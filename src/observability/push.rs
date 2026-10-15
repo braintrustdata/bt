@@ -34,6 +34,7 @@ pub(crate) struct MutationPlan {
     topics: BTreeMap<String, TopicsMutation>,
     loops: Vec<LoopMutation>,
     function_ids: HashMap<String, String>,
+    detached_topic_maps: Vec<PushedResource>,
 }
 
 #[derive(Debug)]
@@ -73,6 +74,8 @@ struct TopicsMutation {
 pub(crate) struct PushResult {
     pub facets: Vec<PushedResource>,
     pub automations: Vec<PushedResource>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub detached_topic_maps: Vec<PushedResource>,
 }
 
 #[derive(Debug, serde::Serialize)]
@@ -132,6 +135,7 @@ pub(crate) fn plan(
         .filter(|automation| is_topics(&automation.config))
         .collect::<Vec<_>>();
     let mut topics = BTreeMap::<String, TopicsMutation>::new();
+    let mut detached_topic_maps = BTreeMap::new();
     let mut facets = Vec::with_capacity(template.facets.len());
 
     for facet in &template.facets {
@@ -149,13 +153,25 @@ pub(crate) fn plan(
             }
         }
 
-        let map_slug = topic_map_slug(&facet.slug);
-        let topic_map = existing_topic_map(
-            existing,
+        let target = resolve_topics_target(
+            facet,
+            topics_override,
+            &snapshot.automations,
             &topics_automations,
+            &automations_by_name,
+        )?;
+        let binding_automations = match &target {
+            TopicsTarget::Existing(automation) => vec![automation],
+            TopicsTarget::New(_) => Vec::new(),
+        };
+        let map_slug = topic_map_slug(&facet.slug);
+        let (topic_map, duplicate_topic_maps) = existing_topic_map(
+            existing,
+            &binding_automations,
             &functions_by_id,
             &functions_by_slug,
             &map_slug,
+            force,
         )?;
         if let Some(topic_map) = topic_map {
             if topic_map
@@ -177,13 +193,6 @@ pub(crate) fn plan(
             force,
         )?;
 
-        let target = resolve_topics_target(
-            facet,
-            topics_override,
-            &snapshot.automations,
-            &topics_automations,
-            &automations_by_name,
-        )?;
         let key = target.key();
         let model = match &target {
             TopicsTarget::Existing(automation) => embedding_model(automation, &functions_by_id),
@@ -199,14 +208,16 @@ pub(crate) fn plan(
             embedding_model: model,
             config,
         });
-        plan_topics_removals(
-            &mut topics,
-            &topics_automations,
-            &key,
-            existing,
-            topic_map,
-            &functions_by_id,
-        )?;
+        for map in &duplicate_topic_maps {
+            detached_topic_maps
+                .entry(map.id.clone())
+                .or_insert_with(|| PushedResource {
+                    id: map.id.clone(),
+                    name: map.name.clone(),
+                    slug: Some(map.slug.clone()),
+                });
+        }
+        plan_topics_removals(&mut topics, &key, &duplicate_topic_maps)?;
         facets.push(FacetMutation {
             template: facet.clone(),
             existing: existing.cloned(),
@@ -254,6 +265,7 @@ pub(crate) fn plan(
         facets,
         topics,
         loops,
+        detached_topic_maps: detached_topic_maps.into_values().collect(),
         function_ids: snapshot
             .functions
             .into_iter()
@@ -265,46 +277,16 @@ pub(crate) fn plan(
 
 fn plan_topics_removals(
     topics: &mut BTreeMap<String, TopicsMutation>,
-    automations: &[&ProjectAutomation],
     selected_key: &str,
-    facet: Option<&Function>,
-    topic_map: Option<&Function>,
-    functions_by_id: &HashMap<&str, &Function>,
+    duplicate_topic_maps: &[&Function],
 ) -> Result<()> {
-    if facet.is_none() && topic_map.is_none() {
-        return Ok(());
-    }
-
-    for &automation in automations {
-        let key = TopicsTarget::Existing(automation.clone()).key();
-        if key == selected_key {
-            continue;
-        }
-        let current_config = topics
-            .get(&key)
-            .map(|mutation| &mutation.config)
-            .unwrap_or(&automation.config);
-        let Some(config) = remove_topics_functions(
-            current_config,
-            facet.map(|facet| facet.id.as_str()),
-            topic_map.map(|topic_map| topic_map.id.as_str()),
-        )?
-        else {
-            continue;
-        };
-
-        match topics.get_mut(&key) {
-            Some(mutation) => mutation.config = config,
-            None => {
-                topics.insert(
-                    key,
-                    TopicsMutation {
-                        target: TopicsTarget::Existing(automation.clone()),
-                        embedding_model: embedding_model(automation, functions_by_id),
-                        config,
-                    },
-                );
-            }
+    let selected = topics
+        .get_mut(selected_key)
+        .expect("resolved Topics destination");
+    for duplicate in duplicate_topic_maps {
+        if let Some(config) = remove_topics_functions(&selected.config, None, Some(&duplicate.id))?
+        {
+            selected.config = config;
         }
     }
     Ok(())
@@ -371,7 +353,8 @@ fn existing_topic_map<'a>(
     functions_by_id: &HashMap<&str, &'a Function>,
     functions_by_slug: &HashMap<&str, Vec<&'a Function>>,
     fallback_slug: &str,
-) -> Result<Option<&'a Function>> {
+    force: bool,
+) -> Result<(Option<&'a Function>, Vec<&'a Function>)> {
     if let Some(facet) = facet {
         let mut matches = BTreeMap::new();
         for automation in topics_automations {
@@ -392,22 +375,36 @@ fn existing_topic_map<'a>(
                 }
             }
         }
-        match matches.len() {
-            0 => {}
-            1 => return Ok(matches.into_values().next()),
-            _ => bail!(
-                "facet '{}' is wired to multiple topic maps in the target project",
-                facet.slug
-            ),
+        let selected = checked_function_by_slug(
+            functions_by_slug,
+            fallback_slug,
+            "classifier topic map",
+            "classifier",
+        )?;
+        if let Some(selected) = selected {
+            if !topic_map_matches(selected, facet) {
+                bail!("topic map slug '{fallback_slug}' belongs to a different facet; use a different facet slug");
+            }
         }
+        let duplicates = matches
+            .into_values()
+            .filter(|map| selected.is_none_or(|selected| map.id != selected.id))
+            .collect::<Vec<_>>();
+        if !duplicates.is_empty() && !force {
+            bail!("facet '{}' has existing topic map bindings; use --force to replace the selected automation's binding", facet.slug);
+        }
+        return Ok((selected, duplicates));
     }
 
-    checked_function_by_slug(
-        functions_by_slug,
-        fallback_slug,
-        "classifier topic map",
-        "classifier",
-    )
+    Ok((
+        checked_function_by_slug(
+            functions_by_slug,
+            fallback_slug,
+            "classifier topic map",
+            "classifier",
+        )?,
+        Vec::new(),
+    ))
 }
 
 fn conflict(existing: Option<&Function>, label: &str, slug: &str, force: bool) -> Result<()> {
@@ -630,6 +627,7 @@ pub(crate) async fn execute(
     Ok(PushResult {
         facets: pushed_facets,
         automations: pushed_loops,
+        detached_topic_maps: plan.detached_topic_maps,
     })
 }
 
@@ -835,7 +833,7 @@ mod tests {
     }
 
     #[test]
-    fn active_observability_finds_and_remaps_an_existing_topic_map() {
+    fn active_observability_preserves_other_automation_bindings() {
         let mut existing_facet = existing_function("test-facet", "facet", "facet");
         existing_facet.id = "fn-existing-facet".to_string();
         let mut existing_topic_map = existing_function("test-facet", "classifier", "topic_map");
@@ -872,22 +870,72 @@ mod tests {
         )
         .expect("existing topic map is found through Topics wiring");
 
-        let topic_map = planned.facets[0]
+        assert!(planned.facets[0].topic_map.is_none());
+        assert!(!planned.topics.contains_key("id:auto-previous"));
+        assert!(planned.topics.contains_key("id:auto-destination"));
+    }
+
+    #[test]
+    fn active_observability_force_repairs_duplicate_topic_map_wiring() {
+        let mut existing_facet = existing_function("test-facet", "facet", "facet");
+        existing_facet.id = "fn-existing-facet".to_string();
+
+        let mut original_topic_map =
+            existing_function("legacy-test-topic-map", "classifier", "topic_map");
+        original_topic_map.id = "fn-original-topic-map".to_string();
+        original_topic_map.created = Some("2026-01-01T00:00:00Z".to_string());
+        original_topic_map.function_data = Some(json!({
+            "type": "topic_map",
+            "source_facet_function": {
+                "type": "function",
+                "id": "fn-existing-facet"
+            },
+            "generation_settings": {"max_topics": 12}
+        }));
+
+        let mut duplicate_topic_map =
+            existing_function("test-facet-topic-map", "classifier", "topic_map");
+        duplicate_topic_map.id = "fn-duplicate-topic-map".to_string();
+        duplicate_topic_map.created = Some("2026-02-01T00:00:00Z".to_string());
+        duplicate_topic_map.function_data = Some(json!({
+            "type": "topic_map",
+            "source_facet_function": {
+                "type": "function",
+                "id": "fn-existing-facet"
+            }
+        }));
+
+        let mut topics = automation("auto-topics", "Topics", "topic");
+        topics.config["facet_functions"] = json!([{"type": "function", "id": "fn-existing-facet"}]);
+        topics.config["topic_map_functions"] = json!([
+            {"function": {"type": "function", "id": "fn-original-topic-map"}},
+            {"function": {"type": "function", "id": "fn-duplicate-topic-map"}}
+        ]);
+
+        let planned = plan(
+            &template(facet(Some("Topics"))),
+            Snapshot {
+                functions: vec![existing_facet, original_topic_map, duplicate_topic_map],
+                automations: vec![topics],
+            },
+            None,
+            true,
+        )
+        .expect("force repairs duplicate topic map wiring");
+
+        let selected = planned.facets[0]
             .topic_map
             .as_ref()
-            .expect("existing topic map");
-        assert_eq!(topic_map.id, "fn-existing-topic-map");
-        assert_eq!(topic_map.slug, "test-facet");
-        let previous = &planned.topics["id:auto-previous"].config;
+            .expect("template map is retained");
+        assert_eq!(selected.id, "fn-duplicate-topic-map");
+        assert_eq!(planned.detached_topic_maps.len(), 1);
+        assert_eq!(planned.detached_topic_maps[0].id, "fn-original-topic-map");
         assert_eq!(
-            previous["facet_functions"],
-            json!([{"type": "function", "id": "fn-unrelated-facet"}])
+            planned.topics["id:auto-topics"].config["topic_map_functions"],
+            json!([
+                {"function": {"type": "function", "id": "fn-duplicate-topic-map"}}
+            ])
         );
-        assert_eq!(
-            previous["topic_map_functions"],
-            json!([{"function": {"type": "function", "id": "fn-unrelated-topic-map"}}])
-        );
-        assert!(planned.topics.contains_key("id:auto-destination"));
     }
 
     #[test]
