@@ -41,7 +41,7 @@ pub(crate) async fn run(base: BaseArgs, args: PullArgs) -> Result<()> {
         (template.facets, template.automations) =
             filter_active_resources(template.facets, template.automations);
     }
-    retain_topics_settings(&mut template);
+    retain_topics_settings(&mut template, &functions, &automations)?;
     validate(&template)?;
     validate_topics_scope(&template)?;
     // Selection happens first so a selected facet never loses its required definition.
