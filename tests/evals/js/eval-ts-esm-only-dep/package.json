@@ -6,6 +6,7 @@
     "esm-only-pkg": "file:./esm-only-pkg"
   },
   "devDependencies": {
-    "tsx": "^4.23.15"
+    "tsx": "^4.23.15",
+    "vite-node": "^6.0.0"
   }
 }

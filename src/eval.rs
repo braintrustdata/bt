@@ -2734,11 +2734,12 @@ fn build_js_plan(
 }
 
 fn build_vite_node_fallback_command(runner: &Path, files: &[String]) -> Result<Command> {
+    let runner = js_runner_path_for_kind(runner, RunnerKind::ViteNode);
     if let Some(path) = find_node_module_bin_for_files("vite-node", files)
         .or_else(|| js_runner::find_binary_in_path(&["vite-node"]))
     {
         let mut command = Command::new(path);
-        command.arg(runner).args(files);
+        command.arg(&runner).args(files);
         return Ok(command);
     }
 
