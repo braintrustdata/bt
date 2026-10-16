@@ -15,8 +15,8 @@ use crate::{
 
 use super::{
     template::{
-        deduplicate_preprocessors, from_remote, ActiveObservabilityTemplate, AutomationTemplate,
-        FacetTemplate,
+        deduplicate_preprocessors, from_remote, retain_topics_settings, validate,
+        validate_topics_scope, ActiveObservabilityTemplate, AutomationTemplate, FacetTemplate,
     },
     PullArgs,
 };
@@ -41,6 +41,9 @@ pub(crate) async fn run(base: BaseArgs, args: PullArgs) -> Result<()> {
         (template.facets, template.automations) =
             filter_active_resources(template.facets, template.automations);
     }
+    retain_topics_settings(&mut template, &functions, &automations)?;
+    validate(&template)?;
+    validate_topics_scope(&template)?;
     // Selection happens first so a selected facet never loses its required definition.
     deduplicate_preprocessors(&mut template.facets);
 
