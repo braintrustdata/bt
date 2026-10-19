@@ -122,14 +122,17 @@ pub fn resolve_prebuilt_runner(explicit: &str) -> Result<PathBuf> {
 /// Checked before spawning `go list` so that a non-Go directory costs nothing
 /// and keeps reporting the ordinary "no eval files found" error.
 pub fn in_go_module(dir: &Path) -> bool {
-    let mut current = Some(dir);
-    while let Some(candidate) = current {
-        if candidate.join("go.mod").is_file() {
-            return true;
-        }
-        current = candidate.parent();
-    }
-    false
+    in_go_module_from(dir, &std::env::current_dir().unwrap_or_default())
+}
+
+/// Like [`in_go_module`], resolving a relative `dir` against `cwd` first.
+///
+/// `Path::parent` is lexical, so climbing `.` or `cmd` as typed stops at the
+/// cwd instead of reaching its real ancestors.
+fn in_go_module_from(dir: &Path, cwd: &Path) -> bool {
+    cwd.join(dir)
+        .ancestors()
+        .any(|candidate| candidate.join("go.mod").is_file())
 }
 
 /// Runs `go list -json <patterns>` in `cwd` and returns the packages it reports.
@@ -187,14 +190,21 @@ mod tests {
         dir
     }
 
+    // `bt eval` passes the path as typed (`.` when bare), and `Path::parent`
+    // on a relative path never reaches the real ancestors of the cwd.
     #[test]
     fn in_go_module_finds_an_ancestor_go_mod() {
         let dir = make_temp_dir("in-module");
-        let pkg = dir.join("cmd").join("evals");
+        let cmd = dir.join("cmd");
+        let pkg = cmd.join("a");
         std::fs::create_dir_all(&pkg).expect("package dir should be created");
         std::fs::write(dir.join("go.mod"), "module example.test\n").expect("go.mod written");
 
         assert!(in_go_module(&pkg));
+        assert!(in_go_module_from(Path::new("."), &cmd));
+        assert!(in_go_module_from(Path::new("a"), &cmd));
+        assert!(in_go_module_from(Path::new("."), &pkg));
+        assert!(!in_go_module_from(Path::new("."), &std::env::temp_dir()));
 
         let _ = std::fs::remove_dir_all(&dir);
     }
