@@ -3000,3 +3000,51 @@ fn eval_go_runner_failure_shows_runner_stderr() {
             "main.go:4:2: undefined: undefinedThing",
         ));
 }
+
+/// Absolute path to a real Go toolchain, or `None` when Go is not installed.
+/// Resolved up front so tests can pin it via `BRAINTRUST_EVAL_GO_BIN` and stay
+/// independent of version-manager shims that read the overridden config dirs.
+fn real_go_binary() -> Option<std::path::PathBuf> {
+    let output = std::process::Command::new("go")
+        .args(["env", "GOROOT"])
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let goroot = String::from_utf8(output.stdout).ok()?;
+    let go = Path::new(goroot.trim()).join("bin").join("go");
+    go.is_file().then_some(go)
+}
+
+// SDK-575: used to run silently and exit 0.
+#[test]
+fn eval_language_go_rejects_a_package_without_the_eval_runner() {
+    let Some(go) = real_go_binary() else {
+        eprintln!("skipping: no Go toolchain installed");
+        return;
+    };
+    let module = tempfile::tempdir().expect("module tempdir");
+    let config_home = tempfile::tempdir().expect("config tempdir");
+    fs::write(
+        module.path().join("go.mod"),
+        "module example.test/goevals\n\ngo 1.21\n",
+    )
+    .expect("write go.mod");
+    let package = module.path().join("cmd").join("a");
+    fs::create_dir_all(&package).expect("create package dir");
+    fs::write(package.join("main.go"), "package main\n\nfunc main() {}\n").expect("write main.go");
+
+    let mut cmd = bt_command();
+    clear_braintrust_auth_env(&mut cmd);
+    cmd.current_dir(module.path())
+        .env("XDG_CONFIG_HOME", config_home.path())
+        .env("BRAINTRUST_EVAL_GO_BIN", &go)
+        .args(["eval", "--no-send-logs", "--language", "go", "./cmd/a"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("does not import"))
+        .stderr(predicate::str::contains(
+            "github.com/braintrustdata/braintrust-sdk-go/evalrunner",
+        ));
+}
