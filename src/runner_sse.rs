@@ -277,15 +277,6 @@ where
                 abort_unconnected_sse(sse_task, sse_connected);
             }
         }
-
-        if status.is_some() && rx.is_closed() {
-            // A closed channel can still hold queued events, such as stderr
-            // lines from a runner that failed before it started.
-            while let Ok(event) = rx.try_recv() {
-                on_event(event);
-            }
-            break;
-        }
     }
 
     let _ = sse_task.await;

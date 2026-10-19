@@ -3384,7 +3384,7 @@ impl EvalUi {
                 if show_hint {
                     let hint = "Hint: set BRAINTRUST_API_KEY, run `bt login`/`bt login --oauth`, or use --no-send-logs for local evals.";
                     if self.verbose {
-                        let _ = self.progress.println(hint.dark_grey().to_string());
+                        self.print_persistent_line(hint.dark_grey().to_string());
                     } else {
                         self.record_deferred_error(hint.to_string());
                     }
