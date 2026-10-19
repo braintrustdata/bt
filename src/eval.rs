@@ -4451,16 +4451,8 @@ mod tests {
         );
         assert!(result[0].ends_with("a.eval.ts"));
 
-        let _ = fs::remove_dir_all(&dir);
-    }
-
-    #[test]
-    fn expand_eval_file_globs_defaults_errors_when_only_excluded_dirs_match() {
-        let dir = make_temp_dir("glob-defaults-only-excluded");
-        let nm = dir.join("node_modules").join("pkg");
-        fs::create_dir_all(&nm).unwrap();
-        fs::write(nm.join("b.eval.ts"), "").unwrap();
-
+        // With only excluded matches left, discovery reports nothing found.
+        fs::remove_file(dir.join("a.eval.ts")).unwrap();
         let err =
             expand_eval_file_globs_for_language(&[dir.to_string_lossy().into_owned()], None, true)
                 .expect_err("only excluded matches should fail");
