@@ -90,9 +90,9 @@ async fn run(argv: &[std::ffi::OsString]) -> Result<()> {
         .filter(|arg| !matches!(arg.to_str(), Some("--help" | "-h" | "--version" | "-V")))
         .cloned()
         .collect();
-    let matches = preflight
-        .try_get_matches_from(preflight_argv)
-        .map_err(|err| anyhow!(err.to_string()))?;
+    let Some(matches) = parse_matches(preflight, preflight_argv)? else {
+        return Ok(());
+    };
     let mut base =
         BaseArgs::from_arg_matches(&matches).context("failed to parse global options")?;
     crate::apply_base_arg_sources(&matches, &mut base.login);
@@ -129,9 +129,9 @@ async fn run(argv: &[std::ffi::OsString]) -> Result<()> {
     for arg in global_args {
         command = command.arg(arg);
     }
-    let matches = command
-        .try_get_matches_from(argv)
-        .map_err(|err| anyhow!(err.to_string()))?;
+    let Some(matches) = parse_matches(command, argv.iter().cloned())? else {
+        return Ok(());
+    };
     let base = BaseArgs::from_arg_matches(&matches).context("failed to parse global options")?;
     let Some((tool_name, tool_matches)) = matches
         .subcommand_matches("mcp")
@@ -161,6 +161,27 @@ async fn run(argv: &[std::ffi::OsString]) -> Result<()> {
         println!("{}", serde_json::to_string_pretty(&result)?);
     }
     Ok(())
+}
+
+fn parse_matches(
+    command: Command,
+    argv: impl IntoIterator<Item = OsString>,
+) -> Result<Option<ArgMatches>> {
+    match command.try_get_matches_from(argv) {
+        Ok(matches) => Ok(Some(matches)),
+        Err(error)
+            if matches!(
+                error.kind(),
+                clap::error::ErrorKind::DisplayHelp
+                    | clap::error::ErrorKind::DisplayVersion
+                    | clap::error::ErrorKind::DisplayHelpOnMissingArgumentOrSubcommand
+            ) =>
+        {
+            error.print().context("failed to print command help")?;
+            Ok(None)
+        }
+        Err(error) => Err(anyhow!(error.to_string())),
+    }
 }
 
 fn tool_command(
