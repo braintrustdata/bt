@@ -279,6 +279,11 @@ where
         }
 
         if status.is_some() && rx.is_closed() {
+            // A closed channel can still hold queued events, such as stderr
+            // lines from a runner that failed before it started.
+            while let Ok(event) = rx.try_recv() {
+                on_event(event);
+            }
             break;
         }
     }
@@ -290,5 +295,42 @@ where
 fn abort_unconnected_sse(sse_task: &mut tokio::task::JoinHandle<()>, sse_connected: &AtomicBool) {
     if !sse_connected.load(Ordering::Relaxed) {
         sse_task.abort();
+    }
+}
+
+#[cfg(all(test, unix))]
+mod tests {
+    use super::*;
+    use std::os::unix::process::ExitStatusExt;
+
+    // A runner that dies fast (e.g. `go run` on a package that fails to
+    // compile) can exit and close its pipes before the forwarded stderr lines
+    // are consumed. Those queued lines must still reach the handler.
+    #[tokio::test]
+    async fn drive_runner_events_drains_events_queued_before_exit() {
+        let (tx, rx) = mpsc::unbounded_channel();
+        for index in 0..100 {
+            tx.send(index).expect("event queued");
+        }
+        drop(tx);
+
+        let wait = Box::pin(async { Ok(ExitStatus::from_raw(1 << 8)) });
+        let mut sse_task = tokio::spawn(async {});
+        let sse_connected = AtomicBool::new(false);
+        let mut received = Vec::new();
+
+        let status = drive_runner_events(
+            rx,
+            wait,
+            &mut sse_task,
+            &sse_connected,
+            "missing status",
+            |event| received.push(event),
+        )
+        .await
+        .expect("runner status");
+
+        assert_eq!(status.code(), Some(1));
+        assert_eq!(received, (0..100).collect::<Vec<_>>());
     }
 }

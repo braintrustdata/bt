@@ -2967,3 +2967,80 @@ fn scorers_preprocessor_export_requires_source() {
         .failure()
         .stderr(predicate::str::contains("--preprocessor <SOURCE>"));
 }
+
+/// Writes a Go eval package plus a prebuilt `--runner` that fails the way
+/// `go run` does on a compile error: plain text on stderr, then exit 1.
+#[cfg(unix)]
+fn write_failing_go_eval(dir: &Path) {
+    use std::os::unix::fs::PermissionsExt;
+
+    fs::create_dir_all(dir.join("cmd/a")).expect("create package dir");
+    fs::write(dir.join("go.mod"), "module example.com/test\n\ngo 1.22\n").expect("write go.mod");
+    fs::write(
+        dir.join("cmd/a/main.go"),
+        "package main\n\nfunc main() {\n\tundefinedThing()\n}\n",
+    )
+    .expect("write main.go");
+    let runner = dir.join("runner.sh");
+    fs::write(
+        &runner,
+        "#!/bin/sh\necho '# example.com/test/cmd/a' >&2\necho 'cmd/a/main.go:4:2: undefined: undefinedThing' >&2\nexit 1\n",
+    )
+    .expect("write runner");
+    let mut perms = fs::metadata(&runner).expect("metadata").permissions();
+    perms.set_mode(0o755);
+    fs::set_permissions(&runner, perms).expect("chmod");
+}
+
+#[cfg(unix)]
+#[test]
+fn eval_go_runner_failure_shows_runner_stderr() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let config_home = tempfile::tempdir().expect("config tempdir");
+    write_failing_go_eval(dir.path());
+
+    for verbose in [false, true] {
+        let mut cmd = bt_command();
+        clear_braintrust_auth_env(&mut cmd);
+        cmd.current_dir(dir.path())
+            .env("XDG_CONFIG_HOME", config_home.path())
+            .args(["eval", "--no-send-logs", "--language", "go"])
+            .args(["--runner", "./runner.sh", "cmd/a/main.go"]);
+        if verbose {
+            cmd.arg("--verbose");
+        }
+        cmd.assert()
+            .failure()
+            .stderr(predicate::str::contains("# example.com/test/cmd/a"))
+            .stderr(predicate::str::contains(
+                "cmd/a/main.go:4:2: undefined: undefinedThing",
+            ));
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn eval_go_compile_error_shows_compiler_output() {
+    if std::process::Command::new("go")
+        .arg("version")
+        .output()
+        .map(|output| !output.status.success())
+        .unwrap_or(true)
+    {
+        eprintln!("skipping: go toolchain not available");
+        return;
+    }
+    let dir = tempfile::tempdir().expect("tempdir");
+    let config_home = tempfile::tempdir().expect("config tempdir");
+    write_failing_go_eval(dir.path());
+
+    let mut cmd = bt_command();
+    clear_braintrust_auth_env(&mut cmd);
+    cmd.current_dir(dir.path())
+        .env("XDG_CONFIG_HOME", config_home.path())
+        .env("GOFLAGS", "-mod=mod")
+        .args(["eval", "--no-send-logs", "--language", "go", "./cmd/a"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("undefined: undefinedThing"));
+}
