@@ -2566,7 +2566,7 @@ fn expand_default_eval_globs_in_dir(
     if dir_files.is_empty() {
         // No JavaScript or Python evals here. Go has no marker filename, so ask
         // the Go toolchain whether this tree holds eval runners instead.
-        if let Some(go_files) = discover_go_eval_packages(input) {
+        if let Some(go_files) = discover_go_eval_packages(input, exclude_default_dirs) {
             return Ok(go_files);
         }
         anyhow::bail!("no eval files found in directory: {input}");
@@ -2606,7 +2606,7 @@ fn expand_go_package_dir(input: &str) -> Result<Vec<String>> {
 /// `go list` can say which packages those are. Returns `None` when the answer
 /// is "not applicable" -- no module, no toolchain, or nothing that links the
 /// runner -- so the caller can fall back to its usual error.
-fn discover_go_eval_packages(dir: &str) -> Option<Vec<String>> {
+fn discover_go_eval_packages(dir: &str, exclude_default_dirs: bool) -> Option<Vec<String>> {
     let path = Path::new(dir);
     if !go_runner::in_go_module(path) {
         return None;
@@ -2617,6 +2617,14 @@ fn discover_go_eval_packages(dir: &str) -> Option<Vec<String>> {
     let mut files: Vec<String> = packages
         .iter()
         .filter(|pkg| pkg.is_eval_runner())
+        // `./...` skips `vendor` and dot-dirs but still walks `node_modules`,
+        // `venv`, `site-packages`, etc. Match below the module root, which comes
+        // from the same `go list` output as `pkg.dir`.
+        .filter(|pkg| {
+            let module_dir = pkg.module.as_ref().and_then(|m| m.dir.as_deref());
+            let relative = module_dir.and_then(|root| pkg.dir.strip_prefix(root).ok());
+            !exclude_default_dirs || !relative.is_some_and(is_excluded_by_default)
+        })
         .flat_map(go_runner::GoPackage::absolute_go_files)
         .collect();
     files.sort();
@@ -4717,7 +4725,8 @@ mod tests {
         }
 
         // Eval-named files in excluded folders (a virtualenv's `openai` package ships
-        // `eval_*.py` files) must not stop bare `bt eval` from falling back to Go.
+        // `eval_*.py` files) must not stop bare `bt eval` from falling back to Go,
+        // and Go eval runners inside those folders must not be picked up either.
         #[cfg(unix)]
         #[test]
         fn default_discovery_ignores_excluded_dirs_before_go_fallback() {
@@ -4737,14 +4746,23 @@ mod tests {
                 fs::write(&path, "").expect("third-party file written");
             }
 
-            let json = go_list_json(
-                &eval_dir,
-                "main",
-                &["main.go"],
-                &[go_runner::EVAL_RUNNER_IMPORT],
+            // `go list ./...` skips `vendor` and dot-dirs but still walks `node_modules`.
+            let json = format!(
+                r#"{{"Dir": "{eval}", "ImportPath": "example.test/cmd/a", "Name": "main",
+                      "GoFiles": ["main.go"], "Deps": ["{runner}"],
+                      "Module": {{"Path": "example.test", "Dir": "{root}"}}}}
+                   {{"Dir": "{root}/node_modules/x/cmd", "ImportPath": "example.test/node_modules/x/cmd",
+                      "Name": "main", "GoFiles": ["main.go"], "Deps": ["{runner}"],
+                      "Module": {{"Path": "example.test", "Dir": "{root}"}}}}"#,
+                eval = eval_dir.display(),
+                root = dir.display(),
+                runner = go_runner::EVAL_RUNNER_IMPORT
             );
             let fake_go = write_fake_go(&dir, &json);
-            let previous = set_env_var("BT_EVAL_GO_BIN", fake_go.to_str().expect("utf-8 path"));
+            let previous = set_env_var(
+                "BRAINTRUST_EVAL_GO_BIN",
+                fake_go.to_str().expect("utf-8 path"),
+            );
 
             let result = expand_eval_file_globs_for_language(
                 &[dir.to_string_lossy().into_owned()],
@@ -4753,7 +4771,7 @@ mod tests {
             )
             .expect("go evals should be discovered");
 
-            restore_env_var("BT_EVAL_GO_BIN", previous);
+            restore_env_var("BRAINTRUST_EVAL_GO_BIN", previous);
 
             assert_eq!(result.len(), 1, "unexpected matches: {result:?}");
             assert!(result[0].ends_with("cmd/a/main.go"), "got {result:?}");
