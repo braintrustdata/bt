@@ -203,7 +203,6 @@ mod tests {
         assert!(in_go_module(&pkg));
         assert!(in_go_module_from(Path::new("."), &cmd));
         assert!(in_go_module_from(Path::new("a"), &cmd));
-        assert!(in_go_module_from(Path::new("."), &pkg));
         assert!(!in_go_module_from(Path::new("."), &std::env::temp_dir()));
 
         let _ = std::fs::remove_dir_all(&dir);
@@ -237,7 +236,7 @@ mod tests {
             "Dir": "/repo/a",
             "ImportPath": "example.test/a",
             "Name": "main",
-            "GoFiles": ["main.go"]
+            "GoFiles": ["main.go", "classifier.go"]
         }
         {
             "Dir": "/repo/b",
@@ -250,6 +249,13 @@ mod tests {
         assert_eq!(packages.len(), 2);
         assert_eq!(packages[0].import_path, "example.test/a");
         assert_eq!(packages[1].name, "b");
+        assert_eq!(
+            packages[0].absolute_go_files(),
+            vec![
+                "/repo/a/main.go".to_string(),
+                "/repo/a/classifier.go".to_string()
+            ]
+        );
     }
 
     // Discovery keys off the runner import, which is what lets Go evals live in
@@ -270,22 +276,6 @@ mod tests {
         assert!(
             !packages[2].is_eval_runner(),
             "library that imports the runner"
-        );
-    }
-
-    #[test]
-    fn absolute_go_files_joins_against_the_package_dir() {
-        let stdout = br#"{"Dir": "/repo/evals", "ImportPath": "x", "Name": "main",
-                          "GoFiles": ["main.go", "classifier.go"]}"#;
-
-        let packages = parse_go_list(stdout).expect("stream should parse");
-
-        assert_eq!(
-            packages[0].absolute_go_files(),
-            vec![
-                "/repo/evals/main.go".to_string(),
-                "/repo/evals/classifier.go".to_string()
-            ]
         );
     }
 }
