@@ -175,7 +175,9 @@ fn tool_command(
     }
     let mut command = Command::new(tool.name.clone());
     if let Some(description) = &tool.description {
-        command = command.about(description.clone());
+        command = command
+            .about(short_description(description))
+            .long_about(description.clone());
     }
     let properties = tool
         .input_schema
@@ -232,6 +234,45 @@ fn tool_command(
         arg_map.insert(id, (name.clone(), schema.clone()));
     }
     Ok((command, arg_map))
+}
+
+fn short_description(description: &str) -> String {
+    const MAX_LENGTH: usize = 120;
+
+    let first_line = description
+        .lines()
+        .map(str::trim)
+        .find(|line| !line.is_empty())
+        .unwrap_or_default()
+        .trim_start_matches('#')
+        .trim_start_matches(['-', '*'])
+        .trim();
+    let sentence_end = first_line.char_indices().find_map(|(index, character)| {
+        if matches!(character, '.' | '!' | '?')
+            && first_line[index + character.len_utf8()..]
+                .chars()
+                .next()
+                .is_none_or(char::is_whitespace)
+        {
+            Some(index + character.len_utf8())
+        } else {
+            None
+        }
+    });
+    let summary = sentence_end
+        .map(|end| &first_line[..end])
+        .unwrap_or(first_line)
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ");
+
+    let mut chars = summary.chars();
+    let shortened: String = chars.by_ref().take(MAX_LENGTH).collect();
+    if chars.next().is_some() {
+        format!("{}…", shortened.trim_end())
+    } else {
+        shortened
+    }
 }
 
 fn is_cli_name(name: &str) -> bool {
