@@ -2566,10 +2566,15 @@ fn expand_default_eval_globs_in_dir(
     if dir_files.is_empty() {
         // No JavaScript or Python evals here. Go has no marker filename, so ask
         // the Go toolchain whether this tree holds eval runners instead.
-        if let Some(go_files) = discover_go_eval_packages(input, exclude_default_dirs) {
-            return Ok(go_files);
+        match discover_go_eval_packages(input, exclude_default_dirs) {
+            Ok(Some(go_files)) => return Ok(go_files),
+            Ok(None) => anyhow::bail!("no eval files found in directory: {input}"),
+            // The top-level error printer shows only the outermost message, so
+            // fold the Go cause into it rather than attaching it as context.
+            Err(err) => anyhow::bail!(
+                "no eval files found in directory: {input}; no JavaScript or Python eval files matched, and Go eval discovery failed: {err:#}"
+            ),
         }
-        anyhow::bail!("no eval files found in directory: {input}");
     }
     Ok(dir_files)
 }
@@ -2603,37 +2608,75 @@ fn expand_go_package_dir(input: &str) -> Result<Vec<String>> {
 ///
 /// Go needs no file-naming or directory-naming convention for this: an eval
 /// runner is a `package main` that imports the SDK's runner package, and
-/// `go list` can say which packages those are. Returns `None` when the answer
-/// is "not applicable" -- no module, no toolchain, or nothing that links the
-/// runner -- so the caller can fall back to its usual error.
-fn discover_go_eval_packages(dir: &str, exclude_default_dirs: bool) -> Option<Vec<String>> {
+/// `go list` can say which packages those are. Returns `Ok(None)` outside a Go
+/// module, so non-Go projects keep their usual error. Inside one, every other
+/// failure is an error naming its cause: no toolchain, a failing `go list`, or
+/// no package that links the runner.
+fn discover_go_eval_packages(dir: &str, exclude_default_dirs: bool) -> Result<Option<Vec<String>>> {
     let path = Path::new(dir);
     if !go_runner::in_go_module(path) {
-        return None;
+        return Ok(None);
     }
-    let go = go_runner::resolve_go_toolchain(GO_TOOLCHAIN_ENV_OVERRIDES)?;
+    let go = require_go_toolchain()?;
 
-    let packages = go_runner::list_packages(&go, &["./...".to_string()], path).ok()?;
-    let mut files: Vec<String> = packages
-        .iter()
-        .filter(|pkg| pkg.is_eval_runner())
-        // `./...` skips `vendor` and dot-dirs but still walks `node_modules`,
-        // `venv`, `site-packages`, etc. Match below the module root, which comes
-        // from the same `go list` output as `pkg.dir`.
-        .filter(|pkg| {
-            let module_dir = pkg.module.as_ref().and_then(|m| m.dir.as_deref());
-            let relative = module_dir.and_then(|root| pkg.dir.strip_prefix(root).ok());
-            !exclude_default_dirs || !relative.is_some_and(is_excluded_by_default)
-        })
+    let packages = go_runner::list_packages(&go, &["./...".to_string()], path)?;
+    let runners: Vec<&go_runner::GoPackage> =
+        packages.iter().filter(|pkg| pkg.is_eval_runner()).collect();
+    if runners.is_empty() {
+        let found = match packages.len() {
+            0 => "found no Go packages".to_string(),
+            1 => "found 1 Go package".to_string(),
+            n => format!("found {n} Go packages"),
+        };
+        anyhow::bail!(
+            "{found} under {dir}, but none is a `package main` that imports {}. Register your evals with `evalrunner` and call `evalrunner.Main`, or point bt at the package that does (e.g. `bt eval --language go ./path/to/pkg`).",
+            go_runner::EVAL_RUNNER_IMPORT
+        );
+    }
+
+    // `./...` skips `vendor` and dot-dirs but still walks `node_modules`,
+    // `venv`, `site-packages`, etc. Match below the module root, which comes
+    // from the same `go list` output as `pkg.dir`.
+    let (included, excluded): (Vec<_>, Vec<_>) = runners.into_iter().partition(|pkg| {
+        let module_dir = pkg.module.as_ref().and_then(|m| m.dir.as_deref());
+        let relative = module_dir.and_then(|root| pkg.dir.strip_prefix(root).ok());
+        !exclude_default_dirs || !relative.is_some_and(is_excluded_by_default)
+    });
+    if included.is_empty() {
+        let count = excluded.len();
+        let example = display_go_package_dir(&excluded[0].dir);
+        anyhow::bail!(
+            "found {count} Go eval package{} under {dir}, but bare `bt eval` skips packages inside default-excluded directories ({}). Point bt at the package explicitly (e.g. `bt eval --language go {example}`).",
+            if count == 1 { "" } else { "s" },
+            DEFAULT_EXCLUDE_DIRS.join(", ")
+        );
+    }
+
+    let mut files: Vec<String> = included
+        .into_iter()
         .flat_map(go_runner::GoPackage::absolute_go_files)
         .collect();
     files.sort();
+    Ok(Some(files))
+}
 
-    if files.is_empty() {
-        None
-    } else {
-        Some(files)
-    }
+/// Renders a package directory for a command hint: relative to the cwd when it
+/// sits below it, absolute otherwise.
+fn display_go_package_dir(dir: &Path) -> String {
+    // Canonicalize both sides: `go list` and the cwd can disagree about
+    // symlinked prefixes such as macOS's `/tmp` -> `/private/tmp`.
+    let canonical = |p: &Path| std::fs::canonicalize(p).unwrap_or_else(|_| p.to_path_buf());
+    std::env::current_dir()
+        .ok()
+        .and_then(|cwd| {
+            canonical(dir)
+                .strip_prefix(canonical(&cwd))
+                .ok()
+                .map(Path::to_path_buf)
+        })
+        .filter(|relative| !relative.as_os_str().is_empty())
+        .map(|relative| format!("./{}", relative.display()))
+        .unwrap_or_else(|| dir.display().to_string())
 }
 
 fn validate_eval_input_files(files: &[String]) -> Result<()> {
@@ -2863,11 +2906,14 @@ fn build_go_command(runner_override: Option<&str>, files: &[String]) -> Result<C
 
 /// Resolves the Go toolchain, or explains how to supply one.
 fn require_go_toolchain() -> Result<PathBuf> {
-    go_runner::resolve_go_toolchain(GO_TOOLCHAIN_ENV_OVERRIDES).ok_or_else(|| {
-        anyhow::anyhow!(
-            "No Go toolchain found. Install Go (https://go.dev/dl/), set BRAINTRUST_EVAL_GO_BIN, or pass a prebuilt eval binary with --runner."
-        )
-    })
+    go_runner::resolve_go_toolchain(GO_TOOLCHAIN_ENV_OVERRIDES).ok_or_else(go_toolchain_not_found)
+}
+
+fn go_toolchain_not_found() -> anyhow::Error {
+    anyhow::anyhow!(
+        "No Go toolchain found. Install Go (https://go.dev/dl/), set {}, or pass a prebuilt eval binary with --runner.",
+        GO_TOOLCHAIN_ENV_OVERRIDES.join(" or ")
+    )
 }
 
 /// Resolves exactly one Go package, erroring when the pattern names none or many.
@@ -5005,6 +5051,174 @@ mod tests {
                 !names.iter().any(|n| n == "main_test.go"),
                 "test files are not part of the build: {names:?}"
             );
+
+            let _ = fs::remove_dir_all(&dir);
+        }
+
+        /// Runs bare-`bt eval` discovery on `dir` and returns the error text.
+        fn default_discovery_error(dir: &Path) -> String {
+            let err = expand_eval_file_globs_for_language(
+                &[dir.to_string_lossy().into_owned()],
+                None,
+                true,
+            )
+            .expect_err("discovery should fail");
+            format!("{err:#}")
+        }
+
+        // A non-Go project must keep the plain error, however Go is configured.
+        #[test]
+        fn default_discovery_without_go_module_stays_generic() {
+            let _guard = lock_env();
+            let dir = make_temp_dir("go-576-no-module");
+            let previous = set_env_var("BRAINTRUST_EVAL_GO_BIN", "/nonexistent/test-go");
+
+            let message = default_discovery_error(&dir);
+
+            restore_env_var("BRAINTRUST_EVAL_GO_BIN", previous);
+            assert_eq!(
+                message,
+                format!("no eval files found in directory: {}", dir.display())
+            );
+
+            let _ = fs::remove_dir_all(&dir);
+        }
+
+        // Discovery and the explicit Go path share this message. Driving it
+        // through discovery would mean clearing PATH, which races tests that
+        // spawn node; tests/cli.rs covers that end to end in a child process.
+        #[test]
+        fn go_toolchain_not_found_names_every_override() {
+            let message = go_toolchain_not_found().to_string();
+            for needle in [
+                "No Go toolchain found",
+                "BRAINTRUST_EVAL_GO_BIN or BRAINTRUST_EVAL_GO",
+                "--runner",
+            ] {
+                assert!(message.contains(needle), "missing {needle:?}: {message}");
+            }
+        }
+
+        #[test]
+        fn default_discovery_in_go_module_reports_an_unrunnable_toolchain() {
+            let _guard = lock_env();
+            let dir = make_temp_dir("go-576-bad-bin");
+            fs::write(dir.join("go.mod"), "module example.com/test-goevals\n").expect("go.mod");
+            let previous = set_env_var("BRAINTRUST_EVAL_GO_BIN", "/nonexistent/test-go");
+
+            let message = default_discovery_error(&dir);
+
+            restore_env_var("BRAINTRUST_EVAL_GO_BIN", previous);
+            assert!(
+                message.contains("failed to run `/nonexistent/test-go list -json`"),
+                "got {message}"
+            );
+
+            let _ = fs::remove_dir_all(&dir);
+        }
+
+        #[cfg(unix)]
+        #[test]
+        fn default_discovery_in_go_module_reports_the_go_list_error() {
+            use std::os::unix::fs::PermissionsExt;
+
+            let _guard = lock_env();
+            let dir = make_temp_dir("go-576-broken-mod");
+            fs::write(
+                dir.join("go.mod"),
+                "module example.com/test-goevals\ngarbage\n",
+            )
+            .expect("go.mod");
+            let fake_go = dir.join("go");
+            fs::write(
+                &fake_go,
+                "#!/bin/sh\necho 'go: errors parsing go.mod:' >&2\necho 'go.mod:2: unknown directive: garbage' >&2\nexit 1\n",
+            )
+            .expect("fake go written");
+            fs::set_permissions(&fake_go, fs::Permissions::from_mode(0o755)).expect("chmod");
+            let previous = set_env_var(
+                "BRAINTRUST_EVAL_GO_BIN",
+                fake_go.to_str().expect("utf-8 path"),
+            );
+
+            let message = default_discovery_error(&dir);
+
+            restore_env_var("BRAINTRUST_EVAL_GO_BIN", previous);
+            for needle in [
+                "Go eval discovery failed",
+                "`go list` failed for ./...",
+                "unknown directive: garbage",
+            ] {
+                assert!(message.contains(needle), "missing {needle:?}: {message}");
+            }
+
+            let _ = fs::remove_dir_all(&dir);
+        }
+
+        #[cfg(unix)]
+        #[test]
+        fn default_discovery_in_go_module_reports_packages_without_the_runner() {
+            let _guard = lock_env();
+            let dir = make_temp_dir("go-576-no-runner");
+            fs::write(dir.join("go.mod"), "module example.com/test-goevals\n").expect("go.mod");
+            let json = format!(
+                "{}\n{}",
+                go_list_json(&dir.join("cmd/a"), "main", &["main.go"], &["fmt"]),
+                go_list_json(&dir.join("lib"), "lib", &["lib.go"], &[])
+            );
+            let fake_go = write_fake_go(&dir, &json);
+            let previous = set_env_var(
+                "BRAINTRUST_EVAL_GO_BIN",
+                fake_go.to_str().expect("utf-8 path"),
+            );
+
+            let message = default_discovery_error(&dir);
+
+            restore_env_var("BRAINTRUST_EVAL_GO_BIN", previous);
+            for needle in [
+                "no JavaScript or Python eval files matched",
+                "found 2 Go packages under",
+                "none is a `package main` that imports",
+                go_runner::EVAL_RUNNER_IMPORT,
+                "bt eval --language go",
+            ] {
+                assert!(message.contains(needle), "missing {needle:?}: {message}");
+            }
+
+            let _ = fs::remove_dir_all(&dir);
+        }
+
+        #[cfg(unix)]
+        #[test]
+        fn default_discovery_in_go_module_reports_excluded_eval_runners() {
+            let _guard = lock_env();
+            let dir = make_temp_dir("go-576-all-excluded");
+            fs::write(dir.join("go.mod"), "module example.com/test-goevals\n").expect("go.mod");
+            let json = format!(
+                r#"{{"Dir": "{root}/node_modules/x/cmd", "ImportPath": "example.com/test-goevals/node_modules/x/cmd",
+                      "Name": "main", "GoFiles": ["main.go"], "Deps": ["{runner}"],
+                      "Module": {{"Path": "example.com/test-goevals", "Dir": "{root}"}}}}"#,
+                root = dir.display(),
+                runner = go_runner::EVAL_RUNNER_IMPORT
+            );
+            let fake_go = write_fake_go(&dir, &json);
+            let previous = set_env_var(
+                "BRAINTRUST_EVAL_GO_BIN",
+                fake_go.to_str().expect("utf-8 path"),
+            );
+
+            let message = default_discovery_error(&dir);
+
+            restore_env_var("BRAINTRUST_EVAL_GO_BIN", previous);
+            for needle in [
+                "found 1 Go eval package under",
+                "default-excluded directories",
+                "node_modules",
+                "bt eval --language go ",
+                "node_modules/x/cmd`",
+            ] {
+                assert!(message.contains(needle), "missing {needle:?}: {message}");
+            }
 
             let _ = fs::remove_dir_all(&dir);
         }

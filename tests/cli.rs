@@ -3048,3 +3048,87 @@ fn eval_language_go_rejects_a_package_without_the_eval_runner() {
             "github.com/braintrustdata/braintrust-sdk-go/evalrunner",
         ));
 }
+
+// SDK-576: bare `bt eval` used to say only "no eval files found" for every Go
+// discovery failure. Outside a Go module it still should; inside one it names
+// the cause.
+#[test]
+fn eval_bare_discovery_reports_the_go_failure_inside_a_module() {
+    let config_home = tempfile::tempdir().expect("config tempdir");
+
+    let not_go = tempfile::tempdir().expect("non-go tempdir");
+    let mut cmd = bt_command();
+    clear_braintrust_auth_env(&mut cmd);
+    cmd.current_dir(not_go.path())
+        .env("XDG_CONFIG_HOME", config_home.path())
+        .env("BRAINTRUST_EVAL_GO_BIN", "/nonexistent/test-go")
+        .args(["eval", "--no-send-logs"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains(
+            "no eval files found in directory: .\n",
+        ))
+        .stderr(predicate::str::contains("Go eval discovery").not());
+
+    let module = tempfile::tempdir().expect("module tempdir");
+    fs::write(
+        module.path().join("go.mod"),
+        "module example.com/test-goevals\n\ngo 1.21\n",
+    )
+    .expect("write go.mod");
+    let package = module.path().join("cmd").join("a");
+    fs::create_dir_all(&package).expect("create package dir");
+    fs::write(package.join("main.go"), "package main\n\nfunc main() {}\n").expect("write main.go");
+
+    let mut cmd = bt_command();
+    clear_braintrust_auth_env(&mut cmd);
+    cmd.current_dir(module.path())
+        .env("XDG_CONFIG_HOME", config_home.path())
+        .env("BRAINTRUST_EVAL_GO_BIN", "/nonexistent/test-go")
+        .args(["eval", "--no-send-logs"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("Go eval discovery failed"))
+        .stderr(predicate::str::contains(
+            "failed to run `/nonexistent/test-go list -json`",
+        ));
+
+    // No toolchain at all: PATH points at an empty directory, in this child only.
+    let empty_path = tempfile::tempdir().expect("empty PATH tempdir");
+    let mut cmd = bt_command();
+    clear_braintrust_auth_env(&mut cmd);
+    cmd.current_dir(module.path())
+        .env("XDG_CONFIG_HOME", config_home.path())
+        .env_remove("BRAINTRUST_EVAL_GO_BIN")
+        .env_remove("BRAINTRUST_EVAL_GO")
+        .env_remove("GOROOT")
+        .env("PATH", empty_path.path())
+        .args(["eval", "--no-send-logs"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains(
+            "no JavaScript or Python eval files matched",
+        ))
+        .stderr(predicate::str::contains("No Go toolchain found"))
+        .stderr(predicate::str::contains(
+            "BRAINTRUST_EVAL_GO_BIN or BRAINTRUST_EVAL_GO",
+        ));
+
+    let Some(go) = real_go_binary() else {
+        eprintln!("skipping real-toolchain case: no Go toolchain installed");
+        return;
+    };
+    let mut cmd = bt_command();
+    clear_braintrust_auth_env(&mut cmd);
+    cmd.current_dir(module.path())
+        .env("XDG_CONFIG_HOME", config_home.path())
+        .env("BRAINTRUST_EVAL_GO_BIN", &go)
+        .args(["eval", "--no-send-logs"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("found 1 Go package under ."))
+        .stderr(predicate::str::contains(
+            "github.com/braintrustdata/braintrust-sdk-go/evalrunner",
+        ))
+        .stderr(predicate::str::contains("bt eval --language go"));
+}
