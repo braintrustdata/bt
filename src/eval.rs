@@ -492,14 +492,22 @@ pub async fn run(base: BaseArgs, args: EvalArgs) -> Result<()> {
     if args.dev && args.watch {
         anyhow::bail!("--watch is not supported with --dev.");
     }
-    let bare = args.files.is_empty();
-    let inputs: Vec<String> = if bare {
-        vec![".".to_string()]
-    } else {
-        args.files.clone()
-    };
-    let files = expand_eval_file_globs_for_language(&inputs, args.language, bare)?;
-    validate_eval_input_files(&files)?;
+    // A prebuilt Go binary is the whole program and ignores argv, so there is
+    // nothing to discover -- and discovery would demand a Go toolchain.
+    let (language, files) =
+        if is_prebuilt_go_runner(args.runner.as_deref(), args.language, &args.files) {
+            (Some(EvalLanguage::Go), Vec::new())
+        } else {
+            let bare = args.files.is_empty();
+            let inputs: Vec<String> = if bare {
+                vec![".".to_string()]
+            } else {
+                args.files.clone()
+            };
+            let files = expand_eval_file_globs_for_language(&inputs, args.language, bare)?;
+            validate_eval_input_files(&files)?;
+            (args.language, files)
+        };
 
     let sampling = if let Some(first) = args.first {
         EvalSamplingMode::First { count: first }
@@ -537,7 +545,7 @@ pub async fn run(base: BaseArgs, args: EvalArgs) -> Result<()> {
     };
 
     if args.dev {
-        let language = detect_eval_language(&files, args.language)?;
+        let language = detect_eval_language(&files, language)?;
         let app_url = resolve_auth(&base)
             .await
             .context("failed to resolve eval dev server authentication")?
@@ -564,7 +572,7 @@ pub async fn run(base: BaseArgs, args: EvalArgs) -> Result<()> {
     if args.watch {
         run_eval_files_watch(
             &base,
-            args.language,
+            language,
             args.runner.as_deref(),
             &files,
             args.no_send_logs,
@@ -574,7 +582,7 @@ pub async fn run(base: BaseArgs, args: EvalArgs) -> Result<()> {
     } else {
         let output = run_eval_files_once(
             &base,
-            args.language,
+            language,
             args.runner.as_deref(),
             &files,
             args.no_send_logs,
@@ -597,7 +605,14 @@ async fn run_eval_files_watch(
     no_send_logs: bool,
     options: &EvalRunOptions,
 ) -> Result<()> {
-    let input_watch_paths = resolve_watch_paths(files)?;
+    let mut input_watch_paths = resolve_watch_paths(files)?;
+    if let Some(runner) = runner_override {
+        if build_eval_plan(files, language_override, runner_override)?.language == EvalLanguage::Go
+        {
+            let binary = go_prebuilt_runner_watch_paths(runner)?;
+            input_watch_paths = merge_watch_paths(&input_watch_paths, &binary);
+        }
+    }
     let mut active_watch_paths = input_watch_paths.clone();
     let mut watch_state = snapshot_watch_state(&active_watch_paths)?;
 
@@ -755,7 +770,10 @@ async fn run_eval_files_once(
                 dependencies = merge_watch_paths(&dependencies, &static_dependencies);
             }
             EvalLanguage::Go => {
-                let static_dependencies = collect_go_static_dependencies(files)?;
+                let static_dependencies = match plan.runner_override {
+                    Some(runner) => go_prebuilt_runner_watch_paths(runner)?,
+                    None => collect_go_static_dependencies(files)?,
+                };
                 dependencies = merge_watch_paths(&dependencies, &static_dependencies);
             }
             // Python runners report their own dependencies over SSE.
@@ -2967,6 +2985,40 @@ fn go_package_dir(files: &[String]) -> Result<PathBuf> {
                 .join(", ")
         ),
     }
+}
+
+/// True when `--runner` names a prebuilt Go eval binary, so `run` can skip file
+/// discovery, which needs a Go toolchain the binary does not.
+///
+/// `--language go` says so outright. Without it, the runner must be a path to a
+/// file the Go linker produced, and the inputs must be directories (or absent):
+/// JS and Python runners (`./node_modules/.bin/tsx`, `.venv/bin/python`) are
+/// never Go binaries, and explicit source files already select a language.
+fn is_prebuilt_go_runner(
+    runner_override: Option<&str>,
+    language_override: Option<EvalLanguage>,
+    inputs: &[String],
+) -> bool {
+    let Some(runner) = runner_override else {
+        return false;
+    };
+    match language_override {
+        Some(EvalLanguage::Go) => true,
+        Some(_) => false,
+        None => {
+            inputs.iter().all(|input| Path::new(input).is_dir())
+                && go_runner::runner_looks_like_path(runner)
+                && go_runner::is_go_binary(Path::new(runner))
+        }
+    }
+}
+
+/// Watch set for a prebuilt Go eval binary: the binary itself. Its sources are
+/// out of bt's reach, and editing them does nothing until it is rebuilt.
+fn go_prebuilt_runner_watch_paths(runner: &str) -> Result<Vec<PathBuf>> {
+    let binary = go_runner::resolve_prebuilt_runner(runner)?;
+    // Drop `.` components so `./bin/evals` reads cleanly in watch messages.
+    normalize_watch_paths([binary.components().collect()])
 }
 
 /// Derives the watch set for a Go eval.
@@ -5219,6 +5271,90 @@ mod tests {
             ] {
                 assert!(message.contains(needle), "missing {needle:?}: {message}");
             }
+
+            let _ = fs::remove_dir_all(&dir);
+        }
+
+        /// Writes a file that `go_runner::is_go_binary` accepts: an ELF header
+        /// followed by the Go linker's build-info magic.
+        fn write_fake_go_binary(dir: &Path) -> PathBuf {
+            let binary = dir.join("evals");
+            let mut bytes = b"\x7fELF".to_vec();
+            bytes.resize(64, 0);
+            bytes.extend_from_slice(b"\xff Go buildinf:\x08\x02");
+            fs::write(&binary, bytes).expect("binary written");
+            binary
+        }
+
+        // SDK-571: `bt eval --runner ./bin/evals` must not need a toolchain to
+        // discover files the binary never reads.
+        #[test]
+        fn is_prebuilt_go_runner_trusts_language_go() {
+            let runner = Some("./bin/evals");
+            let source = vec!["./cmd/evals".to_string()];
+            assert!(is_prebuilt_go_runner(
+                runner,
+                Some(EvalLanguage::Go),
+                &source
+            ));
+            assert!(is_prebuilt_go_runner(runner, Some(EvalLanguage::Go), &[]));
+            assert!(!is_prebuilt_go_runner(None, Some(EvalLanguage::Go), &[]));
+        }
+
+        #[test]
+        fn is_prebuilt_go_runner_detects_a_go_binary_with_directory_inputs() {
+            let dir = make_temp_dir("go-prebuilt-detect");
+            let binary = write_fake_go_binary(&dir);
+            let runner = binary.to_str().expect("utf-8 path");
+            let dir_input = vec![dir.to_string_lossy().into_owned()];
+
+            assert!(is_prebuilt_go_runner(Some(runner), None, &[]));
+            assert!(is_prebuilt_go_runner(Some(runner), None, &dir_input));
+
+            let _ = fs::remove_dir_all(&dir);
+        }
+
+        #[test]
+        fn is_prebuilt_go_runner_leaves_other_runners_alone() {
+            let dir = make_temp_dir("go-prebuilt-other");
+            let binary = write_fake_go_binary(&dir);
+            let go_runner = binary.to_str().expect("utf-8 path");
+            let tsx = dir.join("tsx");
+            fs::write(&tsx, "#!/usr/bin/env node\nrequire('tsx/cli')\n").expect("tsx written");
+            let tsx_runner = tsx.to_str().expect("utf-8 path");
+            let eval_file = dir.join("a.eval.ts");
+            fs::write(&eval_file, "").expect("eval written");
+            let file_input = vec![eval_file.to_string_lossy().into_owned()];
+
+            // JS and Python runners, explicit or by name, keep normal discovery.
+            assert!(!is_prebuilt_go_runner(Some(tsx_runner), None, &[]));
+            assert!(!is_prebuilt_go_runner(Some("tsx"), None, &[]));
+            assert!(!is_prebuilt_go_runner(None, None, &[]));
+            // A non-Go language override wins over what the binary looks like.
+            assert!(!is_prebuilt_go_runner(
+                Some(go_runner),
+                Some(EvalLanguage::JavaScript),
+                &[]
+            ));
+            // Explicit source files already pick a language.
+            assert!(!is_prebuilt_go_runner(Some(go_runner), None, &file_input));
+
+            let _ = fs::remove_dir_all(&dir);
+        }
+
+        #[test]
+        fn go_prebuilt_runner_watch_paths_watches_the_binary() {
+            let dir = make_temp_dir("go-prebuilt-watch");
+            let binary = write_fake_go_binary(&dir);
+            let dotted = dir.join(".").join("evals");
+
+            let paths = go_prebuilt_runner_watch_paths(dotted.to_str().expect("utf-8 path"))
+                .expect("watch paths should resolve");
+            assert_eq!(paths, vec![binary]);
+
+            let err = go_prebuilt_runner_watch_paths("./definitely/not/here")
+                .expect_err("a missing binary should fail");
+            assert!(format!("{err:#}").contains("--runner binary not found"));
 
             let _ = fs::remove_dir_all(&dir);
         }

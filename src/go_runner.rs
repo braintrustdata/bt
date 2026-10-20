@@ -99,12 +99,7 @@ pub fn resolve_go_toolchain(env_overrides: &[&str]) -> Option<PathBuf> {
 /// would otherwise surface only as an opaque spawn failure.
 pub fn resolve_prebuilt_runner(explicit: &str) -> Result<PathBuf> {
     let path = Path::new(explicit);
-    let looks_like_path = path.is_absolute()
-        || explicit.contains('/')
-        || explicit.contains('\\')
-        || explicit.starts_with('.');
-
-    if looks_like_path {
+    if runner_looks_like_path(explicit) {
         if !path.is_file() {
             anyhow::bail!("--runner binary not found: {explicit}");
         }
@@ -115,6 +110,84 @@ pub fn resolve_prebuilt_runner(explicit: &str) -> Result<PathBuf> {
     // error names it, matching how the JS runner override behaves.
     Ok(crate::python_runner::find_binary_in_path(&[explicit])
         .unwrap_or_else(|| PathBuf::from(explicit)))
+}
+
+/// True when `--runner` names a file by path rather than a command on PATH.
+pub fn runner_looks_like_path(runner: &str) -> bool {
+    Path::new(runner).is_absolute()
+        || runner.contains('/')
+        || runner.contains('\\')
+        || runner.starts_with('.')
+}
+
+/// Magic that opens the build-info blob the Go linker embeds in every binary
+/// (what `go version <file>` reads). It survives `-ldflags="-s -w"`.
+const GO_BUILDINFO_MAGIC: &[u8] = b"\xff Go buildinf:";
+
+/// The blob is 16-byte aligned, and so is its file offset in practice.
+const GO_BUILDINFO_ALIGN: usize = 16;
+
+/// True when `path` is an executable compiled by the Go toolchain.
+///
+/// Lets `bt eval --runner ./bin/evals` recognize a prebuilt Go eval binary
+/// without a Go toolchain or `--language go`. Scripts and shims (`tsx`, a
+/// virtualenv's `python`) are rejected by their first bytes, before the rest of
+/// the file is read.
+pub fn is_go_binary(path: &Path) -> bool {
+    use std::io::Read;
+
+    const EXECUTABLE_MAGICS: &[&[u8]] = &[
+        b"\x7fELF",
+        b"MZ",
+        b"\xcf\xfa\xed\xfe",
+        b"\xce\xfa\xed\xfe",
+        b"\xca\xfe\xba\xbe",
+    ];
+
+    let Ok(mut file) = std::fs::File::open(path) else {
+        return false;
+    };
+    let mut buf = vec![0u8; 1 << 20];
+    let mut first = true;
+    loop {
+        // Fill whole chunks so each starts on an aligned offset; an aligned
+        // blob then never straddles two chunks.
+        let mut filled = 0;
+        while filled < buf.len() {
+            match file.read(&mut buf[filled..]) {
+                Ok(0) => break,
+                Ok(read) => filled += read,
+                Err(_) => return false,
+            }
+        }
+        if first
+            && !EXECUTABLE_MAGICS
+                .iter()
+                .any(|magic| buf[..filled].starts_with(magic))
+        {
+            return false;
+        }
+        first = false;
+        if buf[..filled]
+            .chunks_exact(GO_BUILDINFO_ALIGN)
+            .any(is_go_buildinfo_header)
+        {
+            return true;
+        }
+        if filled < buf.len() {
+            return false;
+        }
+    }
+}
+
+/// Matches the blob header as `debug/buildinfo` does: magic, then a pointer
+/// size of 4 or 8, then flags with the inline-strings bit every Go 1.18+ binary
+/// sets. Checking past the magic keeps a binary that merely contains the magic
+/// as a string (bt itself does) from counting.
+fn is_go_buildinfo_header(header: &[u8]) -> bool {
+    header.starts_with(GO_BUILDINFO_MAGIC)
+        && matches!(header[GO_BUILDINFO_MAGIC.len()], 4 | 8)
+        && header[GO_BUILDINFO_MAGIC.len() + 1] & 0x2 != 0
 }
 
 /// True when `dir` sits inside a Go module.
@@ -277,5 +350,48 @@ mod tests {
             !packages[2].is_eval_runner(),
             "library that imports the runner"
         );
+    }
+
+    #[test]
+    fn is_go_binary_finds_build_info_past_the_first_chunk() {
+        let dir = make_temp_dir("is-go-binary");
+        let binary = dir.join("evals");
+        let mut bytes = b"\x7fELF".to_vec();
+        bytes.resize(1 << 20, 0);
+        bytes.extend_from_slice(GO_BUILDINFO_MAGIC);
+        bytes.extend_from_slice(&[8, 2]);
+        bytes.extend_from_slice(&[0u8; 32]);
+        std::fs::write(&binary, bytes).expect("binary written");
+
+        assert!(is_go_binary(&binary));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn is_go_binary_rejects_scripts_and_other_executables() {
+        let dir = make_temp_dir("not-go-binary");
+        let script = dir.join("tsx");
+        let mut bytes = b"#!/bin/sh\n# ".to_vec();
+        bytes.extend_from_slice(GO_BUILDINFO_MAGIC);
+        std::fs::write(&script, bytes).expect("script written");
+
+        assert!(!is_go_binary(&script), "not an executable format");
+        // The magic alone, unaligned or without the header fields, is not enough.
+        let mut bytes = b"\x7fELF".to_vec();
+        bytes.resize(32, 0);
+        bytes.extend_from_slice(GO_BUILDINFO_MAGIC);
+        bytes.extend_from_slice(&[0u8; 32]);
+        let bare_magic = dir.join("bare-magic");
+        std::fs::write(&bare_magic, bytes).expect("binary written");
+        assert!(!is_go_binary(&bare_magic), "magic without a valid header");
+        assert!(!is_go_binary(&dir.join("missing")));
+        #[cfg(unix)]
+        assert!(
+            !is_go_binary(Path::new("/bin/sh")),
+            "a native non-Go binary"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

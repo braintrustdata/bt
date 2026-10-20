@@ -3132,3 +3132,109 @@ fn eval_bare_discovery_reports_the_go_failure_inside_a_module() {
         ))
         .stderr(predicate::str::contains("bt eval --language go"));
 }
+
+// SDK-571: a prebuilt eval binary must run where no Go toolchain is installed,
+// with no source paths, with a package directory, and next to nothing else.
+#[test]
+fn eval_runner_runs_a_prebuilt_go_binary_without_a_go_toolchain() {
+    let Some(go) = real_go_binary() else {
+        eprintln!("skipping: no Go toolchain installed to build the fixture");
+        return;
+    };
+    let module = tempfile::tempdir().expect("module tempdir");
+    let config_home = tempfile::tempdir().expect("config tempdir");
+    let empty_path = tempfile::tempdir().expect("empty PATH tempdir");
+    fs::write(
+        module.path().join("go.mod"),
+        "module example.com/test-goevals\n\ngo 1.25.0\n\nrequire github.com/braintrustdata/braintrust-sdk-go v0.17.0\n",
+    )
+    .expect("write go.mod");
+    let package = module.path().join("cmd").join("a");
+    fs::create_dir_all(&package).expect("create package dir");
+    fs::write(
+        package.join("main.go"),
+        r#"package main
+
+import (
+	"context"
+
+	"github.com/braintrustdata/braintrust-sdk-go/eval"
+	"github.com/braintrustdata/braintrust-sdk-go/evalrunner"
+)
+
+func main() {
+	r := evalrunner.New()
+	evalrunner.RegisterEval(r, &eval.Eval[string, string]{
+		Name:        "test-eval",
+		ProjectName: "test-project",
+		Task: eval.T(func(_ context.Context, input string) (string, error) {
+			return input, nil
+		}),
+	})
+	evalrunner.Main(r)
+}
+"#,
+    )
+    .expect("write main.go");
+
+    // Fetching the SDK needs the module cache or the network; without either
+    // the fixture cannot be built, which says nothing about bt.
+    let tidy = std::process::Command::new(&go)
+        .args(["mod", "tidy"])
+        .current_dir(module.path())
+        .output()
+        .expect("run go mod tidy");
+    if !tidy.status.success() {
+        eprintln!(
+            "skipping: could not fetch the Go SDK: {}",
+            String::from_utf8_lossy(&tidy.stderr)
+        );
+        return;
+    }
+    let build = std::process::Command::new(&go)
+        .args(["build", "-o", "bin/evals", "./cmd/a"])
+        .current_dir(module.path())
+        .output()
+        .expect("run go build");
+    assert!(
+        build.status.success(),
+        "go build failed: {}",
+        String::from_utf8_lossy(&build.stderr)
+    );
+    let binary_only = module.path().join("binary-only");
+    fs::create_dir_all(&binary_only).expect("create binary-only dir");
+    fs::copy(module.path().join("bin/evals"), binary_only.join("evals")).expect("copy binary");
+
+    let cases: [(&Path, &[&str]); 4] = [
+        (module.path(), &["--runner", "./bin/evals"]),
+        (module.path(), &["--runner", "./bin/evals", "./cmd/a"]),
+        (
+            module.path(),
+            &["--language", "go", "--runner", "./bin/evals", "./cmd/a"],
+        ),
+        (&binary_only, &["--runner", "./evals"]),
+    ];
+    for (dir, args) in cases {
+        let mut cmd = bt_command();
+        clear_braintrust_auth_env(&mut cmd);
+        for key in [
+            "GOROOT",
+            "BRAINTRUST_EVAL_GO_BIN",
+            "BRAINTRUST_EVAL_GO",
+            "BT_EVAL_GO_BIN",
+            "BT_EVAL_GO",
+            "BRAINTRUST_EVAL_LANGUAGE",
+            "BRAINTRUST_EVAL_RUNNER",
+        ] {
+            cmd.env_remove(key);
+        }
+        cmd.current_dir(dir)
+            .env("XDG_CONFIG_HOME", config_home.path())
+            .env("PATH", empty_path.path())
+            .args(["eval", "--list", "--no-send-logs"])
+            .args(args)
+            .assert()
+            .success()
+            .stdout(predicate::str::contains("test-eval"));
+    }
+}
