@@ -2073,6 +2073,15 @@ mod tests {
 
     use super::*;
 
+    // Auth tests use this same lock while changing the process working directory.
+    // Custom view bundling resolves JavaScript dependencies relative to that directory.
+    fn cwd_test_guard() -> futures_util::lock::MutexGuard<'static, ()> {
+        tokio::runtime::Builder::new_current_thread()
+            .build()
+            .expect("create test runtime")
+            .block_on(crate::auth::env_test_lock().lock())
+    }
+
     fn test_client(api_url: &str) -> ApiClient {
         let login = braintrust_sdk_rust::LoginState::new();
         login.set(
@@ -2151,6 +2160,7 @@ mod tests {
 
     #[test]
     fn push_runner_bundles_tsx_with_swc() {
+        let _cwd_guard = cwd_test_guard();
         let dir = tempfile::tempdir().expect("tempdir");
         let dependency = dir.path().join("label.ts");
         let path = dir.path().join("swc.trace-view.tsx");
@@ -2229,6 +2239,7 @@ export default customTraceView(
 
     #[test]
     fn push_runner_keeps_same_named_files_distinct() {
+        let _cwd_guard = cwd_test_guard();
         let dir = tempfile::tempdir().expect("tempdir");
         let mut paths = Vec::new();
         for name in ["first", "second"] {
@@ -2257,6 +2268,7 @@ export default customDatasetView(
 
     #[test]
     fn preview_bundles_shared_and_package_imports_and_tracks_dependencies() {
+        let _cwd_guard = cwd_test_guard();
         let dir = tempfile::tempdir().expect("tempdir");
         let views = dir.path().join("views");
         let components = dir.path().join("components");
@@ -2324,6 +2336,7 @@ export default customDatasetView(
 
     #[test]
     fn push_discovers_wrapped_react_components() {
+        let _cwd_guard = cwd_test_guard();
         let dir = tempfile::tempdir().expect("tempdir");
         let path = dir.path().join("test.trace-view.tsx");
         std::fs::write(
@@ -2458,22 +2471,7 @@ export default customDatasetView(
     }
 
     #[test]
-    fn preview_source_version_changes_when_source_changes() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let path = dir.path().join("test.trace-view.tsx");
-        std::fs::write(&path, "export default null;\n").expect("write view");
-        let source = test_preview_source(path.clone());
-
-        let before = preview_source_version(&source, &[]);
-        std::fs::write(&path, "export default function View() { return null; }\n")
-            .expect("rewrite view");
-        let after = preview_source_version(&source, &[]);
-
-        assert_ne!(before, after);
-    }
-
-    #[test]
-    fn preview_source_version_changes_when_dependency_changes() {
+    fn preview_source_version_changes_when_source_or_dependency_changes() {
         let dir = tempfile::tempdir().expect("tempdir");
         let path = dir.path().join("test.trace-view.tsx");
         let dependency = dir.path().join("component.tsx");
@@ -2483,18 +2481,22 @@ export default customDatasetView(
             "export default function View() { return null; }\n",
         )
         .expect("write dependency");
-        let source = test_preview_source(path);
-
+        let source = test_preview_source(path.clone());
         let dependency_paths = vec![dependency.clone()];
+
         let before = preview_source_version(&source, &dependency_paths);
+        std::fs::write(&path, "export default null;\n").expect("rewrite view");
+        let after_source_change = preview_source_version(&source, &dependency_paths);
+        assert_ne!(before, after_source_change);
+
         std::fs::write(
             &dependency,
             "export default function View() { return 'changed'; }\n",
         )
         .expect("rewrite dependency");
-        let after = preview_source_version(&source, &dependency_paths);
+        let after_dependency_change = preview_source_version(&source, &dependency_paths);
 
-        assert_ne!(before, after);
+        assert_ne!(after_source_change, after_dependency_change);
     }
 
     #[test]
@@ -2734,7 +2736,7 @@ export default customDatasetView(
     }
 
     #[test]
-    fn builds_inline_custom_view_insert_event() {
+    fn builds_insert_events_for_trace_and_dataset_views() {
         let view = PreparedView {
             source_file: "test.view.tsx".to_string(),
             entry: ViewManifestEntry {
@@ -2764,6 +2766,33 @@ export default customDatasetView(
         assert!(event.get("description").is_none());
         assert!(event.get("metadata").is_none());
         assert!(event.get("tags").is_none());
+
+        let dataset_view = PreparedView {
+            source_file: "dataset.view.tsx".to_string(),
+            entry: ViewManifestEntry {
+                view_type: ViewType::Dataset,
+                name: "Dataset View".to_string(),
+                slug: "dataset-view".to_string(),
+                code: "module.exports = function View() {}".to_string(),
+                project_id: None,
+                project_name: None,
+                dataset_id: Some("dataset_test".to_string()),
+                dataset_name: None,
+            },
+            project: test_project(),
+            dataset: Some(datasets_api::Dataset {
+                id: "dataset_test".to_string(),
+                name: "test-dataset".to_string(),
+                project_id: Some("proj_test".to_string()),
+                description: None,
+                created: None,
+                created_at: None,
+                metadata: None,
+            }),
+        };
+        let dataset_event = build_insert_event(&dataset_view, IfExistsMode::Error);
+        assert_eq!(dataset_event["origin"]["object_type"], "dataset");
+        assert_eq!(dataset_event["origin"]["object_id"], "dataset_test");
     }
 
     #[test]
@@ -2838,36 +2867,5 @@ export default customDatasetView(
             assert_eq!(pushed.last().unwrap().function_id, "fn_test_new");
             assert!(pushed.last().unwrap().url.contains("tv=fn_test_new"));
         }
-    }
-
-    #[test]
-    fn dataset_insert_event_sets_origin() {
-        let view = PreparedView {
-            source_file: "dataset.view.tsx".to_string(),
-            entry: ViewManifestEntry {
-                view_type: ViewType::Dataset,
-                name: "Dataset View".to_string(),
-                slug: "dataset-view".to_string(),
-                code: "module.exports = function View() {}".to_string(),
-                project_id: None,
-                project_name: None,
-                dataset_id: Some("dataset_test".to_string()),
-                dataset_name: None,
-            },
-            project: test_project(),
-            dataset: Some(datasets_api::Dataset {
-                id: "dataset_test".to_string(),
-                name: "test-dataset".to_string(),
-                project_id: Some("proj_test".to_string()),
-                description: None,
-                created: None,
-                created_at: None,
-                metadata: None,
-            }),
-        };
-
-        let event = build_insert_event(&view, IfExistsMode::Error);
-        assert_eq!(event["origin"]["object_type"], "dataset");
-        assert_eq!(event["origin"]["object_id"], "dataset_test");
     }
 }
