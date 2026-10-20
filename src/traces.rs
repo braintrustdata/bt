@@ -1934,10 +1934,9 @@ fn run_app(
 
         if event::poll(Duration::from_millis(200))? {
             match event::read()? {
-                Event::Key(key)
-                    if handle_key_event(app, key, &client, &handle)? => {
-                        break;
-                    }
+                Event::Key(key) if handle_key_event(app, key, &client, &handle)? => {
+                    break;
+                }
                 Event::Resize(_, _) => {}
                 _ => {}
             }
@@ -2357,38 +2356,36 @@ fn handle_span_detail_key(
                 scroll_detail_down_bounded(app, 1);
             }
         }
-        KeyCode::PageUp
-            if app.detail_pane_focus == DetailPaneFocus::Detail => {
-                if detail_message_list_mode {
-                    if app.detail_view == DetailView::Thread {
-                        for _ in 0..10 {
-                            app.move_thread_message_up();
-                        }
-                    } else {
-                        for _ in 0..10 {
-                            app.move_span_detail_message_up();
-                        }
+        KeyCode::PageUp if app.detail_pane_focus == DetailPaneFocus::Detail => {
+            if detail_message_list_mode {
+                if app.detail_view == DetailView::Thread {
+                    for _ in 0..10 {
+                        app.move_thread_message_up();
                     }
                 } else {
-                    app.scroll_detail_up(10);
+                    for _ in 0..10 {
+                        app.move_span_detail_message_up();
+                    }
                 }
+            } else {
+                app.scroll_detail_up(10);
             }
-        KeyCode::PageDown
-            if app.detail_pane_focus == DetailPaneFocus::Detail => {
-                if detail_message_list_mode {
-                    if app.detail_view == DetailView::Thread {
-                        for _ in 0..10 {
-                            app.move_thread_message_down();
-                        }
-                    } else {
-                        for _ in 0..10 {
-                            app.move_span_detail_message_down();
-                        }
+        }
+        KeyCode::PageDown if app.detail_pane_focus == DetailPaneFocus::Detail => {
+            if detail_message_list_mode {
+                if app.detail_view == DetailView::Thread {
+                    for _ in 0..10 {
+                        app.move_thread_message_down();
                     }
                 } else {
-                    scroll_detail_down_bounded(app, 10);
+                    for _ in 0..10 {
+                        app.move_span_detail_message_down();
+                    }
                 }
+            } else {
+                scroll_detail_down_bounded(app, 10);
             }
+        }
         KeyCode::Backspace => {
             app.screen = Screen::Traces;
             app.set_status(
@@ -2420,11 +2417,10 @@ fn handle_span_detail_key(
                 app.toggle_selected_thread_message();
             }
         }
-        KeyCode::Char('v')
-            if detail_message_list_mode => {
-                app.open_message_viewer();
-                app.set_status(app.span_detail_status_text());
-            }
+        KeyCode::Char('v') if detail_message_list_mode => {
+            app.open_message_viewer();
+            app.set_status(app.span_detail_status_text());
+        }
         KeyCode::Char('t') => {
             app.detail_scroll = 0;
             app.close_message_viewer();
@@ -2442,37 +2438,37 @@ fn handle_span_detail_key(
                 request_selected_span_load(app, client, handle, false)?;
             }
         }
-        KeyCode::Tab
-            if app.detail_view == DetailView::Span => {
-                app.toggle_span_detail_tab();
-                app.set_status(app.span_detail_status_text());
-            }
-        KeyCode::Char('r')
-            if app.loaded_root_span_id.is_some() => {
-                request_loaded_trace_reload(app, client, handle)?;
-            }
+        KeyCode::Tab if app.detail_view == DetailView::Span => {
+            app.toggle_span_detail_tab();
+            app.set_status(app.span_detail_status_text());
+        }
+        KeyCode::Char('r') if app.loaded_root_span_id.is_some() => {
+            request_loaded_trace_reload(app, client, handle)?;
+        }
         KeyCode::Char(' ')
             if app.detail_pane_focus == DetailPaneFocus::Tree
-                && app.toggle_selected_span_collapsed()
-            => {
-                app.set_status(app.span_detail_status_text());
-            }
-        KeyCode::Char('u') if key.modifiers.contains(KeyModifiers::CONTROL)
-            && app.detail_pane_focus == DetailPaneFocus::Detail => {
-                if detail_message_list_mode {
-                    if app.detail_view == DetailView::Thread {
-                        for _ in 0..10 {
-                            app.move_thread_message_up();
-                        }
-                    } else {
-                        for _ in 0..10 {
-                            app.move_span_detail_message_up();
-                        }
+                && app.toggle_selected_span_collapsed() =>
+        {
+            app.set_status(app.span_detail_status_text());
+        }
+        KeyCode::Char('u')
+            if key.modifiers.contains(KeyModifiers::CONTROL)
+                && app.detail_pane_focus == DetailPaneFocus::Detail =>
+        {
+            if detail_message_list_mode {
+                if app.detail_view == DetailView::Thread {
+                    for _ in 0..10 {
+                        app.move_thread_message_up();
                     }
                 } else {
-                    app.scroll_detail_up(10)
+                    for _ in 0..10 {
+                        app.move_span_detail_message_up();
+                    }
                 }
+            } else {
+                app.scroll_detail_up(10)
             }
+        }
         KeyCode::Char('d')
             if key.modifiers.contains(KeyModifiers::CONTROL)
                 && app.detail_pane_focus == DetailPaneFocus::Detail =>
@@ -5778,14 +5774,12 @@ pub(crate) fn parse_trace_url(input: &str) -> Result<ParsedTraceUrl> {
 
     for (key, value) in parsed_url.query_pairs() {
         match key.as_ref() {
-            "r"
-                if !value.is_empty() => {
-                    parsed.row_ref = Some(value.to_string());
-                }
-            "s"
-                if !value.is_empty() => {
-                    parsed.span_id = Some(value.to_string());
-                }
+            "r" if !value.is_empty() => {
+                parsed.row_ref = Some(value.to_string());
+            }
+            "s" if !value.is_empty() => {
+                parsed.span_id = Some(value.to_string());
+            }
             "tvt" if !value.is_empty() => {
                 parsed.trace_view_type = Some(value.to_string());
             }
