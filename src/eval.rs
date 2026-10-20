@@ -3382,7 +3382,10 @@ impl EvalUi {
                 } else if stream == "stderr" && !self.verbose {
                     self.suppressed_stderr_lines += 1;
                 } else {
-                    let _ = self.progress.println(message);
+                    // `MultiProgress::println` is a no-op when stderr is not a
+                    // terminal, which would drop runner output such as `go run`
+                    // compile errors.
+                    self.print_persistent_line(message);
                 }
             }
             EvalEvent::Error { message, stack, .. } => {
@@ -3400,7 +3403,7 @@ impl EvalUi {
                 if show_hint {
                     let hint = "Hint: set BRAINTRUST_API_KEY, run `bt login`/`bt login --oauth`, or use --no-send-logs for local evals.";
                     if self.verbose {
-                        let _ = self.progress.println(hint.dark_grey().to_string());
+                        self.print_persistent_line(hint.dark_grey().to_string());
                     } else {
                         self.record_deferred_error(hint.to_string());
                     }

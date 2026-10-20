@@ -2967,3 +2967,36 @@ fn scorers_preprocessor_export_requires_source() {
         .failure()
         .stderr(predicate::str::contains("--preprocessor <SOURCE>"));
 }
+
+// The runner fails the way `go run` does on a compile error: plain text on
+// stderr, then exit 1. That output must reach the user even without a TTY.
+#[cfg(unix)]
+#[test]
+fn eval_go_runner_failure_shows_runner_stderr() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    let config_home = tempfile::tempdir().expect("config tempdir");
+    fs::write(dir.path().join("main.go"), "package main\n").expect("write main.go");
+    let runner = dir.path().join("runner.sh");
+    fs::write(
+        &runner,
+        "#!/bin/sh\necho 'main.go:4:2: undefined: undefinedThing' >&2\nexit 1\n",
+    )
+    .expect("write runner");
+    let mut perms = fs::metadata(&runner).expect("metadata").permissions();
+    perms.set_mode(0o755);
+    fs::set_permissions(&runner, perms).expect("chmod");
+
+    let mut cmd = bt_command();
+    clear_braintrust_auth_env(&mut cmd);
+    cmd.current_dir(dir.path())
+        .env("XDG_CONFIG_HOME", config_home.path())
+        .args(["eval", "--no-send-logs", "--language", "go"])
+        .args(["--runner", "./runner.sh", "main.go"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains(
+            "main.go:4:2: undefined: undefinedThing",
+        ));
+}
