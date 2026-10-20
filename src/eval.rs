@@ -2832,6 +2832,16 @@ fn build_go_command(runner_override: Option<&str>, files: &[String]) -> Result<C
         );
     }
 
+    // A `package main` that never links the runner would run, report no evals,
+    // and exit 0. Discovery already skips such packages; reject them here too.
+    if !package.is_eval_runner() {
+        anyhow::bail!(
+            "{} does not import {}, so it has no evals to run. Register your evals with `evalrunner` and call `evalrunner.Main`, or point bt at the package that does.",
+            package.import_path,
+            go_runner::EVAL_RUNNER_IMPORT
+        );
+    }
+
     let mut command = Command::new(go);
     command.arg("run").arg(&package.dir);
 
@@ -4873,7 +4883,7 @@ mod tests {
             let _guard = lock_env();
             let dir = make_temp_dir("go-run");
             fs::write(dir.join("main.go"), "package main").expect("main written");
-            let json = go_list_json(&dir, "main", &["main.go"], &[]);
+            let json = go_list_json(&dir, "main", &["main.go"], &[go_runner::EVAL_RUNNER_IMPORT]);
             let fake_go = write_fake_go(&dir, &json);
             let previous = set_env_var(
                 "BRAINTRUST_EVAL_GO_BIN",
@@ -4899,29 +4909,42 @@ mod tests {
             let _ = fs::remove_dir_all(&dir);
         }
 
-        // `go run` needs `package main`. Catching it here gives a pointed error
-        // instead of letting the toolchain complain about a missing entry point.
+        // `go run` needs `package main`, and a main that never links evalrunner
+        // would run zero evals and exit 0. Both get a pointed error up front.
         #[cfg(unix)]
         #[test]
-        fn build_go_command_rejects_a_non_main_package() {
-            let _guard = lock_env();
-            let dir = make_temp_dir("go-not-main");
-            fs::write(dir.join("lib.go"), "package lib").expect("lib written");
-            let json = go_list_json(&dir, "lib", &["lib.go"], &[]);
-            let fake_go = write_fake_go(&dir, &json);
-            let previous = set_env_var(
-                "BRAINTRUST_EVAL_GO_BIN",
-                fake_go.to_str().expect("utf-8 path"),
-            );
+        fn build_go_command_rejects_unrunnable_packages() {
+            let cases: [(&str, &str, &[&str], &[&str]); 2] = [
+                ("lib", "lib.go", &[], &["not `package main`"]),
+                (
+                    "main",
+                    "main.go",
+                    &["fmt"],
+                    &["does not import", go_runner::EVAL_RUNNER_IMPORT],
+                ),
+            ];
+            for (name, file, deps, expected) in cases {
+                let _guard = lock_env();
+                let dir = make_temp_dir("go-unrunnable");
+                fs::write(dir.join(file), format!("package {name}")).expect("source written");
+                let json = go_list_json(&dir, name, &[file], deps);
+                let fake_go = write_fake_go(&dir, &json);
+                let previous = set_env_var(
+                    "BRAINTRUST_EVAL_GO_BIN",
+                    fake_go.to_str().expect("utf-8 path"),
+                );
 
-            let err = build_go_command(None, &[dir.join("lib.go").to_string_lossy().into_owned()])
-                .expect_err("a library package should fail");
+                let err = build_go_command(None, &[dir.join(file).to_string_lossy().into_owned()])
+                    .expect_err("an unrunnable package should fail");
 
-            restore_env_var("BRAINTRUST_EVAL_GO_BIN", previous);
-            let message = format!("{err:#}");
-            assert!(message.contains("not `package main`"), "got {message}");
+                restore_env_var("BRAINTRUST_EVAL_GO_BIN", previous);
+                let message = format!("{err:#}");
+                for needle in expected {
+                    assert!(message.contains(needle), "package {name}: got {message}");
+                }
 
-            let _ = fs::remove_dir_all(&dir);
+                let _ = fs::remove_dir_all(&dir);
+            }
         }
 
         #[test]
