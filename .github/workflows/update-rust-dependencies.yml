@@ -1,0 +1,151 @@
+name: Update Rust dependencies
+
+on:
+  workflow_dispatch:
+    inputs:
+      update_rust_sdk:
+        description: Update the Rust SDK dependency
+        required: false
+        type: boolean
+        default: true
+      update_bt_daemon:
+        description: Update bt-daemon from plugin-monorepo
+        required: false
+        type: boolean
+        default: true
+
+permissions:
+  contents: write
+  pull-requests: write
+
+concurrency:
+  group: update-rust-dependencies
+  cancel-in-progress: false
+
+jobs:
+  update:
+    runs-on: ubuntu-24.04
+    env:
+      GH_TOKEN: ${{ github.token }}
+      BRANCH: automation/update-rust-dependencies
+      UPDATE_RUST_SDK: ${{ inputs.update_rust_sdk }}
+      UPDATE_BT_DAEMON: ${{ inputs.update_bt_daemon }}
+      SDK_REPOSITORY: braintrustdata/braintrust-sdk-rust
+      DAEMON_REPOSITORY: braintrustdata/braintrust-coding-agent-plugins
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          fetch-depth: 0
+          ref: main
+
+      - name: Validate dependency selection
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ "$UPDATE_RUST_SDK" != "true" && "$UPDATE_BT_DAEMON" != "true" ]]; then
+            echo "Select at least one dependency to update." >&2
+            exit 1
+          fi
+
+      - name: Resolve selected dependency commits
+        id: dependencies
+        shell: bash
+        run: |
+          set -euo pipefail
+          resolve_main_sha() {
+            local repository="$1"
+            local sha
+            sha="$(git ls-remote "https://github.com/${repository}.git" refs/heads/main | awk 'NR == 1 { print $1 }')"
+            if [[ ! "$sha" =~ ^[0-9a-f]{40}$ ]]; then
+              echo "Could not resolve ${repository} main to a commit." >&2
+              exit 1
+            fi
+            echo "$sha"
+          }
+
+          if [[ "$UPDATE_RUST_SDK" == "true" ]]; then
+            echo "sdk_sha=$(resolve_main_sha "$SDK_REPOSITORY")" >> "$GITHUB_OUTPUT"
+          fi
+          if [[ "$UPDATE_BT_DAEMON" == "true" ]]; then
+            echo "daemon_sha=$(resolve_main_sha "$DAEMON_REPOSITORY")" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Update selected manifest pins and lockfile
+        env:
+          SDK_SHA: ${{ steps.dependencies.outputs.sdk_sha }}
+          DAEMON_SHA: ${{ steps.dependencies.outputs.daemon_sha }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import os
+          import re
+          from pathlib import Path
+
+          manifest = Path("Cargo.toml")
+          text = manifest.read_text()
+          dependencies = [
+              (
+                  os.environ["UPDATE_RUST_SDK"] == "true",
+                  r'(braintrust-sdk-rust\s*=\s*\{\s*git\s*=\s*"https://github\.com/braintrustdata/braintrust-sdk-rust"\s*,\s*rev\s*=\s*")[0-9a-f]{40}("\s*\})',
+                  os.environ.get("SDK_SHA", ""),
+                  "braintrust-sdk-rust",
+              ),
+              (
+                  os.environ["UPDATE_BT_DAEMON"] == "true",
+                  r'(bt-daemon\s*=\s*\{\s*git\s*=\s*"https://github\.com/braintrustdata/braintrust-coding-agent-plugins"\s*,\s*rev\s*=\s*")[0-9a-f]{40}("\s*\})',
+                  os.environ.get("DAEMON_SHA", ""),
+                  "bt-daemon",
+              ),
+          ]
+
+          for selected, pattern, sha, name in dependencies:
+              if not selected:
+                  continue
+              if not re.fullmatch(r"[0-9a-f]{40}", sha):
+                  raise SystemExit(f"missing or invalid resolved commit for {name}")
+              text, count = re.subn(pattern, rf"\g<1>{sha}\g<2>", text)
+              if count != 1:
+                  raise SystemExit(f"expected exactly one {name} git dependency")
+
+          manifest.write_text(text)
+          PY
+
+          # Resolve the lockfile from the selected direct pins together. Updating
+          # by package name is ambiguous when bt-daemon retains another SDK revision.
+          cargo update --workspace
+
+      - name: Commit and open pull request
+        env:
+          SDK_SHA: ${{ steps.dependencies.outputs.sdk_sha }}
+          DAEMON_SHA: ${{ steps.dependencies.outputs.daemon_sha }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          if git diff --quiet -- Cargo.toml Cargo.lock; then
+            echo "Selected Rust dependencies are already up to date."
+            exit 0
+          fi
+
+          git fetch origin "refs/heads/${BRANCH}:refs/remotes/origin/${BRANCH}" || true
+          git switch -C "$BRANCH"
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add Cargo.toml Cargo.lock
+          git commit -m "chore: update Rust dependencies"
+          git push --force-with-lease origin "HEAD:refs/heads/${BRANCH}"
+
+          body="Updates the selected Rust dependencies to the commits at their respective main branches when this workflow ran."
+          if [[ "$UPDATE_RUST_SDK" == "true" ]]; then
+            body+=$'\n\n- `braintrust-sdk-rust`: ['"$SDK_SHA"'](https://github.com/'"$SDK_REPOSITORY"'/commit/'"$SDK_SHA"')'
+          fi
+          if [[ "$UPDATE_BT_DAEMON" == "true" ]]; then
+            body+=$'\n- `bt-daemon`: ['"$DAEMON_SHA"'](https://github.com/'"$DAEMON_REPOSITORY"'/commit/'"$DAEMON_SHA"')'
+          fi
+
+          pr_number="$(gh pr list --repo "${{ github.repository }}" --head "$BRANCH" --state open --json number --jq '.[0].number')"
+          if [[ -n "$pr_number" ]]; then
+            gh pr edit "$pr_number" --repo "${{ github.repository }}" --title "chore: update Rust dependencies" --body "$body"
+          else
+            gh pr create --repo "${{ github.repository }}" --base main --head "$BRANCH" --title "chore: update Rust dependencies" --body "$body"
+          fi
