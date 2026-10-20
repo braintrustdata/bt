@@ -12,6 +12,122 @@ use crate::{args::BaseArgs, auth, http::build_http_client, Cli};
 
 const PROTOCOL_VERSION: &str = "2025-03-26";
 
+fn global_args() -> Result<Vec<Arg>> {
+    Ok(Cli::command()
+        .find_subcommand("status")
+        .context("status command is unavailable")?
+        .get_arguments()
+        .filter(|arg| arg.is_global_set())
+        .cloned()
+        .collect())
+}
+
+fn global_option_specs(args: &[Arg]) -> Vec<(Option<String>, Option<char>, bool)> {
+    args.iter()
+        .map(|arg| {
+            (
+                arg.get_long().map(str::to_owned),
+                arg.get_short(),
+                matches!(arg.get_action(), ArgAction::Set | ArgAction::Append),
+            )
+        })
+        .collect()
+}
+
+/// Detect the MCP namespace even when global options appear before it.
+pub fn is_mcp_invocation(argv: &[OsString]) -> Result<bool> {
+    let specs = global_option_specs(&global_args()?);
+    let mut index = 1;
+    while index < argv.len() {
+        let Some(token) = argv[index].to_str() else {
+            index += 1;
+            continue;
+        };
+        if token == "--" {
+            return Ok(false);
+        }
+        if token == "mcp" {
+            return Ok(true);
+        }
+        if let Some((name, _)) = token.strip_prefix("--").and_then(|s| s.split_once('=')) {
+            if specs
+                .iter()
+                .any(|(long, _, _)| long.as_deref() == Some(name))
+            {
+                index += 1;
+                continue;
+            }
+        } else if let Some(name) = token.strip_prefix("--") {
+            if let Some((_, _, takes_value)) = specs
+                .iter()
+                .find(|(long, _, _)| long.as_deref() == Some(name))
+            {
+                index += 1 + usize::from(*takes_value);
+                continue;
+            }
+        } else if token.starts_with('-') && token.len() >= 2 {
+            let short = token.chars().nth(1);
+            if let Some((_, _, takes_value)) =
+                specs.iter().find(|(_, candidate, _)| *candidate == short)
+            {
+                index += 1 + usize::from(*takes_value && token.len() == 2);
+                continue;
+            }
+        }
+        // The first non-global token is the root command. Do not mistake a
+        // later positional or tool argument whose value happens to be `mcp`.
+        return Ok(false);
+    }
+    Ok(false)
+}
+
+fn normalize_global_args(argv: &[OsString], args: &[Arg]) -> Vec<OsString> {
+    let specs = global_option_specs(args);
+    let mut normalized = Vec::with_capacity(argv.len());
+    let mut global = Vec::new();
+    if let Some(program) = argv.first() {
+        normalized.push(program.clone());
+    }
+    let mut index = 1;
+    while index < argv.len() {
+        let token = argv[index].to_string_lossy();
+        if token == "--" {
+            normalized.extend(argv[index..].iter().cloned());
+            break;
+        }
+        let matched = if let Some(name) = token.strip_prefix("--") {
+            let name = name.split_once('=').map_or(name, |(name, _)| name);
+            specs
+                .iter()
+                .find(|(long, _, _)| long.as_deref() == Some(name))
+                .map(|(_, _, takes_value)| *takes_value)
+                .map(|takes_value| (takes_value, token.contains('=')))
+        } else if token.starts_with('-') && token.len() >= 2 {
+            let short = token.chars().nth(1);
+            specs
+                .iter()
+                .find(|(_, candidate, _)| *candidate == short)
+                .map(|(_, _, takes_value)| *takes_value)
+                .map(|takes_value| (takes_value, token.len() > 2))
+        } else {
+            None
+        };
+        if let Some((takes_value, attached_value)) = matched {
+            global.push(argv[index].clone());
+            index += 1;
+            if takes_value && !attached_value && index < argv.len() {
+                global.push(argv[index].clone());
+                index += 1;
+            }
+        } else {
+            normalized.push(argv[index].clone());
+            index += 1;
+        }
+    }
+    normalized.splice(1..1, global);
+    normalized
+}
+
 #[derive(Debug, Clone, Deserialize)]
 struct Tool {
     name: String,
@@ -70,14 +186,8 @@ pub fn try_main(argv: &[std::ffi::OsString]) -> Result<()> {
 }
 
 async fn run(argv: &[std::ffi::OsString]) -> Result<()> {
-    let command = Cli::command();
-    let global_args: Vec<Arg> = command
-        .find_subcommand("status")
-        .context("status command is unavailable")?
-        .get_arguments()
-        .filter(|arg| arg.is_global_set())
-        .cloned()
-        .collect();
+    let global_args = global_args()?;
+    let normalized_argv = normalize_global_args(argv, &global_args);
     // The MCP namespace is intentionally discovered only on this path. Resolve
     // the same profile/API-key configuration used by the rest of the CLI.
     let mut preflight = Command::new("bt")
@@ -87,7 +197,7 @@ async fn run(argv: &[std::ffi::OsString]) -> Result<()> {
         preflight = preflight.arg(arg.clone());
     }
     let preflight = preflight.subcommand(Command::new("mcp").allow_external_subcommands(true));
-    let preflight_argv: Vec<OsString> = argv
+    let preflight_argv: Vec<OsString> = normalized_argv
         .iter()
         .filter(|arg| !matches!(arg.to_str(), Some("--help" | "-h" | "--version" | "-V")))
         .cloned()
@@ -98,6 +208,7 @@ async fn run(argv: &[std::ffi::OsString]) -> Result<()> {
     let mut base =
         BaseArgs::from_arg_matches(&matches).context("failed to parse global options")?;
     crate::apply_base_arg_sources(&matches, &mut base.login);
+    base.login.profile_explicit = crate::args::has_explicit_profile_arg(argv);
     if !base.login.quiet && !base.login.verbose {
         base.login.quiet = true;
     } else if base.login.quiet {
@@ -131,7 +242,7 @@ async fn run(argv: &[std::ffi::OsString]) -> Result<()> {
     for arg in global_args {
         command = command.arg(arg);
     }
-    let Some(matches) = parse_matches(command, argv.iter().cloned())? else {
+    let Some(matches) = parse_matches(command, normalized_argv.iter().cloned())? else {
         return Ok(());
     };
     let base = BaseArgs::from_arg_matches(&matches).context("failed to parse global options")?;
@@ -631,6 +742,84 @@ fn parse_rpc_body(body: &str) -> Result<Value> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn detects_mcp_after_global_options() {
+        for argv in [
+            vec!["bt", "--profile", "work", "mcp", "search_docs"],
+            vec!["bt", "--api-url=https://api.example.test", "mcp"],
+            vec!["bt", "-pwork", "mcp", "search_docs"],
+        ] {
+            let argv = argv.into_iter().map(OsString::from).collect::<Vec<_>>();
+            assert!(is_mcp_invocation(&argv).unwrap());
+        }
+    }
+
+    #[test]
+    fn does_not_treat_a_global_option_value_as_the_namespace() {
+        let argv = ["bt", "--profile", "mcp", "status"]
+            .into_iter()
+            .map(OsString::from)
+            .collect::<Vec<_>>();
+        assert!(!is_mcp_invocation(&argv).unwrap());
+
+        let positional = ["bt", "status", "mcp"]
+            .into_iter()
+            .map(OsString::from)
+            .collect::<Vec<_>>();
+        assert!(!is_mcp_invocation(&positional).unwrap());
+    }
+
+    #[test]
+    fn moves_global_options_after_tool_before_namespace() {
+        let args = global_args().unwrap();
+        let argv = [
+            "bt",
+            "mcp",
+            "search_docs",
+            "--profile",
+            "work",
+            "--api-url",
+            "https://api.example.test",
+            "--query",
+            "synthetic",
+        ]
+        .into_iter()
+        .map(OsString::from)
+        .collect::<Vec<_>>();
+        let normalized = normalize_global_args(&argv, &args);
+        assert_eq!(
+            normalized,
+            [
+                "bt",
+                "--profile",
+                "work",
+                "--api-url",
+                "https://api.example.test",
+                "mcp",
+                "search_docs",
+                "--query",
+                "synthetic"
+            ]
+            .map(OsString::from)
+        );
+
+        let mut preflight = Command::new("bt");
+        for arg in &args {
+            preflight = preflight.arg(arg.clone());
+        }
+        preflight = preflight.subcommand(Command::new("mcp").allow_external_subcommands(true));
+        assert!(preflight.try_get_matches_from(normalized).is_ok());
+    }
+
+    #[test]
+    fn explicit_profile_after_dynamic_tool_is_preserved() {
+        let argv = ["bt", "mcp", "search_docs", "--profile", "work"]
+            .into_iter()
+            .map(OsString::from)
+            .collect::<Vec<_>>();
+        assert!(crate::args::has_explicit_profile_arg(&argv));
+    }
 
     #[test]
     fn accepts_unquoted_strings_for_string_unions() {
