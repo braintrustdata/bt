@@ -127,13 +127,17 @@ const GO_BUILDINFO_MAGIC: &[u8] = b"\xff Go buildinf:";
 /// The blob is 16-byte aligned, and so is its file offset in practice.
 const GO_BUILDINFO_ALIGN: usize = 16;
 
-/// True when `path` is an executable compiled by the Go toolchain.
+/// True when `path` is a Go executable that links the SDK's eval runner.
 ///
 /// Lets `bt eval --runner ./bin/evals` recognize a prebuilt Go eval binary
-/// without a Go toolchain or `--language go`. Scripts and shims (`tsx`, a
+/// without a Go toolchain or `--language go`. Both marks are required: the Go
+/// linker's build info says the file is a Go binary, and [`EVAL_RUNNER_IMPORT`]
+/// (kept in function names even when stripped) says it is an eval runner -- the
+/// same rule discovery applies to packages. A Go-built wrapper that launches a
+/// JS or Python runner therefore does not match. Scripts and shims (`tsx`, a
 /// virtualenv's `python`) are rejected by their first bytes, before the rest of
 /// the file is read.
-pub fn is_go_binary(path: &Path) -> bool {
+pub fn is_go_eval_runner_binary(path: &Path) -> bool {
     use std::io::Read;
 
     const EXECUTABLE_MAGICS: &[&[u8]] = &[
@@ -143,12 +147,18 @@ pub fn is_go_binary(path: &Path) -> bool {
         b"\xce\xfa\xed\xfe",
         b"\xca\xfe\xba\xbe",
     ];
+    let runner_import = EVAL_RUNNER_IMPORT.as_bytes();
 
     let Ok(mut file) = std::fs::File::open(path) else {
         return false;
     };
     let mut buf = vec![0u8; 1 << 20];
     let mut first = true;
+    let mut has_build_info = false;
+    let mut links_runner = false;
+    // End of the previous chunk, so an import path split across two chunks is
+    // still found.
+    let mut tail: Vec<u8> = Vec::new();
     loop {
         // Fill whole chunks so each starts on an aligned offset; an aligned
         // blob then never straddles two chunks.
@@ -160,24 +170,40 @@ pub fn is_go_binary(path: &Path) -> bool {
                 Err(_) => return false,
             }
         }
+        let chunk = &buf[..filled];
         if first
             && !EXECUTABLE_MAGICS
                 .iter()
-                .any(|magic| buf[..filled].starts_with(magic))
+                .any(|magic| chunk.starts_with(magic))
         {
             return false;
         }
         first = false;
-        if buf[..filled]
-            .chunks_exact(GO_BUILDINFO_ALIGN)
-            .any(is_go_buildinfo_header)
-        {
+
+        has_build_info = has_build_info
+            || chunk
+                .chunks_exact(GO_BUILDINFO_ALIGN)
+                .any(is_go_buildinfo_header);
+        if !links_runner {
+            let keep = runner_import.len() - 1;
+            tail.extend_from_slice(&chunk[..chunk.len().min(keep)]);
+            links_runner = contains(&tail, runner_import) || contains(chunk, runner_import);
+            tail.clear();
+            tail.extend_from_slice(&chunk[chunk.len().saturating_sub(keep)..]);
+        }
+        if has_build_info && links_runner {
             return true;
         }
         if filled < buf.len() {
             return false;
         }
     }
+}
+
+fn contains(haystack: &[u8], needle: &[u8]) -> bool {
+    haystack
+        .windows(needle.len())
+        .any(|window| window == needle)
 }
 
 /// Matches the blob header as `debug/buildinfo` does: magic, then a pointer
@@ -352,43 +378,76 @@ mod tests {
         );
     }
 
-    #[test]
-    fn is_go_binary_finds_build_info_past_the_first_chunk() {
-        let dir = make_temp_dir("is-go-binary");
-        let binary = dir.join("evals");
-        let mut bytes = b"\x7fELF".to_vec();
-        bytes.resize(1 << 20, 0);
-        bytes.extend_from_slice(GO_BUILDINFO_MAGIC);
-        bytes.extend_from_slice(&[8, 2]);
-        bytes.extend_from_slice(&[0u8; 32]);
-        std::fs::write(&binary, bytes).expect("binary written");
+    /// Bytes `is_go_eval_runner_binary` looks for: an ELF header, the Go
+    /// build-info blob at `build_info_at`, and the eval runner import path at
+    /// `import_at` (when given). Built from parts so the test binary itself
+    /// never holds a matching blob.
+    fn fake_go_binary(len: usize, build_info_at: usize, import_at: Option<usize>) -> Vec<u8> {
+        let mut bytes = vec![0u8; len];
+        bytes[..4].copy_from_slice(b"\x7fELF");
+        let header = build_info_at..build_info_at + GO_BUILDINFO_MAGIC.len();
+        bytes[header.clone()].copy_from_slice(GO_BUILDINFO_MAGIC);
+        bytes[header.end] = 8;
+        bytes[header.end + 1] = 2;
+        if let Some(at) = import_at {
+            bytes[at..at + EVAL_RUNNER_IMPORT.len()].copy_from_slice(EVAL_RUNNER_IMPORT.as_bytes());
+        }
+        bytes
+    }
 
-        assert!(is_go_binary(&binary));
+    #[test]
+    fn is_go_eval_runner_binary_finds_marks_past_the_first_chunk() {
+        let dir = make_temp_dir("go-eval-runner-binary");
+        let binary = dir.join("evals");
+        // The import path straddles the 1 MiB chunk boundary.
+        let chunk = 1 << 20;
+        std::fs::write(
+            &binary,
+            fake_go_binary(chunk + 4096, chunk + 1024, Some(chunk - 10)),
+        )
+        .expect("binary written");
+
+        assert!(is_go_eval_runner_binary(&binary));
 
         let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
-    fn is_go_binary_rejects_scripts_and_other_executables() {
-        let dir = make_temp_dir("not-go-binary");
+    fn is_go_eval_runner_binary_rejects_other_executables() {
+        let dir = make_temp_dir("not-go-eval-runner-binary");
+
         let script = dir.join("tsx");
         let mut bytes = b"#!/bin/sh\n# ".to_vec();
-        bytes.extend_from_slice(GO_BUILDINFO_MAGIC);
+        bytes.extend_from_slice(&fake_go_binary(256, 64, Some(128)));
         std::fs::write(&script, bytes).expect("script written");
+        assert!(
+            !is_go_eval_runner_binary(&script),
+            "not an executable format"
+        );
 
-        assert!(!is_go_binary(&script), "not an executable format");
-        // The magic alone, unaligned or without the header fields, is not enough.
+        // A Go binary that never links the runner, e.g. a Go-built JS wrapper.
+        let wrapper = dir.join("wrapper");
+        std::fs::write(&wrapper, fake_go_binary(256, 64, None)).expect("wrapper written");
+        assert!(!is_go_eval_runner_binary(&wrapper), "Go, but no evalrunner");
+
+        // The magic alone, unaligned or without the header fields, is not
+        // enough, even next to the import path.
         let mut bytes = b"\x7fELF".to_vec();
-        bytes.resize(32, 0);
+        bytes.resize(33, 0);
         bytes.extend_from_slice(GO_BUILDINFO_MAGIC);
-        bytes.extend_from_slice(&[0u8; 32]);
+        bytes.extend_from_slice(&[8, 2]);
+        bytes.extend_from_slice(EVAL_RUNNER_IMPORT.as_bytes());
         let bare_magic = dir.join("bare-magic");
         std::fs::write(&bare_magic, bytes).expect("binary written");
-        assert!(!is_go_binary(&bare_magic), "magic without a valid header");
-        assert!(!is_go_binary(&dir.join("missing")));
+        assert!(
+            !is_go_eval_runner_binary(&bare_magic),
+            "magic without a valid header"
+        );
+
+        assert!(!is_go_eval_runner_binary(&dir.join("missing")));
         #[cfg(unix)]
         assert!(
-            !is_go_binary(Path::new("/bin/sh")),
+            !is_go_eval_runner_binary(Path::new("/bin/sh")),
             "a native non-Go binary"
         );
 

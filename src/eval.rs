@@ -2991,9 +2991,10 @@ fn go_package_dir(files: &[String]) -> Result<PathBuf> {
 /// discovery, which needs a Go toolchain the binary does not.
 ///
 /// `--language go` says so outright. Without it, the runner must be a path to a
-/// file the Go linker produced, and the inputs must be directories (or absent):
-/// JS and Python runners (`./node_modules/.bin/tsx`, `.venv/bin/python`) are
-/// never Go binaries, and explicit source files already select a language.
+/// Go binary that links the SDK's eval runner, and the inputs must be
+/// directories (or absent): JS and Python runners (`./node_modules/.bin/tsx`,
+/// `.venv/bin/python`, or a Go-built wrapper) never link it, and explicit
+/// source files already select a language.
 fn is_prebuilt_go_runner(
     runner_override: Option<&str>,
     language_override: Option<EvalLanguage>,
@@ -3008,7 +3009,7 @@ fn is_prebuilt_go_runner(
         None => {
             inputs.iter().all(|input| Path::new(input).is_dir())
                 && go_runner::runner_looks_like_path(runner)
-                && go_runner::is_go_binary(Path::new(runner))
+                && go_runner::is_go_eval_runner_binary(Path::new(runner))
         }
     }
 }
@@ -5275,15 +5276,24 @@ mod tests {
             let _ = fs::remove_dir_all(&dir);
         }
 
-        /// Writes a file that `go_runner::is_go_binary` accepts: an ELF header
-        /// followed by the Go linker's build-info magic.
-        fn write_fake_go_binary(dir: &Path) -> PathBuf {
-            let binary = dir.join("evals");
+        /// Writes a file that `go_runner::is_go_eval_runner_binary` accepts: an
+        /// ELF header, the Go linker's build-info blob, and (when
+        /// `links_runner`) the eval runner import path.
+        fn write_fake_go_binary_with(dir: &Path, name: &str, links_runner: bool) -> PathBuf {
+            let binary = dir.join(name);
             let mut bytes = b"\x7fELF".to_vec();
             bytes.resize(64, 0);
-            bytes.extend_from_slice(b"\xff Go buildinf:\x08\x02");
+            bytes.extend_from_slice(b"\xff Go buildinf:");
+            bytes.extend_from_slice(&[8, 2]);
+            if links_runner {
+                bytes.extend_from_slice(go_runner::EVAL_RUNNER_IMPORT.as_bytes());
+            }
             fs::write(&binary, bytes).expect("binary written");
             binary
+        }
+
+        fn write_fake_go_binary(dir: &Path) -> PathBuf {
+            write_fake_go_binary_with(dir, "evals", true)
         }
 
         // SDK-571: `bt eval --runner ./bin/evals` must not need a toolchain to
@@ -5338,6 +5348,10 @@ mod tests {
             ));
             // Explicit source files already pick a language.
             assert!(!is_prebuilt_go_runner(Some(go_runner), None, &file_input));
+            // A runner written in Go is not an eval runner unless it links one.
+            let wrapper = write_fake_go_binary_with(&dir, "go-built-tsx", false);
+            let wrapper_runner = wrapper.to_str().expect("utf-8 path");
+            assert!(!is_prebuilt_go_runner(Some(wrapper_runner), None, &[]));
 
             let _ = fs::remove_dir_all(&dir);
         }
