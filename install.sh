@@ -136,6 +136,8 @@ bash "$tmpfile" $passthrough_args
 
 if [[ "$is_first_install" == true ]]; then
   echo ""
-  echo "Run 'bt setup' to get started."
+  echo "To instrument your project, run the setup wizard from your project directory:"
+  echo ""
+  echo "    curl -fsSL https://braintrust.dev/wizard/setup.sh | sh"
   echo ""
 fi
