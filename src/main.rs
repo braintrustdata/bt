@@ -358,6 +358,10 @@ fn try_main() -> Result<()> {
     }
 
     if argv.get(1).is_some_and(|arg| arg == "mcp") {
+        JSON_OUTPUT_REQUESTED.store(
+            argv.iter().any(|arg| arg == "--json"),
+            std::sync::atomic::Ordering::Relaxed,
+        );
         return mcp::try_main(&argv);
     }
 
