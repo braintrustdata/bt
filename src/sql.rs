@@ -461,11 +461,10 @@ fn run_app(
 
         if event::poll(Duration::from_millis(200))? {
             match event::read()? {
-                Event::Key(key) => {
-                    if handle_key_event(&mut app, key, &base, &client, &handle)? {
+                Event::Key(key)
+                    if handle_key_event(&mut app, key, &base, &client, &handle)? => {
                         break;
                     }
-                }
                 Event::Resize(_, _) => {}
                 _ => {}
             }

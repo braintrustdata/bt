@@ -2024,11 +2024,10 @@ fn is_uuid_like(value: &str) -> bool {
     }
     for (index, byte) in bytes.iter().enumerate() {
         match index {
-            8 | 13 | 18 | 23 => {
-                if *byte != b'-' {
+            8 | 13 | 18 | 23
+                if *byte != b'-' => {
                     return false;
                 }
-            }
             _ if !byte.is_ascii_hexdigit() => return false,
             _ => {}
         }
