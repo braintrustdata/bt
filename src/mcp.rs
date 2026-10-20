@@ -21,6 +21,8 @@ struct Tool {
     input_schema: Value,
 }
 
+type ToolArgumentMap = BTreeMap<String, (String, Value)>;
+
 #[derive(Debug, Deserialize)]
 struct ToolsResult {
     tools: Vec<Tool>,
@@ -172,10 +174,7 @@ fn parse_matches(
     }
 }
 
-fn tool_command(
-    tool: &Tool,
-    tool_index: usize,
-) -> Result<(Command, BTreeMap<String, (String, Value)>)> {
+fn tool_command(tool: &Tool, tool_index: usize) -> Result<(Command, ToolArgumentMap)> {
     if !is_cli_name(&tool.name) || tool.name == "help" {
         bail!(
             "MCP tool name `{}` cannot be represented as a CLI command",
@@ -461,99 +460,6 @@ fn format_tool_result(result: &Value, json_output: bool) -> Result<String> {
     serde_json::to_string_pretty(result).context("failed to serialize MCP result")
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn accepts_unquoted_strings_for_string_unions() {
-        let uuid_union = json!({
-            "anyOf": [
-                { "type": "string", "format": "uuid" },
-                { "type": "string", "const": "overview" }
-            ]
-        });
-        assert_eq!(
-            parse_argument_value("68191735-06de-4056-afe5-11f97dcc5988", &uuid_union).unwrap(),
-            json!("68191735-06de-4056-afe5-11f97dcc5988")
-        );
-        assert_eq!(
-            parse_argument_value("overview", &uuid_union).unwrap(),
-            json!("overview")
-        );
-    }
-
-    #[test]
-    fn accepts_plain_strings_and_json_objects_for_string_object_unions() {
-        let time_frame = json!({
-            "anyOf": [
-                { "type": "string", "enum": ["1h", "1d", "3d"] },
-                { "type": "object", "required": ["from", "to"] }
-            ]
-        });
-        assert_eq!(
-            parse_argument_value("3d", &time_frame).unwrap(),
-            json!("3d")
-        );
-        assert_eq!(
-            parse_argument_value(r#"{"from":"2026-01-01","to":"2026-01-02"}"#, &time_frame)
-                .unwrap(),
-            json!({"from":"2026-01-01","to":"2026-01-02"})
-        );
-    }
-
-    #[test]
-    fn accepts_json_null_for_nullable_string_and_boolean() {
-        let nullable_string = json!({ "type": ["string", "null"] });
-        let nullable_boolean = json!({ "type": ["boolean", "null"] });
-        assert_eq!(
-            parse_argument_value("filter text", &nullable_string).unwrap(),
-            json!("filter text")
-        );
-        assert_eq!(
-            parse_argument_value("null", &nullable_string).unwrap(),
-            Value::Null
-        );
-        assert_eq!(
-            parse_argument_value("false", &nullable_boolean).unwrap(),
-            json!(false)
-        );
-        assert_eq!(
-            parse_argument_value("null", &nullable_boolean).unwrap(),
-            Value::Null
-        );
-    }
-
-    #[test]
-    fn structured_result_is_not_repeated_as_text_content() {
-        let result = json!({
-            "content": [{ "type": "text", "text": "{\"views\":[]}" }],
-            "structuredContent": { "views": [] }
-        });
-        assert_eq!(
-            format_tool_result(&result, false).unwrap(),
-            "{\n  \"views\": []\n}"
-        );
-        assert_eq!(
-            format_tool_result(&result, true).unwrap(),
-            result.to_string()
-        );
-    }
-
-    #[test]
-    fn content_only_results_keep_text_and_non_text_items() {
-        let result = json!({
-            "content": [
-                { "type": "text", "text": "first" },
-                { "type": "image", "data": "ZmFrZQ==", "mimeType": "image/png" }
-            ]
-        });
-        let rendered = format_tool_result(&result, false).unwrap();
-        assert!(rendered.starts_with("first\n"));
-        assert!(rendered.contains("\"type\":\"image\""));
-    }
-}
-
 impl McpClient {
     fn new(endpoint: &str, api_key: &str) -> Result<Self> {
         Ok(Self {
@@ -720,4 +626,97 @@ fn parse_rpc_body(body: &str) -> Result<Value> {
     Err(anyhow!(
         "MCP server returned an empty or unsupported response"
     ))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn accepts_unquoted_strings_for_string_unions() {
+        let uuid_union = json!({
+            "anyOf": [
+                { "type": "string", "format": "uuid" },
+                { "type": "string", "const": "overview" }
+            ]
+        });
+        assert_eq!(
+            parse_argument_value("68191735-06de-4056-afe5-11f97dcc5988", &uuid_union).unwrap(),
+            json!("68191735-06de-4056-afe5-11f97dcc5988")
+        );
+        assert_eq!(
+            parse_argument_value("overview", &uuid_union).unwrap(),
+            json!("overview")
+        );
+    }
+
+    #[test]
+    fn accepts_plain_strings_and_json_objects_for_string_object_unions() {
+        let time_frame = json!({
+            "anyOf": [
+                { "type": "string", "enum": ["1h", "1d", "3d"] },
+                { "type": "object", "required": ["from", "to"] }
+            ]
+        });
+        assert_eq!(
+            parse_argument_value("3d", &time_frame).unwrap(),
+            json!("3d")
+        );
+        assert_eq!(
+            parse_argument_value(r#"{"from":"2026-01-01","to":"2026-01-02"}"#, &time_frame)
+                .unwrap(),
+            json!({"from":"2026-01-01","to":"2026-01-02"})
+        );
+    }
+
+    #[test]
+    fn accepts_json_null_for_nullable_string_and_boolean() {
+        let nullable_string = json!({ "type": ["string", "null"] });
+        let nullable_boolean = json!({ "type": ["boolean", "null"] });
+        assert_eq!(
+            parse_argument_value("filter text", &nullable_string).unwrap(),
+            json!("filter text")
+        );
+        assert_eq!(
+            parse_argument_value("null", &nullable_string).unwrap(),
+            Value::Null
+        );
+        assert_eq!(
+            parse_argument_value("false", &nullable_boolean).unwrap(),
+            json!(false)
+        );
+        assert_eq!(
+            parse_argument_value("null", &nullable_boolean).unwrap(),
+            Value::Null
+        );
+    }
+
+    #[test]
+    fn structured_result_is_not_repeated_as_text_content() {
+        let result = json!({
+            "content": [{ "type": "text", "text": "{\"views\":[]}" }],
+            "structuredContent": { "views": [] }
+        });
+        assert_eq!(
+            format_tool_result(&result, false).unwrap(),
+            "{\n  \"views\": []\n}"
+        );
+        assert_eq!(
+            format_tool_result(&result, true).unwrap(),
+            result.to_string()
+        );
+    }
+
+    #[test]
+    fn content_only_results_keep_text_and_non_text_items() {
+        let result = json!({
+            "content": [
+                { "type": "text", "text": "first" },
+                { "type": "image", "data": "ZmFrZQ==", "mimeType": "image/png" }
+            ]
+        });
+        let rendered = format_tool_result(&result, false).unwrap();
+        assert!(rendered.starts_with("first\n"));
+        assert!(rendered.contains("\"type\":\"image\""));
+    }
 }
