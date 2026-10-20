@@ -21,6 +21,7 @@ mod http;
 mod init;
 mod js_bundle;
 mod js_runner;
+mod mcp;
 mod observability;
 mod preprocessors;
 mod profiles;
@@ -354,6 +355,14 @@ fn try_main() -> Result<()> {
 
     if handle_version_json(&argv)? {
         return Ok(());
+    }
+
+    if mcp::is_mcp_invocation(&argv)? {
+        JSON_OUTPUT_REQUESTED.store(
+            argv.iter().any(|arg| arg == "--json"),
+            std::sync::atomic::Ordering::Relaxed,
+        );
+        return mcp::try_main(&argv);
     }
 
     let matches = Cli::command().get_matches_from(&argv);
