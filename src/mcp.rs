@@ -144,21 +144,9 @@ async fn run(argv: &[std::ffi::OsString]) -> Result<()> {
         .context("tool arguments unavailable")?;
     let arguments = arguments_from_matches(tool_matches, arg_map)?;
     let result = client.call_tool(tool_name, arguments).await?;
-    if base.json {
-        println!("{}", serde_json::to_string(&result)?);
-    } else if let Some(content) = result.get("content") {
-        for item in content.as_array().into_iter().flatten() {
-            if let Some(text) = item.get("text").and_then(Value::as_str) {
-                println!("{text}");
-            } else {
-                println!("{}", serde_json::to_string(item)?);
-            }
-        }
-        if let Some(structured) = result.get("structuredContent") {
-            println!("{}", serde_json::to_string_pretty(structured)?);
-        }
-    } else {
-        println!("{}", serde_json::to_string_pretty(&result)?);
+    let output = format_tool_result(&result, base.json)?;
+    if !output.is_empty() {
+        println!("{output}");
     }
     Ok(())
 }
@@ -327,20 +315,242 @@ fn arguments_from_matches(
 }
 
 fn parse_argument_value(raw: &str, schema: &Value) -> Result<Value> {
-    match schema.get("type").and_then(Value::as_str) {
-        Some("integer") => Ok(Value::Number(raw.parse::<i64>()?.into())),
-        Some("number") => serde_json::Number::from_f64(raw.parse::<f64>()?)
+    let types = schema_types(schema);
+
+    if raw == "null" && types.contains("null") {
+        return Ok(Value::Null);
+    }
+
+    if types.len() == 1 {
+        return parse_typed_argument(raw, types.iter().next().expect("one schema type"));
+    }
+
+    // For unions that include strings, accept normal CLI text while still
+    // allowing JSON objects/arrays and explicitly quoted JSON strings.
+    if types.contains("string") {
+        if let Ok(value) = serde_json::from_str::<Value>(raw) {
+            if value.is_string()
+                || (value.is_object() && types.contains("object"))
+                || (value.is_array() && types.contains("array"))
+            {
+                return Ok(value);
+            }
+        }
+        return Ok(Value::String(raw.to_owned()));
+    }
+
+    let value: Value = serde_json::from_str(raw)
+        .context("expected a JSON value matching one of the schema alternatives")?;
+    if value_matches_schema_type(&value, &types) {
+        Ok(value)
+    } else {
+        bail!("value does not match any supported schema alternative")
+    }
+}
+
+fn parse_typed_argument(raw: &str, schema_type: &str) -> Result<Value> {
+    match schema_type {
+        "integer" => Ok(Value::Number(raw.parse::<i64>()?.into())),
+        "number" => serde_json::Number::from_f64(raw.parse::<f64>()?)
             .map(Value::Number)
             .context("number must be finite"),
-        Some("boolean") => match raw {
+        "boolean" => match raw {
             "true" => Ok(Value::Bool(true)),
             "false" => Ok(Value::Bool(false)),
             _ => bail!("expected true or false"),
         },
-        Some("object" | "array") | None => {
-            serde_json::from_str(raw).context("expected a JSON object or array")
+        "object" | "array" => {
+            let value: Value =
+                serde_json::from_str(raw).context("expected a JSON object or array")?;
+            if value_matches_schema_type(&value, &BTreeSet::from([schema_type.to_owned()])) {
+                Ok(value)
+            } else {
+                bail!("expected a JSON {schema_type}")
+            }
+        }
+        "null" => {
+            if raw == "null" {
+                Ok(Value::Null)
+            } else {
+                bail!("expected null")
+            }
         }
         _ => Ok(Value::String(raw.to_owned())),
+    }
+}
+
+fn schema_types(schema: &Value) -> BTreeSet<String> {
+    let mut types = BTreeSet::new();
+    collect_schema_types(schema, &mut types);
+    types
+}
+
+fn collect_schema_types(schema: &Value, types: &mut BTreeSet<String>) {
+    if let Some(schema_type) = schema.get("type") {
+        match schema_type {
+            Value::String(value) => {
+                types.insert(value.clone());
+            }
+            Value::Array(values) => {
+                types.extend(values.iter().filter_map(Value::as_str).map(str::to_owned));
+            }
+            _ => {}
+        }
+    }
+    for key in ["anyOf", "oneOf"] {
+        if let Some(alternatives) = schema.get(key).and_then(Value::as_array) {
+            for alternative in alternatives {
+                collect_schema_types(alternative, types);
+            }
+        }
+    }
+    if let Some(constant) = schema.get("const") {
+        types.insert(json_value_type(constant).to_owned());
+    }
+    if let Some(values) = schema.get("enum").and_then(Value::as_array) {
+        types.extend(values.iter().map(|value| json_value_type(value).to_owned()));
+    }
+}
+
+fn json_value_type(value: &Value) -> &str {
+    match value {
+        Value::Null => "null",
+        Value::Bool(_) => "boolean",
+        Value::Number(number) if number.is_i64() || number.is_u64() => "integer",
+        Value::Number(_) => "number",
+        Value::String(_) => "string",
+        Value::Array(_) => "array",
+        Value::Object(_) => "object",
+    }
+}
+
+fn value_matches_schema_type(value: &Value, types: &BTreeSet<String>) -> bool {
+    types.contains(json_value_type(value)) || (value.is_number() && types.contains("number"))
+}
+
+fn format_tool_result(result: &Value, json_output: bool) -> Result<String> {
+    if json_output {
+        return serde_json::to_string(result).context("failed to serialize MCP result");
+    }
+
+    // Structured content is the authoritative result when the server returns
+    // both it and a text rendering in content; printing both duplicates output.
+    if let Some(structured) = result
+        .get("structuredContent")
+        .filter(|value| !value.is_null())
+    {
+        return serde_json::to_string_pretty(structured)
+            .context("failed to serialize structured MCP result");
+    }
+
+    if let Some(content) = result.get("content").and_then(Value::as_array) {
+        return content
+            .iter()
+            .map(|item| {
+                if let Some(text) = item.get("text").and_then(Value::as_str) {
+                    Ok(text.to_owned())
+                } else {
+                    Ok(serde_json::to_string(item)?)
+                }
+            })
+            .collect::<Result<Vec<_>>>()
+            .map(|items| items.join("\n"))
+            .context("failed to serialize MCP content");
+    }
+
+    serde_json::to_string_pretty(result).context("failed to serialize MCP result")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn accepts_unquoted_strings_for_string_unions() {
+        let uuid_union = json!({
+            "anyOf": [
+                { "type": "string", "format": "uuid" },
+                { "type": "string", "const": "overview" }
+            ]
+        });
+        assert_eq!(
+            parse_argument_value("68191735-06de-4056-afe5-11f97dcc5988", &uuid_union).unwrap(),
+            json!("68191735-06de-4056-afe5-11f97dcc5988")
+        );
+        assert_eq!(
+            parse_argument_value("overview", &uuid_union).unwrap(),
+            json!("overview")
+        );
+    }
+
+    #[test]
+    fn accepts_plain_strings_and_json_objects_for_string_object_unions() {
+        let time_frame = json!({
+            "anyOf": [
+                { "type": "string", "enum": ["1h", "1d", "3d"] },
+                { "type": "object", "required": ["from", "to"] }
+            ]
+        });
+        assert_eq!(
+            parse_argument_value("3d", &time_frame).unwrap(),
+            json!("3d")
+        );
+        assert_eq!(
+            parse_argument_value(r#"{"from":"2026-01-01","to":"2026-01-02"}"#, &time_frame)
+                .unwrap(),
+            json!({"from":"2026-01-01","to":"2026-01-02"})
+        );
+    }
+
+    #[test]
+    fn accepts_json_null_for_nullable_string_and_boolean() {
+        let nullable_string = json!({ "type": ["string", "null"] });
+        let nullable_boolean = json!({ "type": ["boolean", "null"] });
+        assert_eq!(
+            parse_argument_value("filter text", &nullable_string).unwrap(),
+            json!("filter text")
+        );
+        assert_eq!(
+            parse_argument_value("null", &nullable_string).unwrap(),
+            Value::Null
+        );
+        assert_eq!(
+            parse_argument_value("false", &nullable_boolean).unwrap(),
+            json!(false)
+        );
+        assert_eq!(
+            parse_argument_value("null", &nullable_boolean).unwrap(),
+            Value::Null
+        );
+    }
+
+    #[test]
+    fn structured_result_is_not_repeated_as_text_content() {
+        let result = json!({
+            "content": [{ "type": "text", "text": "{\"views\":[]}" }],
+            "structuredContent": { "views": [] }
+        });
+        assert_eq!(
+            format_tool_result(&result, false).unwrap(),
+            "{\n  \"views\": []\n}"
+        );
+        assert_eq!(
+            format_tool_result(&result, true).unwrap(),
+            result.to_string()
+        );
+    }
+
+    #[test]
+    fn content_only_results_keep_text_and_non_text_items() {
+        let result = json!({
+            "content": [
+                { "type": "text", "text": "first" },
+                { "type": "image", "data": "ZmFrZQ==", "mimeType": "image/png" }
+            ]
+        });
+        let rendered = format_tool_result(&result, false).unwrap();
+        assert!(rendered.starts_with("first\n"));
+        assert!(rendered.contains("\"type\":\"image\""));
     }
 }
 
