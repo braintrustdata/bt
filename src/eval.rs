@@ -492,18 +492,13 @@ pub async fn run(base: BaseArgs, args: EvalArgs) -> Result<()> {
     if args.dev && args.watch {
         anyhow::bail!("--watch is not supported with --dev.");
     }
-    let inputs: Vec<String> = if args.files.is_empty() {
+    let bare = args.files.is_empty();
+    let inputs: Vec<String> = if bare {
         vec![".".to_string()]
     } else {
         args.files.clone()
     };
-    let mut files = expand_eval_file_globs_for_language(&inputs, args.language)?;
-    if args.files.is_empty() {
-        files.retain(|p| !is_excluded_by_default(p));
-        if files.is_empty() {
-            anyhow::bail!("no eval files found in current directory");
-        }
-    }
+    let files = expand_eval_file_globs_for_language(&inputs, args.language, bare)?;
     validate_eval_input_files(&files)?;
 
     let sampling = if let Some(first) = args.first {
@@ -2465,8 +2460,8 @@ const DEFAULT_EXCLUDE_DIRS: &[&str] = &[
     "vendor",
 ];
 
-fn is_excluded_by_default(path: &str) -> bool {
-    Path::new(path).components().any(|c| {
+fn is_excluded_by_default(path: &Path) -> bool {
+    path.components().any(|c| {
         if let std::path::Component::Normal(s) = c {
             DEFAULT_EXCLUDE_DIRS.contains(&s.to_string_lossy().as_ref())
         } else {
@@ -2479,7 +2474,7 @@ fn is_excluded_by_default(path: &str) -> bool {
 /// callers that have no `--language` to pass.
 #[cfg(test)]
 fn expand_eval_file_globs(inputs: &[String]) -> Result<Vec<String>> {
-    expand_eval_file_globs_for_language(inputs, None)
+    expand_eval_file_globs_for_language(inputs, None, false)
 }
 
 /// Expands eval inputs into a list of regular files.
@@ -2488,9 +2483,13 @@ fn expand_eval_file_globs(inputs: &[String]) -> Result<Vec<String>> {
 /// `detect_eval_language` runs: Go's compilation unit is a package directory,
 /// so `--language go ./cmd/evals` must expand to that package's .go files
 /// rather than searching for conventionally-named eval files.
+///
+/// `exclude_default_dirs` is set for bare `bt eval`, so directory inputs skip
+/// `DEFAULT_EXCLUDE_DIRS`.
 fn expand_eval_file_globs_for_language(
     inputs: &[String],
     language_override: Option<EvalLanguage>,
+    exclude_default_dirs: bool,
 ) -> Result<Vec<String>> {
     let mut expanded: Vec<String> = Vec::new();
     let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
@@ -2507,7 +2506,7 @@ fn expand_eval_file_globs_for_language(
             let dir_files = if language_override == Some(EvalLanguage::Go) {
                 expand_go_package_dir(input)?
             } else {
-                expand_default_eval_globs_in_dir(input)?
+                expand_default_eval_globs_in_dir(input, exclude_default_dirs)?
             };
             dir_files.into_iter().for_each(&mut push);
             continue;
@@ -2538,7 +2537,13 @@ fn expand_eval_file_globs_for_language(
 }
 
 /// Expands the default eval globs inside a directory input.
-fn expand_default_eval_globs_in_dir(input: &str) -> Result<Vec<String>> {
+///
+/// Exclusions apply before the Go fallback check, so third-party files such as
+/// a virtualenv's `openai/types/eval_*.py` can't hide a Go eval package.
+fn expand_default_eval_globs_in_dir(
+    input: &str,
+    exclude_default_dirs: bool,
+) -> Result<Vec<String>> {
     let mut dir_files: Vec<String> = Vec::new();
     for glob_suffix in DEFAULT_EVAL_GLOBS {
         let pattern = format!("{input}/{glob_suffix}");
@@ -2549,13 +2554,19 @@ fn expand_default_eval_globs_in_dir(input: &str) -> Result<Vec<String>> {
         dir_files.extend(
             matches
                 .into_iter()
+                // Match against the path below `input` so the input directory's
+                // own location never triggers an exclusion.
+                .filter(|p| {
+                    !exclude_default_dirs
+                        || !is_excluded_by_default(p.strip_prefix(input).unwrap_or(p))
+                })
                 .map(|p| p.to_string_lossy().into_owned()),
         );
     }
     if dir_files.is_empty() {
         // No JavaScript or Python evals here. Go has no marker filename, so ask
         // the Go toolchain whether this tree holds eval runners instead.
-        if let Some(go_files) = discover_go_eval_packages(input) {
+        if let Some(go_files) = discover_go_eval_packages(input, exclude_default_dirs) {
             return Ok(go_files);
         }
         anyhow::bail!("no eval files found in directory: {input}");
@@ -2595,7 +2606,7 @@ fn expand_go_package_dir(input: &str) -> Result<Vec<String>> {
 /// `go list` can say which packages those are. Returns `None` when the answer
 /// is "not applicable" -- no module, no toolchain, or nothing that links the
 /// runner -- so the caller can fall back to its usual error.
-fn discover_go_eval_packages(dir: &str) -> Option<Vec<String>> {
+fn discover_go_eval_packages(dir: &str, exclude_default_dirs: bool) -> Option<Vec<String>> {
     let path = Path::new(dir);
     if !go_runner::in_go_module(path) {
         return None;
@@ -2606,6 +2617,14 @@ fn discover_go_eval_packages(dir: &str) -> Option<Vec<String>> {
     let mut files: Vec<String> = packages
         .iter()
         .filter(|pkg| pkg.is_eval_runner())
+        // `./...` skips `vendor` and dot-dirs but still walks `node_modules`,
+        // `venv`, `site-packages`, etc. Match below the module root, which comes
+        // from the same `go list` output as `pkg.dir`.
+        .filter(|pkg| {
+            let module_dir = pkg.module.as_ref().and_then(|m| m.dir.as_deref());
+            let relative = module_dir.and_then(|root| pkg.dir.strip_prefix(root).ok());
+            !exclude_default_dirs || !relative.is_some_and(is_excluded_by_default)
+        })
         .flat_map(go_runner::GoPackage::absolute_go_files)
         .collect();
     files.sort();
@@ -4398,19 +4417,27 @@ mod tests {
 
     #[test]
     fn is_excluded_by_default_matches_known_dirs() {
-        assert!(is_excluded_by_default("node_modules/foo/bar.eval.ts"));
-        assert!(is_excluded_by_default("a/b/node_modules/pkg/x.eval.ts"));
-        assert!(is_excluded_by_default("site-packages/lib/x.eval.py"));
-        assert!(is_excluded_by_default("__pycache__/x.eval.py"));
-        assert!(is_excluded_by_default(".venv/lib/x.eval.py"));
-        assert!(is_excluded_by_default("venv/lib/x.eval.py"));
+        assert!(is_excluded_by_default(Path::new(
+            "node_modules/foo/bar.eval.ts"
+        )));
+        assert!(is_excluded_by_default(Path::new(
+            "a/b/node_modules/pkg/x.eval.ts"
+        )));
+        assert!(is_excluded_by_default(Path::new(
+            "site-packages/lib/x.eval.py"
+        )));
+        assert!(is_excluded_by_default(Path::new("__pycache__/x.eval.py")));
+        assert!(is_excluded_by_default(Path::new(".venv/lib/x.eval.py")));
+        assert!(is_excluded_by_default(Path::new("venv/lib/x.eval.py")));
     }
 
     #[test]
     fn is_excluded_by_default_allows_normal_paths() {
-        assert!(!is_excluded_by_default("src/foo.eval.ts"));
-        assert!(!is_excluded_by_default("tests/sub/bar.eval.py"));
-        assert!(!is_excluded_by_default("my_node_modules_backup/x.eval.ts"));
+        assert!(!is_excluded_by_default(Path::new("src/foo.eval.ts")));
+        assert!(!is_excluded_by_default(Path::new("tests/sub/bar.eval.py")));
+        assert!(!is_excluded_by_default(Path::new(
+            "my_node_modules_backup/x.eval.ts"
+        )));
     }
 
     #[test]
@@ -4421,9 +4448,9 @@ mod tests {
         fs::write(dir.join("a.eval.ts"), "").unwrap();
         fs::write(nm.join("b.eval.ts"), "").unwrap();
 
-        let mut result = expand_eval_file_globs(&[dir.to_string_lossy().into_owned()])
-            .expect("defaults should expand");
-        result.retain(|p| !is_excluded_by_default(p));
+        let result =
+            expand_eval_file_globs_for_language(&[dir.to_string_lossy().into_owned()], None, true)
+                .expect("defaults should expand");
 
         assert_eq!(
             result.len(),
@@ -4431,6 +4458,13 @@ mod tests {
             "node_modules should be excluded: {result:?}"
         );
         assert!(result[0].ends_with("a.eval.ts"));
+
+        // With only excluded matches left, discovery reports nothing found.
+        fs::remove_file(dir.join("a.eval.ts")).unwrap();
+        let err =
+            expand_eval_file_globs_for_language(&[dir.to_string_lossy().into_owned()], None, true)
+                .expect_err("only excluded matches should fail");
+        assert!(format!("{err}").contains("no eval files found in directory"));
 
         let _ = fs::remove_dir_all(&dir);
     }
@@ -4570,6 +4604,7 @@ mod tests {
             let result = expand_eval_file_globs_for_language(
                 &[dir.to_string_lossy().into_owned()],
                 Some(EvalLanguage::Go),
+                false,
             )
             .expect("package dir should expand");
 
@@ -4603,6 +4638,7 @@ mod tests {
             let result = expand_eval_file_globs_for_language(
                 &[dir.to_string_lossy().into_owned()],
                 Some(EvalLanguage::Go),
+                false,
             )
             .expect("package dir should expand");
 
@@ -4628,6 +4664,7 @@ mod tests {
             let err = expand_eval_file_globs_for_language(
                 &[dir.to_string_lossy().into_owned()],
                 Some(EvalLanguage::Go),
+                false,
             )
             .expect_err("an empty package should fail");
 
@@ -4683,6 +4720,61 @@ mod tests {
                 result.iter().all(|f| f.contains("evals")),
                 "the plain cli main package must not be treated as an eval: {result:?}"
             );
+
+            let _ = fs::remove_dir_all(&dir);
+        }
+
+        // Eval-named files in excluded folders (a virtualenv's `openai` package ships
+        // `eval_*.py` files) must not stop bare `bt eval` from falling back to Go,
+        // and Go eval runners inside those folders must not be picked up either.
+        #[cfg(unix)]
+        #[test]
+        fn default_discovery_ignores_excluded_dirs_before_go_fallback() {
+            let _guard = lock_env();
+            let dir = make_temp_dir("go-excluded-dirs");
+            fs::write(dir.join("go.mod"), "module example.test\n").expect("go.mod written");
+
+            let eval_dir = dir.join("cmd").join("a");
+            fs::create_dir_all(&eval_dir).expect("eval dir");
+            for third_party in [
+                ".venv/lib/python3.11/site-packages/openai/types/eval_list_params.py",
+                "node_modules/x/y.eval.ts",
+                "vendor/x/v.eval.py",
+            ] {
+                let path = dir.join(third_party);
+                fs::create_dir_all(path.parent().expect("parent")).expect("parent dir");
+                fs::write(&path, "").expect("third-party file written");
+            }
+
+            // `go list ./...` skips `vendor` and dot-dirs but still walks `node_modules`.
+            let json = format!(
+                r#"{{"Dir": "{eval}", "ImportPath": "example.test/cmd/a", "Name": "main",
+                      "GoFiles": ["main.go"], "Deps": ["{runner}"],
+                      "Module": {{"Path": "example.test", "Dir": "{root}"}}}}
+                   {{"Dir": "{root}/node_modules/x/cmd", "ImportPath": "example.test/node_modules/x/cmd",
+                      "Name": "main", "GoFiles": ["main.go"], "Deps": ["{runner}"],
+                      "Module": {{"Path": "example.test", "Dir": "{root}"}}}}"#,
+                eval = eval_dir.display(),
+                root = dir.display(),
+                runner = go_runner::EVAL_RUNNER_IMPORT
+            );
+            let fake_go = write_fake_go(&dir, &json);
+            let previous = set_env_var(
+                "BRAINTRUST_EVAL_GO_BIN",
+                fake_go.to_str().expect("utf-8 path"),
+            );
+
+            let result = expand_eval_file_globs_for_language(
+                &[dir.to_string_lossy().into_owned()],
+                None,
+                true,
+            )
+            .expect("go evals should be discovered");
+
+            restore_env_var("BRAINTRUST_EVAL_GO_BIN", previous);
+
+            assert_eq!(result.len(), 1, "unexpected matches: {result:?}");
+            assert!(result[0].ends_with("cmd/a/main.go"), "got {result:?}");
 
             let _ = fs::remove_dir_all(&dir);
         }
