@@ -122,14 +122,17 @@ pub fn resolve_prebuilt_runner(explicit: &str) -> Result<PathBuf> {
 /// Checked before spawning `go list` so that a non-Go directory costs nothing
 /// and keeps reporting the ordinary "no eval files found" error.
 pub fn in_go_module(dir: &Path) -> bool {
-    let mut current = Some(dir);
-    while let Some(candidate) = current {
-        if candidate.join("go.mod").is_file() {
-            return true;
-        }
-        current = candidate.parent();
-    }
-    false
+    in_go_module_from(dir, &std::env::current_dir().unwrap_or_default())
+}
+
+/// Like [`in_go_module`], resolving a relative `dir` against `cwd` first.
+///
+/// `Path::parent` is lexical, so climbing `.` or `cmd` as typed stops at the
+/// cwd instead of reaching its real ancestors.
+fn in_go_module_from(dir: &Path, cwd: &Path) -> bool {
+    cwd.join(dir)
+        .ancestors()
+        .any(|candidate| candidate.join("go.mod").is_file())
 }
 
 /// Runs `go list -json <patterns>` in `cwd` and returns the packages it reports.
@@ -187,14 +190,20 @@ mod tests {
         dir
     }
 
+    // `bt eval` passes the path as typed (`.` when bare), and `Path::parent`
+    // on a relative path never reaches the real ancestors of the cwd.
     #[test]
     fn in_go_module_finds_an_ancestor_go_mod() {
         let dir = make_temp_dir("in-module");
-        let pkg = dir.join("cmd").join("evals");
+        let cmd = dir.join("cmd");
+        let pkg = cmd.join("a");
         std::fs::create_dir_all(&pkg).expect("package dir should be created");
         std::fs::write(dir.join("go.mod"), "module example.test\n").expect("go.mod written");
 
         assert!(in_go_module(&pkg));
+        assert!(in_go_module_from(Path::new("."), &cmd));
+        assert!(in_go_module_from(Path::new("a"), &cmd));
+        assert!(!in_go_module_from(Path::new("."), &std::env::temp_dir()));
 
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -227,7 +236,7 @@ mod tests {
             "Dir": "/repo/a",
             "ImportPath": "example.test/a",
             "Name": "main",
-            "GoFiles": ["main.go"]
+            "GoFiles": ["main.go", "classifier.go"]
         }
         {
             "Dir": "/repo/b",
@@ -240,6 +249,13 @@ mod tests {
         assert_eq!(packages.len(), 2);
         assert_eq!(packages[0].import_path, "example.test/a");
         assert_eq!(packages[1].name, "b");
+        assert_eq!(
+            packages[0].absolute_go_files(),
+            vec![
+                "/repo/a/main.go".to_string(),
+                "/repo/a/classifier.go".to_string()
+            ]
+        );
     }
 
     // Discovery keys off the runner import, which is what lets Go evals live in
@@ -260,22 +276,6 @@ mod tests {
         assert!(
             !packages[2].is_eval_runner(),
             "library that imports the runner"
-        );
-    }
-
-    #[test]
-    fn absolute_go_files_joins_against_the_package_dir() {
-        let stdout = br#"{"Dir": "/repo/evals", "ImportPath": "x", "Name": "main",
-                          "GoFiles": ["main.go", "classifier.go"]}"#;
-
-        let packages = parse_go_list(stdout).expect("stream should parse");
-
-        assert_eq!(
-            packages[0].absolute_go_files(),
-            vec![
-                "/repo/evals/main.go".to_string(),
-                "/repo/evals/classifier.go".to_string()
-            ]
         );
     }
 }
