@@ -326,7 +326,7 @@ Files inside `node_modules`, `.venv`, `venv`, `site-packages`, `dist-packages`, 
 **Runners:**
 
 - By default, `bt eval` auto-detects a JavaScript runner from your project (`tsx`, `vite-node`, `ts-node`, then `ts-node-esm`).
-- Set a runner explicitly with `--runner` / `BT_EVAL_RUNNER`:
+- Set a runner explicitly with `--runner` / `BRAINTRUST_EVAL_RUNNER`:
   - `bt eval --runner vite-node tutorial.eval.ts`
   - `bt eval --runner tsx tutorial.eval.ts`
 - `bt` resolves local `node_modules/.bin` entries automatically — no need for a full path.
@@ -342,14 +342,18 @@ supply the program — your compiled package _is_ the eval runner. Write it with
 - `bt eval ./cmd/evals` — point `bt` at the **package directory**. Go's compilation unit is a
   directory, not a file, so all inputs must resolve to a single package.
 - `bt eval` — with no arguments, `bt` asks `go list` which packages in the module import the SDK's
-  `evalrunner`, and runs those. Eval files need no special name.
+  `evalrunner`. It runs them only when they are all in one package directory; if discovery finds
+  multiple directories, `bt eval` fails and asks you to pass one package directory (for example,
+  `bt eval --language go ./cmd/evals`) or a prebuilt binary with `--runner`. Eval files need no
+  special name.
 - `bt eval --language go ./cmd/evals` — force Go when a directory holds evals for more than one
   language.
-- `bt eval --runner ./bin/evals` — run a prebuilt binary instead of compiling, for environments with
-  no Go toolchain. The binary is spawned with no arguments; the Go runner takes all its input from
-  the environment.
-- `BT_EVAL_GO_BIN` / `BT_EVAL_GO` override which `go` toolchain is used; otherwise `bt` looks at
-  `GOROOT` and then `PATH`.
+- `bt eval --runner ./bin/evals` — run a prebuilt binary instead of compiling. The binary is spawned
+  with no arguments; the Go runner takes all its input from the environment. A Go toolchain is still
+  needed to discover packages or expand a package directory; pass `.go` files explicitly to use the
+  binary without a Go toolchain.
+- `BRAINTRUST_EVAL_GO_BIN` / `BRAINTRUST_EVAL_GO` override which `go` toolchain is used; otherwise
+  `bt` looks at `GOROOT` and then `PATH`.
 
 Package layout comes from `go list -json`, so build constraints, `go.work`, and vendoring are
 handled by the toolchain rather than guessed from file paths.
