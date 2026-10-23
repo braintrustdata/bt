@@ -560,7 +560,9 @@ fn classify_sdk_error(err: &anyhow::Error) -> Option<ExitCode> {
         braintrust_sdk_rust::BraintrustError::InvalidConfig(_)
         | braintrust_sdk_rust::BraintrustError::ChannelClosed
         | braintrust_sdk_rust::BraintrustError::Background(_)
-        | braintrust_sdk_rust::BraintrustError::StreamAggregation(_) => None,
+        | braintrust_sdk_rust::BraintrustError::StreamAggregation(_)
+        | braintrust_sdk_rust::BraintrustError::Execution(_)
+        | braintrust_sdk_rust::BraintrustError::Admission(_) => None,
     }
 }
 
