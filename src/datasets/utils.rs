@@ -1,7 +1,7 @@
 use std::time::Duration;
 
 use anyhow::{anyhow, Result};
-use braintrust_sdk_rust::Logs3BatchUploader;
+use braintrust_sdk_rust::{api::Config, ingest::BatchUploader};
 use serde_json::{Map, Value};
 
 use crate::ui::with_spinner_visible;
@@ -32,12 +32,12 @@ pub(crate) async fn submit_rows(
     spinner_label: &str,
     error_context: &str,
 ) -> Result<()> {
-    let mut uploader = dataset_uploader(ctx)?;
+    let uploader = dataset_uploader(ctx)?;
     with_spinner_visible(
         spinner_label,
         async {
             uploader
-                .upload_rows(rows, DATASET_UPLOAD_BATCH_SIZE)
+                .upload_rows(rows.to_vec(), DATASET_UPLOAD_BATCH_SIZE)
                 .await
                 .map_err(|err| anyhow!("{error_context}: {err}"))
         },
@@ -47,11 +47,11 @@ pub(crate) async fn submit_rows(
     Ok(())
 }
 
-fn dataset_uploader(ctx: &ResolvedContext) -> Result<Logs3BatchUploader> {
-    Logs3BatchUploader::new(
-        ctx.client.base_url(),
-        ctx.client.api_key().to_string(),
-        (!ctx.client.org_name().trim().is_empty()).then_some(ctx.client.org_name().to_string()),
-    )
-    .map_err(|err| anyhow!("failed to initialize dataset uploader: {err}"))
+fn dataset_uploader(ctx: &ResolvedContext) -> Result<BatchUploader> {
+    let mut config = Config::new(ctx.client.api_key().to_string());
+    config.api_url = ctx.client.base_url().to_string();
+    config.org_name =
+        (!ctx.client.org_name().trim().is_empty()).then_some(ctx.client.org_name().to_string());
+    BatchUploader::new(config)
+        .map_err(|err| anyhow!("failed to initialize dataset uploader: {err}"))
 }
