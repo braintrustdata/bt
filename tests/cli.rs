@@ -3324,3 +3324,98 @@ func main() {
             .stdout(predicate::str::contains("test-eval"));
     }
 }
+
+#[cfg(unix)]
+#[test]
+fn login_json_reports_the_selected_org() {
+    let home = tempfile::tempdir().unwrap();
+    let config = tempfile::tempdir().unwrap();
+    let bin = tempfile::tempdir().unwrap();
+    let (url, server) = serve_login_once();
+    let mut cmd = bt_command();
+    clear_braintrust_auth_env(&mut cmd);
+    use_fake_credential_store(&mut cmd, bin.path());
+    let output = cmd
+        .env("BRAINTRUST_API_KEY", "test-key")
+        .env("HOME", home.path())
+        .env("XDG_CONFIG_HOME", config.path())
+        .args([
+            "login",
+            "--save-env-api-key",
+            "--profile",
+            "test-profile",
+            "--app-url",
+            &url,
+            "--json",
+        ])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let result: serde_json::Value = serde_json::from_slice(&output).unwrap();
+    assert_eq!(result["org"], "test-org");
+    server.join().unwrap();
+}
+
+#[cfg(unix)]
+#[test]
+fn oauth_refresh_diagnostics_require_verbose() {
+    for verbose in [false, true] {
+        let home = tempfile::tempdir().unwrap();
+        let config = tempfile::tempdir().unwrap();
+        let bin = tempfile::tempdir().unwrap();
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let server = std::thread::spawn(move || {
+            let (mut socket, _) = listener.accept().unwrap();
+            let mut bytes = [0; 4096];
+            let size = socket.read(&mut bytes).unwrap();
+            assert!(String::from_utf8_lossy(&bytes[..size]).starts_with("POST /oauth/token "));
+            let body = r#"{"access_token":"test-access-token","expires_in":3600}"#;
+            write!(
+                socket,
+                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            )
+            .unwrap();
+        });
+        let auth_dir = config.path().join("bt");
+        fs::create_dir_all(&auth_dir).unwrap();
+        fs::write(auth_dir.join("auth.json"), serde_json::json!({"profiles":{"test-profile":{"auth_kind":"oauth","api_url":url,"oauth_client_id":"test-client"}}}).to_string()).unwrap();
+        fs::write(
+            auth_dir.join("secrets.json"),
+            r#"{"secrets":{"oauth_refresh::test-profile":"test-refresh-token"}}"#,
+        )
+        .unwrap();
+        let mut cmd = bt_command();
+        clear_braintrust_auth_env(&mut cmd);
+        use_fake_credential_store(&mut cmd, bin.path());
+        cmd.env("HOME", home.path())
+            .env("XDG_CONFIG_HOME", config.path())
+            .args(["login", "--refresh", "--profile", "test-profile", "--json"]);
+        if verbose {
+            cmd.arg("--verbose");
+        }
+        let output = cmd.assert().success().get_output().clone();
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert_eq!(
+            stderr.contains("Refreshing OAuth token"),
+            verbose,
+            "{stderr}"
+        );
+        assert_eq!(
+            stderr.contains("Cached access token expiry"),
+            verbose,
+            "{stderr}"
+        );
+        assert_eq!(
+            stderr.contains("Refresh token rotation"),
+            verbose,
+            "{stderr}"
+        );
+        let result: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert_eq!(result["status"], "ok");
+        server.join().unwrap();
+    }
+}

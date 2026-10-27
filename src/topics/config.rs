@@ -869,6 +869,9 @@ fn parse_duration_to_seconds(value: Option<&str>) -> Result<Option<i64>> {
         None => (value, 's'),
     };
     let amount = number.trim().parse::<i64>()?;
+    if amount < 0 {
+        bail!("duration cannot be negative");
+    }
     let multiplier = match unit.to_ascii_lowercase() {
         's' => 1,
         'm' => 60,
@@ -877,7 +880,11 @@ fn parse_duration_to_seconds(value: Option<&str>) -> Result<Option<i64>> {
         'w' => 7 * 24 * 60 * 60,
         _ => bail!("unsupported duration unit '{unit}'"),
     };
-    Ok(Some(amount * multiplier))
+    Ok(Some(
+        amount
+            .checked_mul(multiplier)
+            .ok_or_else(|| anyhow::anyhow!("duration is too large"))?,
+    ))
 }
 
 fn parse_sampling_rate(value: Option<&str>) -> Result<Option<f64>> {
@@ -909,6 +916,15 @@ fn parse_sampling_rate(value: Option<&str>) -> Result<Option<f64>> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn durations_reject_negative_values_and_overflow() {
+        for value in ["-5m", "-1", "9223372036854775807w"] {
+            assert!(parse_duration_to_seconds(Some(value)).is_err(), "{value}");
+        }
+        assert_eq!(parse_duration_to_seconds(Some("0")).unwrap(), Some(0));
+        assert_eq!(parse_duration_to_seconds(Some("5m")).unwrap(), Some(300));
+    }
+
     use super::*;
     use crate::topics::api::{TopicsDeleteReport, TopicsProjectSummary};
 

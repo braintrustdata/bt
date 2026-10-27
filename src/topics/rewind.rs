@@ -84,7 +84,9 @@ fn parse_topic_window(value: &str) -> Result<i64> {
         'w' => 7 * 24 * 60 * 60,
         _ => bail!("unsupported duration unit '{unit}'"),
     };
-    Ok(amount * multiplier)
+    amount
+        .checked_mul(multiplier)
+        .ok_or_else(|| anyhow::anyhow!("topic window is too large"))
 }
 #[cfg(test)]
 mod tests {
