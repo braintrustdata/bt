@@ -577,10 +577,6 @@ Show current org and project context:
 - `bt status --verbose` — show detailed config resolution
 - `bt status --json` — JSON output
 
-The saved project ID is shown only when the selected organization and project
-match the saved context. Overriding the organization does not reuse another
-organization's project ID, even when the project names are the same.
-
 ## Application SDK setup
 
 To add the Braintrust SDK to an application, run the project setup wizard from
