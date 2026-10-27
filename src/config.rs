@@ -120,7 +120,7 @@ pub(crate) fn project_from_config_for_context(
         .flatten()
 }
 
-fn config_matches_context(cfg: &Config, resolved_org: Option<&str>) -> bool {
+pub(crate) fn config_matches_context(cfg: &Config, resolved_org: Option<&str>) -> bool {
     let cfg_org = trimmed_option(cfg.org.as_deref());
     let resolved_org = trimmed_option(resolved_org);
 

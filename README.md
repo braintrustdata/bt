@@ -575,7 +575,11 @@ Show current org and project context:
 
 - `bt status` — display current org, project, and config source
 - `bt status --verbose` — show detailed config resolution
-- `bt status -j` — JSON output
+- `bt status --json` — JSON output
+
+The saved project ID is shown only when the selected organization and project
+match the saved context. Overriding the organization does not reuse another
+organization's project ID, even when the project names are the same.
 
 ## Application SDK setup
 

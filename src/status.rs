@@ -112,9 +112,10 @@ pub async fn run(base: BaseArgs, args: StatusArgs) -> Result<()> {
         project = config::project_from_config_for_context(&merged_cfg, org.as_deref());
     }
 
-    let project_id = (project.as_deref() == merged_cfg.project.as_deref())
-        .then(|| merged_cfg.project_id.clone())
-        .flatten();
+    let project_id = (project.as_deref() == merged_cfg.project.as_deref()
+        && config::config_matches_context(&merged_cfg, org.as_deref()))
+    .then(|| merged_cfg.project_id.clone())
+    .flatten();
     let profiles = if args.all {
         Some(auth::profile_verifications().await?)
     } else {
