@@ -335,52 +335,6 @@ fn status_verbose_explicitly_shows_unset_profile() {
 }
 
 #[test]
-fn status_honors_clustered_context_flags_and_their_source() {
-    let home = tempfile::tempdir().expect("home tempdir");
-    let config_home = tempfile::tempdir().expect("config tempdir");
-    let work = tempfile::tempdir().expect("work tempdir");
-    for flags in [
-        vec!["-qo", "test-org", "-ptest-project"],
-        vec!["-vo", "test-org", "-ptest-project"],
-        vec!["-otest-org", "-qptest-project"],
-        vec!["--org=test-org", "--project=test-project"],
-        vec![],
-    ] {
-        let explicit = !flags.is_empty();
-        let mut cmd = bt_command();
-        clear_braintrust_auth_env(&mut cmd);
-        let stdout = cmd
-            .current_dir(work.path())
-            .env("HOME", home.path())
-            .env("XDG_CONFIG_HOME", config_home.path())
-            .env(
-                "BRAINTRUST_ORG_NAME",
-                if explicit { "env-org" } else { "test-org" },
-            )
-            .env(
-                "BRAINTRUST_DEFAULT_PROJECT",
-                if explicit {
-                    "env-project"
-                } else {
-                    "test-project"
-                },
-            )
-            .arg("status")
-            .args(flags)
-            .arg("--json")
-            .assert()
-            .success()
-            .get_output()
-            .stdout
-            .clone();
-        let output: serde_json::Value = serde_json::from_slice(&stdout).expect("status emits JSON");
-        assert_eq!(output["org"], "test-org");
-        assert_eq!(output["project"], "test-project");
-        assert_eq!(output["source"], if explicit { "cli" } else { "env" });
-    }
-}
-
-#[test]
 fn bare_status_does_not_render_the_all_profiles_report() {
     let home = tempfile::tempdir().expect("home tempdir");
     let config_home = tempfile::tempdir().expect("config tempdir");
@@ -2612,6 +2566,52 @@ fn status_quiet_and_verbose_conflict() {
         .assert()
         .failure()
         .stderr(predicate::str::contains("cannot be used with"));
+}
+
+#[test]
+fn status_honors_clustered_context_flags_and_their_source() {
+    let home = tempfile::tempdir().expect("home tempdir");
+    let config_home = tempfile::tempdir().expect("config tempdir");
+    let work = tempfile::tempdir().expect("work tempdir");
+    for flags in [
+        vec!["-qo", "test-org", "-ptest-project"],
+        vec!["-vo", "test-org", "-ptest-project"],
+        vec!["-otest-org", "-qptest-project"],
+        vec!["--org=test-org", "--project=test-project"],
+        vec![],
+    ] {
+        let explicit = !flags.is_empty();
+        let mut cmd = bt_command();
+        clear_braintrust_auth_env(&mut cmd);
+        let stdout = cmd
+            .current_dir(work.path())
+            .env("HOME", home.path())
+            .env("XDG_CONFIG_HOME", config_home.path())
+            .env(
+                "BRAINTRUST_ORG_NAME",
+                if explicit { "env-org" } else { "test-org" },
+            )
+            .env(
+                "BRAINTRUST_DEFAULT_PROJECT",
+                if explicit {
+                    "env-project"
+                } else {
+                    "test-project"
+                },
+            )
+            .arg("status")
+            .args(flags)
+            .arg("--json")
+            .assert()
+            .success()
+            .get_output()
+            .stdout
+            .clone();
+        let output: serde_json::Value = serde_json::from_slice(&stdout).expect("status emits JSON");
+        assert_eq!(output["org"], "test-org");
+        assert_eq!(output["project"], "test-project");
+        assert_eq!(output["source"], if explicit { "cli" } else { "env" });
+    }
 }
 
 #[test]
