@@ -287,14 +287,7 @@ struct ObjectRef {
     object_name: String,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
-struct BtqlResponse {
-    pub data: Vec<Map<String, Value>>,
-    #[serde(default)]
-    pub cursor: Option<String>,
-    #[serde(default)]
-    pub schema: Option<Value>,
-}
+type BtqlResponse = crate::http::BtqlResponse<Map<String, Value>>;
 
 #[derive(Debug, Clone, Serialize)]
 pub(crate) struct ProjectSelection {
@@ -6301,7 +6294,9 @@ async fn fetch_summary_rows(
     let mut rows: Vec<Map<String, Value>> = Vec::new();
     let mut cursor: Option<String> = None;
 
+    let mut pagination = crate::http::btql::Pagination::default();
     while rows.len() < total_limit {
+        pagination.check(cursor.as_deref())?;
         let page_limit = (total_limit - rows.len()).min(MAX_BTQL_PAGE_LIMIT);
         let query = build_summary_query(
             &query_ctx.source_expr,
@@ -6402,7 +6397,9 @@ async fn fetch_trace_span_rows_for_tree(
     let mut rows: Vec<Map<String, Value>> = Vec::new();
     let mut cursor: Option<String> = None;
 
+    let mut pagination = crate::http::btql::Pagination::default();
     while rows.len() < total_limit {
+        pagination.check(cursor.as_deref())?;
         let page_limit = (total_limit - rows.len()).min(MAX_BTQL_PAGE_LIMIT);
         let query = build_spans_query(
             project_id,
@@ -6748,29 +6745,19 @@ fn poll_pending_thread_load(app: &mut TraceViewerApp) {
 }
 
 async fn execute_query(client: &ApiClient, query: &str) -> Result<BtqlResponse> {
-    let body = json!({
-        "query": query,
-        "fmt": "json",
-        "query_source": "bt_traces_9f4b1e6d7c2a4a7b8d4f9a6c2b1e7f3d",
-    });
-
-    let org_name = client.org_name();
-    let headers = if !org_name.is_empty() {
-        vec![("x-bt-org-name", org_name)]
-    } else {
-        Vec::new()
-    };
-
-    client.post_with_headers("/btql", &body, &headers).await
+    client
+        .query(
+            query,
+            crate::http::btql::QueryOptions {
+                source: Some(crate::http::btql::TRACES_QUERY_SOURCE),
+                lint_mode: None,
+            },
+        )
+        .await
 }
 
 async fn execute_invoke(client: &ApiClient, request: &Value) -> Result<Value> {
-    let org_name = client.org_name();
-    let headers = if !org_name.is_empty() {
-        vec![("x-bt-org-name", org_name)]
-    } else {
-        Vec::new()
-    };
+    let headers = client.org_headers();
 
     client
         .post_with_headers("/function/invoke", request, &headers)

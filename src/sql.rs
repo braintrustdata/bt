@@ -20,7 +20,9 @@ use ratatui::widgets::{Block, Borders, Paragraph, Wrap};
 use ratatui::Terminal;
 use regex::Regex;
 use serde::{Deserialize, Serialize};
-use serde_json::{json, Map, Value};
+#[cfg(test)]
+use serde_json::json;
+use serde_json::{Map, Value};
 use unicode_width::UnicodeWidthStr;
 use urlencoding::encode;
 
@@ -31,7 +33,7 @@ use crate::project_context::resolve_required_project;
 use crate::ui::with_spinner;
 use crate::utils::parse_duration_to_seconds;
 
-const QUERY_SOURCE: &str = "bt_sql_9f4b1e6d7c2a4a7b8d4f9a6c2b1e7f3d";
+use crate::http::btql::{Pagination, QueryOptions, SQL_QUERY_SOURCE as QUERY_SOURCE};
 static LOGS_SOURCE_RE: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(r"(?i)\bfrom[ \t\r\n]+(?P<source>logs)\b").expect("valid logs source regex")
 });
@@ -217,7 +219,7 @@ struct AsyncQueryResultPage {
     status: AsyncQueryStatus,
     #[serde(default)]
     rows: Vec<Map<String, Value>>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "crate::http::btql::deserialize_cursor")]
     cursor: Option<String>,
     #[serde(default)]
     error: Option<String>,
@@ -574,10 +576,16 @@ fn format_response(response: &SqlResponse, json_output: bool) -> Result<String> 
 }
 
 async fn execute_query(client: &ApiClient, query: &str, lint_mode: &str) -> Result<SqlResponse> {
-    let body = query_body(query, lint_mode);
-    let headers = org_headers(client);
-
-    match client.post_with_headers("/btql", &body, &headers).await {
+    match client
+        .query(
+            query,
+            QueryOptions {
+                source: Some(QUERY_SOURCE),
+                lint_mode: Some(lint_mode),
+            },
+        )
+        .await
+    {
         Ok(response) => Ok(response),
         Err(err) => {
             if let Some(message) = format_strict_lint_error(&err) {
@@ -630,7 +638,7 @@ async fn submit_async_query(
     batch_size: Option<u64>,
 ) -> Result<SubmitAsyncQueryResponse> {
     let body = async_query_submit_body(query, batch_size);
-    let headers = org_headers(client);
+    let headers = client.org_headers();
     client
         .post_with_headers("/btql/async", &body, &headers)
         .await
@@ -642,10 +650,9 @@ async fn wait_for_async_query(
     args: &SqlArgs,
 ) -> Result<AsyncQueryStatusResponse> {
     let started = Instant::now();
-    let headers = org_headers(client);
     loop {
         let status: AsyncQueryStatusResponse = client
-            .get_with_headers(&format!("/btql/async/{}", encode(automation_id)), &headers)
+            .get_query_result(&format!("/btql/async/{}", encode(automation_id)))
             .await?;
         if status.status.is_terminal() {
             return Ok(status);
@@ -669,6 +676,7 @@ async fn collect_async_query_result(
 ) -> Result<SqlResponse> {
     let mut cursor = None;
     let mut rows = Vec::new();
+    let mut pagination = Pagination::default();
 
     loop {
         let page = get_async_query_result_page(
@@ -695,8 +703,9 @@ async fn collect_async_query_result(
             );
         }
 
+        pagination.check(cursor.as_deref())?;
         rows.extend(page.rows);
-        cursor = page.cursor;
+        cursor = page.cursor.filter(|cursor| !cursor.is_empty());
         if cursor.is_none() {
             break;
         }
@@ -719,31 +728,20 @@ async fn get_async_query_result_page(
     limit: u64,
     cursor: Option<&str>,
 ) -> Result<AsyncQueryResultPage> {
-    let headers = org_headers(client);
     client
-        .get_with_headers(
-            &async_query_result_path(automation_id, limit, cursor),
-            &headers,
-        )
+        .get_query_result(&async_query_result_path(automation_id, limit, cursor))
         .await
 }
 
-fn org_headers(client: &ApiClient) -> Vec<(&'static str, &str)> {
-    let org_name = client.org_name();
-    if org_name.is_empty() {
-        return Vec::new();
-    }
-    vec![("x-bt-org-name", org_name)]
-}
-
+#[cfg(test)]
 fn query_body(query: &str, lint_mode: &str) -> Value {
-    json!({
-        "query": query,
-        "fmt": "json",
-        "lint_mode": lint_mode,
-        "strict_lint_mode": lint_mode == "strict",
-        "query_source": QUERY_SOURCE,
-    })
+    crate::http::btql::query_body(
+        query,
+        QueryOptions {
+            source: Some(QUERY_SOURCE),
+            lint_mode: Some(lint_mode),
+        },
+    )
 }
 
 fn async_query_submit_body(query: &str, batch_size: Option<u64>) -> SubmitAsyncQueryRequest<'_> {

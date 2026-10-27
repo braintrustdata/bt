@@ -1,17 +1,14 @@
-use std::collections::HashSet;
-
 use anyhow::{bail, Context, Result};
 use reqwest::header::HeaderMap;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Map, Value};
 use urlencoding::encode;
 
-use crate::http::{ApiClient, HttpError};
+use crate::http::ApiClient;
 
 use super::records::DATASET_RECORD_FIELDS;
 
 const MAX_DATASET_ROWS_PAGE_LIMIT: usize = 1000;
-const MAX_DATASET_ROWS_PAGES: usize = 10_000;
 const DATASET_ROWS_SINCE: &str = "1970-01-01T00:00:00Z";
 const MAX_ERROR_RESPONSE_BODY_CHARS: usize = 4000;
 
@@ -157,8 +154,7 @@ pub async fn list_dataset_rows_limited(
 
     let mut rows = Vec::new();
     let mut cursor: Option<String> = None;
-    let mut seen_cursors = HashSet::new();
-    let mut page_count = 0usize;
+    let mut pagination = crate::http::btql::Pagination::with_max_pages(10_000);
     let mut truncated = false;
 
     loop {
@@ -167,22 +163,9 @@ pub async fn list_dataset_rows_limited(
             break;
         };
 
-        page_count += 1;
-        if page_count > MAX_DATASET_ROWS_PAGES {
-            bail!(
-                "dataset rows pagination exceeded {} pages for dataset '{}'",
-                MAX_DATASET_ROWS_PAGES,
-                dataset_id
-            );
-        }
-        if let Some(current_cursor) = cursor.as_ref() {
-            if !seen_cursors.insert(current_cursor.clone()) {
-                bail!(
-                    "dataset rows pagination loop detected for dataset '{}'",
-                    dataset_id
-                );
-            }
-        }
+        pagination
+            .check(cursor.as_deref())
+            .with_context(|| format!("failed to paginate dataset '{dataset_id}'"))?;
 
         let query =
             build_dataset_rows_query(dataset_id, page_limit, cursor.as_deref(), preview_length);
@@ -302,14 +285,11 @@ pub async fn create_dataset_snapshot(
     let response = client
         .post_with_headers_raw("/v1/dataset_snapshot", &body, &[])
         .await?;
-    if !response.status().is_success() {
-        let status = response.status();
-        let body = response.text().await.unwrap_or_default();
-        return Err(HttpError { status, body }.into());
-    }
+    let response = ApiClient::checked_response(response).await?;
 
     let found_existing = found_existing_snapshot_header(response.headers());
-    let dataset_snapshot = response.json().await.context("failed to parse response")?;
+    let dataset_snapshot =
+        crate::http::parse_json_response(response, "POST", "/v1/dataset_snapshot").await?;
     Ok(CreateDatasetSnapshotResult {
         dataset_snapshot,
         found_existing,
@@ -341,11 +321,7 @@ pub async fn restore_dataset(
     let response = client
         .post_with_headers_raw(&path, &serde_json::json!({ "version": xact_id }), &[])
         .await?;
-    if !response.status().is_success() {
-        let status = response.status();
-        let body = response.text().await.unwrap_or_default();
-        return Err(HttpError { status, body }.into());
-    }
+    let response = ApiClient::checked_response(response).await?;
 
     let body = response
         .text()

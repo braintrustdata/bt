@@ -2080,13 +2080,7 @@ async fn execute_btql_value(client: &ApiClient, query: &str) -> Result<Value> {
         fmt: "json",
         brainstore_realtime: true,
     };
-    let org_name = client.org_name();
-    let headers = if !org_name.is_empty() {
-        vec![("x-bt-org-name", org_name)]
-    } else {
-        Vec::new()
-    };
-    client.post_with_headers("/btql", &body, &headers).await
+    client.query_with_body(&body).await
 }
 
 fn first_btql_row(response: &Value) -> Option<&serde_json::Map<String, Value>> {

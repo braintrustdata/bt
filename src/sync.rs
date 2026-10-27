@@ -8,8 +8,6 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::{anyhow, bail, Context, Result};
-use backoff::future::retry_notify;
-use backoff::{Error as BackoffError, ExponentialBackoffBuilder};
 use base64::prelude::{Engine as _, BASE64_STANDARD};
 use braintrust_sdk_rust::Logs3BatchUploader;
 use clap::{Args, Subcommand, ValueEnum};
@@ -23,7 +21,10 @@ use urlencoding::encode;
 use crate::args::BaseArgs;
 use crate::auth::{login, LoginContext};
 use crate::experiments::api::create_experiment;
-use crate::http::ApiClient;
+use crate::http::{
+    btql::{Pagination, QueryOptions, RetryReason, SYNC_QUERY_SOURCE},
+    ApiClient,
+};
 use crate::projects::api::{create_project, list_projects, Project};
 use crate::ui::{animations_enabled, fuzzy_select, is_quiet};
 use crate::utils::{app_project_url, parse_duration_to_seconds, write_json_atomic};
@@ -38,9 +39,6 @@ const DEFAULT_WORKERS_FALLBACK: usize = 8;
 // BTQL currently enforces limit <= 1000.
 const ROOT_DISCOVERY_PAGE_SIZE: usize = 1000;
 const ROOT_FETCH_CHUNK_SIZE: usize = 100;
-const BTQL_MAX_ATTEMPTS: usize = 5;
-const BTQL_RETRY_BASE_DELAY_MS: u64 = 300;
-const BTQL_MAX_BACKOFF_SECS: u64 = 8;
 const PULL_OUTPUT_PART_MAX_BYTES: u64 = 128 * 1024 * 1024;
 const LINE_COUNT_BUFFER_BYTES: usize = 1024 * 1024;
 const PUSH_BATCH_MAX_INPUT_BYTES: usize = 16 * 1024 * 1024;
@@ -402,12 +400,7 @@ struct PushState {
     completed_at: Option<u64>,
 }
 
-#[derive(Debug, Deserialize)]
-struct BtqlResponse {
-    data: Vec<Map<String, Value>>,
-    #[serde(default)]
-    cursor: Option<String>,
-}
+type BtqlResponse = crate::http::BtqlResponse<Map<String, Value>>;
 
 #[derive(Debug, Clone, Deserialize)]
 struct NamedObject {
@@ -977,10 +970,12 @@ async fn pull_spans_mode(
 
     let mut writer = open_jsonl_part_writer(output_dir, state.items_done > 0)?;
 
+    let mut pagination = Pagination::default();
     while state.items_done < limit {
+        pagination.check(state.cursor.as_deref())?;
         let batch_limit = (limit - state.items_done).min(spec.page_size);
         let query = build_spans_query(source_expr, filter, batch_limit, state.cursor.as_deref());
-        let BtqlResponse { data, cursor } = execute_btql_query_timed(
+        let BtqlResponse { data, cursor, .. } = execute_btql_query_timed(
             client,
             ctx,
             &query,
@@ -1210,7 +1205,9 @@ async fn pull_traces_mode(
         let mut seen = state.root_ids.iter().cloned().collect::<HashSet<String>>();
         let mut discovery_cursor = state.root_discovery_cursor.clone();
 
+        let mut pagination = Pagination::default();
         while seen.len() < state.limit {
+            pagination.check(discovery_cursor.as_deref())?;
             let page_limit = ROOT_DISCOVERY_PAGE_SIZE;
             let query = build_root_discovery_query(
                 source_expr,
@@ -1498,6 +1495,7 @@ async fn process_trace_chunk(
     btql_retry_tracker: &Arc<BtqlRetryTracker>,
     verbose: bool,
 ) -> Result<()> {
+    let mut pagination = Pagination::default();
     loop {
         let (root_chunk, cursor, already_completed) = {
             let state = shared_state.lock().await;
@@ -1513,6 +1511,7 @@ async fn process_trace_chunk(
             return Ok(());
         }
 
+        pagination.check(cursor.as_deref())?;
         let query = build_root_spans_query(
             source_expr,
             &root_chunk,
@@ -1520,7 +1519,7 @@ async fn process_trace_chunk(
             page_size,
             cursor.as_deref(),
         );
-        let BtqlResponse { data, cursor } = execute_btql_query_timed(
+        let BtqlResponse { data, cursor, .. } = execute_btql_query_timed(
             client,
             ctx,
             &query,
@@ -2251,7 +2250,7 @@ fn run_status(json_output: bool, args: StatusArgs) -> Result<()> {
 
 async fn execute_btql_request<Q, T>(
     client: &ApiClient,
-    ctx: &LoginContext,
+    _ctx: &LoginContext,
     query: &Q,
     query_source: &str,
     btql_retry_tracker: Option<Arc<BtqlRetryTracker>>,
@@ -2260,89 +2259,23 @@ where
     Q: Serialize + ?Sized,
     T: DeserializeOwned,
 {
-    let body = json!({
-        "query": query,
-        "fmt": "json",
-        "query_source": query_source,
-    });
-    let org_name = ctx.login.org_name().unwrap_or_default();
-    let client = client.clone();
-    let attempt_counter = Arc::new(AtomicUsize::new(0));
-
-    let backoff = ExponentialBackoffBuilder::new()
-        .with_initial_interval(Duration::from_millis(BTQL_RETRY_BASE_DELAY_MS))
-        .with_multiplier(2.0)
-        .with_randomization_factor(0.2)
-        .with_max_interval(Duration::from_secs(BTQL_MAX_BACKOFF_SECS))
-        .with_max_elapsed_time(None)
-        .build();
-
-    let result = retry_notify(
-        backoff,
-        || {
-            let client = client.clone();
-            let body = body.clone();
-            let org_name = org_name.clone();
-            let attempt_counter = Arc::clone(&attempt_counter);
-            let btql_retry_tracker = btql_retry_tracker.clone();
-
-            async move {
-                let attempt = attempt_counter.fetch_add(1, Ordering::Relaxed) + 1;
-                let headers = if org_name.is_empty() {
-                    Vec::new()
-                } else {
-                    vec![("x-bt-org-name", org_name.as_str())]
-                };
-
-                match client.post_with_headers_raw("/btql", &body, &headers).await {
-                    Ok(response) => {
-                        let status = response.status();
-                        if status.is_success() {
-                            return response.json::<T>().await.map_err(|err| {
-                                BackoffError::permanent(anyhow!("failed to parse BTQL response: {err}"))
-                            });
-                        }
-
-                        let body = response.text().await.unwrap_or_default();
-                        let should_retry = status.is_server_error() || status.as_u16() == 413;
-                        if should_retry && attempt < BTQL_MAX_ATTEMPTS {
-                            if let Some(tracker) = btql_retry_tracker.as_ref() {
-                                tracker.record_status(status.as_u16());
-                            }
-                            Err(BackoffError::transient(anyhow!(
-                                "BTQL retryable failure ({status}) on attempt {attempt}/{BTQL_MAX_ATTEMPTS}: {body}"
-                            )))
-                        } else {
-                            Err(BackoffError::permanent(anyhow!(
-                                "BTQL request failed ({status}) after {attempt} attempt(s): {body}"
-                            )))
-                        }
-                    }
-                    Err(err) => {
-                        if attempt < BTQL_MAX_ATTEMPTS {
-                            if let Some(tracker) = btql_retry_tracker.as_ref() {
-                                tracker.record_network();
-                            }
-                            Err(BackoffError::transient(anyhow!(
-                                "BTQL network error on attempt {attempt}/{BTQL_MAX_ATTEMPTS}: {err}"
-                            )))
-                        } else {
-                            Err(BackoffError::permanent(anyhow!(
-                                "BTQL request failed after {attempt} attempt(s): {err}"
-                            )))
-                        }
+    client
+        .query_with_retry_observer(
+            query,
+            QueryOptions {
+                source: Some(query_source),
+                lint_mode: None,
+            },
+            |reason| {
+                if let Some(tracker) = btql_retry_tracker.as_ref() {
+                    match reason {
+                        RetryReason::Status(status) => tracker.record_status(status),
+                        RetryReason::Network => tracker.record_network(),
                     }
                 }
-            }
-        },
-        |_, _| {},
-    )
-    .await;
-
-    result.map_err(|err| {
-        let attempts = attempt_counter.load(Ordering::Relaxed).max(1);
-        anyhow!(err).context(format!("BTQL request failed after {attempts} attempt(s)"))
-    })
+            },
+        )
+        .await
 }
 
 async fn execute_btql_query(
@@ -2351,14 +2284,7 @@ async fn execute_btql_query(
     query: &str,
     btql_retry_tracker: Option<Arc<BtqlRetryTracker>>,
 ) -> Result<BtqlResponse> {
-    execute_btql_request(
-        client,
-        ctx,
-        query,
-        "bt_sync_9f4b1e6d7c2a4a7b8d4f9a6c2b1e7f3d",
-        btql_retry_tracker,
-    )
-    .await
+    execute_btql_request(client, ctx, query, SYNC_QUERY_SOURCE, btql_retry_tracker).await
 }
 
 async fn execute_btql_json_query<T: DeserializeOwned>(

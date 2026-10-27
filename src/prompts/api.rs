@@ -98,14 +98,7 @@ pub async fn list_prompt_versions(
     prompt_id: &str,
 ) -> Result<Vec<String>> {
     let body = prompt_versions_request(project_id, prompt_id);
-    let org_name = client.org_name();
-    let headers = if org_name.is_empty() {
-        Vec::new()
-    } else {
-        vec![("x-bt-org-name", org_name)]
-    };
-    let response: PromptVersionsResponse =
-        client.post_with_headers("/btql", &body, &headers).await?;
+    let response: PromptVersionsResponse = client.query_with_body(&body).await?;
 
     Ok(prompt_versions_from_rows(response.data))
 }

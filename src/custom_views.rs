@@ -486,10 +486,7 @@ struct PushedView {
     url: String,
 }
 
-#[derive(Debug, Deserialize)]
-struct BtqlResponse {
-    data: Vec<Map<String, Value>>,
-}
+type BtqlResponse = crate::http::BtqlResponse<Map<String, Value>>;
 
 struct PreviewServerState {
     client: ApiClient,
@@ -1898,18 +1895,15 @@ async fn fetch_full_span_row(
 }
 
 async fn execute_query(client: &ApiClient, query: &str) -> Result<BtqlResponse> {
-    let body = json!({
-        "query": query,
-        "fmt": "json",
-        "query_source": "bt_views_preview_7e8680d0f2484e2fbef8a61f2de0b9df",
-    });
-    let org_name = client.org_name();
-    let headers = if org_name.is_empty() {
-        Vec::new()
-    } else {
-        vec![("x-bt-org-name", org_name)]
-    };
-    client.post_with_headers("/btql", &body, &headers).await
+    client
+        .query(
+            query,
+            crate::http::btql::QueryOptions {
+                source: Some("bt_views_preview_7e8680d0f2484e2fbef8a61f2de0b9df"),
+                lint_mode: None,
+            },
+        )
+        .await
 }
 
 fn sql_quote(value: &str) -> String {

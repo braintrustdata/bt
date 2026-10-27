@@ -1,3 +1,5 @@
+pub mod btql;
+
 use std::collections::HashMap;
 
 use anyhow::{Context, Result};
@@ -5,7 +7,6 @@ use reqwest::header::{HeaderValue, CONTENT_TYPE};
 use reqwest::{Client, ClientBuilder, Method, StatusCode};
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
-use serde_json::json;
 
 use crate::auth::LoginContext;
 
@@ -84,7 +85,7 @@ impl std::fmt::Display for ResponseParseError {
 
 impl std::error::Error for ResponseParseError {}
 
-async fn parse_json_response<T: DeserializeOwned>(
+pub(crate) async fn parse_json_response<T: DeserializeOwned>(
     response: reqwest::Response,
     method: &str,
     path: &str,
@@ -166,11 +167,13 @@ fn parse_response_error<T>(
     ResponseParseError { message }.into()
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Serialize, Deserialize)]
 pub struct BtqlResponse<T> {
     pub data: Vec<T>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "btql::deserialize_cursor")]
     pub cursor: Option<String>,
+    #[serde(default)]
+    pub schema: Option<serde_json::Value>,
 }
 
 impl ApiClient {
@@ -207,6 +210,40 @@ impl ApiClient {
         &self.org_name
     }
 
+    async fn send_request<B: Serialize + ?Sized>(
+        &self,
+        method: Method,
+        path: &str,
+        body: Option<&B>,
+        headers: &[(&str, &str)],
+        timeout: Option<std::time::Duration>,
+    ) -> Result<reqwest::Response> {
+        let mut request = self
+            .http
+            .request(method.clone(), self.url(path))
+            .bearer_auth(&self.api_key);
+        if let Some(body) = body {
+            request = request.json(body);
+        }
+        for (key, value) in headers {
+            request = request.header(*key, *value);
+        }
+        if let Some(timeout) = timeout {
+            request = request.timeout(timeout);
+        }
+        request
+            .send()
+            .await
+            .with_context(|| format!("{method} {path} request failed"))
+    }
+
+    pub(crate) async fn checked_response(response: reqwest::Response) -> Result<reqwest::Response> {
+        if !response.status().is_success() {
+            return Err(response_error(response).await.into());
+        }
+        Ok(response)
+    }
+
     pub async fn get<T: DeserializeOwned>(&self, path: &str) -> Result<T> {
         self.get_with_headers(path, &[]).await
     }
@@ -216,20 +253,10 @@ impl ApiClient {
         path: &str,
         headers: &[(&str, &str)],
     ) -> Result<T> {
-        let url = self.url(path);
-        let mut request = self.http.get(&url).bearer_auth(&self.api_key);
-
-        for (key, value) in headers {
-            request = request.header(*key, *value);
-        }
-
-        let response = request.send().await.context("request failed")?;
-
-        if !response.status().is_success() {
-            return Err(response_error(response).await.into());
-        }
-
-        parse_json_response(response, "GET", path).await
+        let response = self
+            .send_request::<()>(Method::GET, path, None, headers, None)
+            .await?;
+        parse_json_response(Self::checked_response(response).await?, "GET", path).await
     }
 
     async fn send_json<T: DeserializeOwned, B: Serialize>(
@@ -239,17 +266,14 @@ impl ApiClient {
         body: &B,
     ) -> Result<T> {
         let response = self
-            .http
-            .request(method.clone(), self.url(path))
-            .bearer_auth(&self.api_key)
-            .json(body)
-            .send()
-            .await
-            .context("request failed")?;
-        if !response.status().is_success() {
-            return Err(response_error(response).await.into());
-        }
-        parse_json_response(response, method.as_str(), path).await
+            .send_request(method.clone(), path, Some(body), &[], None)
+            .await?;
+        parse_json_response(
+            Self::checked_response(response).await?,
+            method.as_str(),
+            path,
+        )
+        .await
     }
 
     pub async fn post<T: DeserializeOwned, B: Serialize>(&self, path: &str, body: &B) -> Result<T> {
@@ -293,56 +317,27 @@ impl ApiClient {
         T: DeserializeOwned,
         B: Serialize,
     {
-        let url = self.url(path);
-        let mut request = self.http.post(&url).bearer_auth(&self.api_key).json(body);
-
-        for (key, value) in headers {
-            request = request.header(*key, *value);
-        }
-        if let Some(t) = timeout {
-            request = request.timeout(t);
-        }
-
-        let response = request.send().await.context("request failed")?;
-
-        if !response.status().is_success() {
-            return Err(response_error(response).await.into());
-        }
-
-        parse_json_response(response, "POST", path).await
+        let response = self
+            .send_request(Method::POST, path, Some(body), headers, timeout)
+            .await?;
+        parse_json_response(Self::checked_response(response).await?, "POST", path).await
     }
 
-    pub async fn post_with_headers_raw<B>(
+    pub async fn post_with_headers_raw<B: Serialize>(
         &self,
         path: &str,
         body: &B,
         headers: &[(&str, &str)],
-    ) -> Result<reqwest::Response>
-    where
-        B: Serialize,
-    {
-        let url = self.url(path);
-        let mut request = self.http.post(&url).bearer_auth(&self.api_key).json(body);
-
-        for (key, value) in headers {
-            request = request.header(*key, *value);
-        }
-
-        request.send().await.context("request failed")
+    ) -> Result<reqwest::Response> {
+        self.send_request(Method::POST, path, Some(body), headers, None)
+            .await
     }
 
     async fn send_delete(&self, path: &str) -> Result<reqwest::Response> {
         let response = self
-            .http
-            .delete(self.url(path))
-            .bearer_auth(&self.api_key)
-            .send()
-            .await
-            .context("request failed")?;
-        if !response.status().is_success() {
-            return Err(response_error(response).await.into());
-        }
-        Ok(response)
+            .send_request::<()>(Method::DELETE, path, None, &[], None)
+            .await?;
+        Self::checked_response(response).await
     }
 
     pub async fn delete(&self, path: &str) -> Result<()> {
@@ -370,19 +365,7 @@ impl ApiClient {
         T: DeserializeOwned,
         Q: Serialize + ?Sized,
     {
-        let body = json!({
-            "query": query,
-            "fmt": "json",
-        });
-
-        let org_name = self.org_name();
-        let headers = if !org_name.is_empty() {
-            vec![("x-bt-org-name", org_name)]
-        } else {
-            Vec::new()
-        };
-
-        self.post_with_headers("/btql", &body, &headers).await
+        self.query(query, btql::QueryOptions::default()).await
     }
 }
 
