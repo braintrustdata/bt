@@ -577,6 +577,9 @@ Show current org and project context:
 - `bt status --verbose` — show detailed config resolution
 - `bt status -j` — JSON output
 
+Organization and project flags use the same parsing and precedence as other
+commands, including combined short options such as `bt status -qo my-org`.
+
 ## Application SDK setup
 
 To add the Braintrust SDK to an application, run the project setup wizard from
