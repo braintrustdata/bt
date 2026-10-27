@@ -56,6 +56,12 @@ fn retry_reason(error: &anyhow::Error) -> Option<RetryReason> {
     })
 }
 
+fn retry_delay(retry_after: Option<Duration>, backoff: &mut impl Backoff) -> Duration {
+    // The local cap only applies to delays we generate. A server's rate-limit
+    // window must elapse before another attempt, even when it is longer.
+    retry_after.unwrap_or_else(|| backoff.next_backoff().unwrap_or(MAX_DELAY).min(MAX_DELAY))
+}
+
 impl ApiClient {
     pub fn org_headers(&self) -> Vec<(&'static str, &str)> {
         if self.org_name().is_empty() {
@@ -151,9 +157,7 @@ impl ApiClient {
                     if let Some(reason) = reason {
                         on_retry(reason);
                     }
-                    let delay =
-                        retry_after.unwrap_or_else(|| backoff.next_backoff().unwrap_or(MAX_DELAY));
-                    tokio::time::sleep(delay.min(MAX_DELAY)).await;
+                    tokio::time::sleep(retry_delay(retry_after, &mut backoff)).await;
                 }
             }
         }
@@ -461,5 +465,18 @@ mod tests {
         assert_eq!(requests[0].1, body);
         assert_eq!(requests[1].1, body);
         handle.stop(false).await;
+    }
+    #[test]
+    fn server_retry_after_is_not_shortened_by_the_local_backoff_cap() {
+        let mut backoff = backoff::backoff::Constant::new(Duration::from_secs(20));
+        assert_eq!(
+            retry_delay(Some(Duration::from_secs(60)), &mut backoff),
+            Duration::from_secs(60)
+        );
+        assert_eq!(
+            retry_delay(Some(Duration::ZERO), &mut backoff),
+            Duration::ZERO
+        );
+        assert_eq!(retry_delay(None, &mut backoff), MAX_DELAY);
     }
 }
