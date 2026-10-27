@@ -6754,6 +6754,11 @@ fn poll_pending_thread_load(app: &mut TraceViewerApp) {
 }
 
 async fn execute_invoke(client: &ApiClient, request: &Value) -> Result<Value> {
+    let client = if client.org_name().is_empty() {
+        client.clone()
+    } else {
+        client.header("x-bt-org-name", client.org_name())
+    };
     client.post("/function/invoke", request).await
 }
 

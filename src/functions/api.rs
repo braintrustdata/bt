@@ -244,6 +244,11 @@ pub async fn invoke_function(
     client: &ApiClient,
     body: &serde_json::Value,
 ) -> Result<serde_json::Value> {
+    let client = if client.org_name().is_empty() {
+        client.clone()
+    } else {
+        client.header("x-bt-org-name", client.org_name())
+    };
     let result = client
         .with_options(HttpOptions {
             timeout: Some(std::time::Duration::from_secs(300)),

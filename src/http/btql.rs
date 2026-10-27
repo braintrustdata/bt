@@ -50,20 +50,26 @@ impl ApiClient {
         if let Some(label) = &self.options.trace {
             eprintln!("btql[{label}] query:\n{}\n", serde_json::to_string(query)?);
         }
-        self.with_options(super::HttpOptions {
-            retry: Some(self.options.retry.unwrap_or(true)),
-            ..Default::default()
-        })
-        .post(
-            "/btql",
-            &QueryBody {
-                query,
-                fmt: "json",
-                options,
-                strict_lint_mode,
-            },
-        )
-        .await
+        let client = if self.org_name().is_empty() {
+            self.clone()
+        } else {
+            self.header("x-bt-org-name", self.org_name())
+        };
+        client
+            .with_options(super::HttpOptions {
+                retry: Some(self.options.retry.unwrap_or(true)),
+                ..Default::default()
+            })
+            .post(
+                "/btql",
+                &QueryBody {
+                    query,
+                    fmt: "json",
+                    options,
+                    strict_lint_mode,
+                },
+            )
+            .await
     }
 }
 
@@ -202,6 +208,7 @@ mod tests {
     use std::time::Duration;
 
     struct MockState {
+        org_name: String,
         replies: Mutex<VecDeque<(u16, &'static str)>>,
         requests: Mutex<Vec<(String, Value)>>,
     }
@@ -215,7 +222,18 @@ mod tests {
             req.headers().get("authorization").unwrap(),
             "Bearer test-key"
         );
-        assert_eq!(req.headers().get("x-bt-org-name").unwrap(), "test-org");
+        if (req.path() == "/btql" && !state.org_name.is_empty())
+            || req.path() == "/btql/async/test-id/result"
+            || req.path() == "/test/explicit-org"
+        {
+            assert_eq!(
+                req.headers().get("x-bt-org-name").unwrap(),
+                state.org_name.as_str()
+            );
+            assert_eq!(req.headers().get_all("x-bt-org-name").count(), 1);
+        } else {
+            assert!(!req.headers().contains_key("x-bt-org-name"));
+        }
         if req.path() == "/test/http" {
             assert_eq!(req.headers().get("x-test-header").unwrap(), "test-value");
             assert_eq!(req.query_string(), "name=test+project%2F%26");
@@ -230,10 +248,18 @@ mod tests {
         ));
         if req.path() == "/test/scoped" || req.headers().contains_key("x-test-option") {
             assert_eq!(req.headers().get("x-test-option").unwrap(), "test-value");
+            assert_eq!(
+                req.headers()
+                    .get_all("x-test-first")
+                    .map(|value| value.to_str().unwrap())
+                    .collect::<Vec<_>>(),
+                vec!["test-first", "test-second"]
+            );
             assert_eq!(req.query_string(), "test-name=test+value");
         }
         if req.path() == "/test/unconfigured" {
             assert!(!req.headers().contains_key("x-test-option"));
+            assert!(!req.headers().contains_key("x-test-first"));
             assert!(req.query_string().is_empty());
         }
         if req.headers().contains_key("x-test-delay") {
@@ -255,7 +281,15 @@ mod tests {
     async fn mock(
         replies: Vec<(u16, &'static str)>,
     ) -> (ApiClient, Arc<MockState>, actix_web::dev::ServerHandle) {
+        mock_with_org(replies, "test-org").await
+    }
+
+    async fn mock_with_org(
+        replies: Vec<(u16, &'static str)>,
+        org_name: &str,
+    ) -> (ApiClient, Arc<MockState>, actix_web::dev::ServerHandle) {
         let state = Arc::new(MockState {
+            org_name: org_name.to_owned(),
             replies: Mutex::new(replies.into()),
             requests: Mutex::new(Vec::new()),
         });
@@ -278,7 +312,7 @@ mod tests {
             base_url,
             api_key: "test-key".into(),
             org_id: "test-org-id".into(),
-            org_name: "test-org".into(),
+            org_name: org_name.to_owned(),
             options: HttpOptions::default(),
         };
         (client, state, handle)
@@ -381,6 +415,7 @@ mod tests {
     async fn async_result_gets_retry_but_api_writes_do_not() {
         let (client, state, handle) = mock(vec![(503, "test retry"), (200, "{\"rows\":[]}")]).await;
         let result: Value = client
+            .header("x-bt-org-name", client.org_name())
             .with_options(HttpOptions {
                 retry: Some(true),
                 ..Default::default()
@@ -710,18 +745,24 @@ mod tests {
     #[tokio::test]
     async fn scoped_options_can_be_reused_without_affecting_the_original_client() {
         let (client, state, handle) = mock(vec![
+            (503, "test retry"),
             (200, "{}"),
             (200, "test text"),
             (204, ""),
+            (503, "test retry"),
             (200, "{\"data\":[]}"),
             (200, "{}"),
         ])
         .await;
-        let configured = client.with_options(HttpOptions {
-            headers: vec![("x-test-option".into(), "test-value".into())],
-            query: vec![("test-name".into(), "test value".into())],
-            ..Default::default()
-        });
+        let configured = client
+            .header("x-test-first", "test-first")
+            .with_options(HttpOptions {
+                query: vec![("test-name".into(), "test value".into())],
+                retry: Some(true),
+                ..Default::default()
+            })
+            .header("x-test-option", "test-value")
+            .header("x-test-first", "test-second");
         let _: Value = configured.get("/test/scoped").await.unwrap();
         let text: WithHeaders<Text> = configured.post("/test/scoped", &json!({})).await.unwrap();
         assert_eq!(text.body.0, "test text");
@@ -732,7 +773,7 @@ mod tests {
             .await
             .unwrap();
         let _: Value = client.get("/test/unconfigured").await.unwrap();
-        assert_eq!(state.requests.lock().unwrap().len(), 5);
+        assert_eq!(state.requests.lock().unwrap().len(), 7);
         handle.stop(false).await;
     }
 
@@ -783,6 +824,27 @@ mod tests {
                 .is_timeout());
             handle.stop(false).await;
         }
+    }
+
+    #[tokio::test]
+    async fn explicit_org_headers_work_for_http_and_empty_orgs_remain_headerless() {
+        let (client, _, handle) = mock(vec![(200, "{}")]).await;
+        let _: Value = client
+            .header("x-bt-org-name", client.org_name())
+            .get("/test/explicit-org")
+            .await
+            .unwrap();
+        handle.stop(false).await;
+
+        let (client, state, handle) =
+            mock_with_org(vec![(200, "{}"), (200, "{\"data\":[]}")], "").await;
+        let _: Value = client.get("/test/unconfigured").await.unwrap();
+        let _: BtqlResponse<Value> = client
+            .btql("SELECT * FROM dataset('test-dataset') LIMIT 1")
+            .await
+            .unwrap();
+        assert_eq!(state.requests.lock().unwrap().len(), 2);
+        handle.stop(false).await;
     }
 
     #[tokio::test]

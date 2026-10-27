@@ -605,6 +605,12 @@ async fn run_async_query(
     args: &SqlArgs,
     json_output: bool,
 ) -> Result<()> {
+    let scoped = if client.org_name().is_empty() {
+        client.clone()
+    } else {
+        client.header("x-bt-org-name", client.org_name())
+    };
+    let client = &scoped;
     let submitted = with_spinner(
         "Submitting async query...",
         submit_async_query(client, query, args.async_batch_size),

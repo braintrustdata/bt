@@ -6,7 +6,7 @@
 //! let created: Project = client.with_options(HttpOptions {
 //!     timeout: Some(Duration::from_secs(60)), ..Default::default()
 //! }).post("/v1/project", &body).await?;
-//! let page: BtqlResponse<Row> = client.btql(&query).await?;
+//! let page: BtqlResponse<Row> = client.header("x-request-tag", "test-query").btql(&query).await?;
 //! let options = BtqlOptions { lint_mode: Some("strict"), ..Default::default() };
 //! let result: SqlResponse = client.btql_with_options(&sql, options).await?;
 //! let response: WithHeaders<Project> = client.post("/v1/project", &body).await?;
@@ -251,14 +251,19 @@ impl ApiClient {
         configured
     }
 
+    /// Append a header on a configured copy before an HTTP or BTQL call.
+    pub fn header(&self, name: &str, value: &str) -> Self {
+        self.with_options(HttpOptions {
+            headers: vec![(name.to_owned(), value.to_owned())],
+            ..Default::default()
+        })
+    }
+
     fn prepare(&self, method: Method, path: &str) -> reqwest::RequestBuilder {
         let mut inner = self
             .http
             .request(method.clone(), self.url(path))
             .bearer_auth(&self.api_key);
-        if !self.org_name.is_empty() {
-            inner = inner.header("x-bt-org-name", &self.org_name);
-        }
         for (name, value) in &self.options.headers {
             inner = inner.header(name, value);
         }
