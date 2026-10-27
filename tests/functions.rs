@@ -222,6 +222,7 @@ impl MockServer {
                 .route("/upload/{bundle_id}", web::put().to(mock_upload_bundle))
                 .route("/insert-functions", web::post().to(mock_insert_functions))
                 .route("/v1/function", web::get().to(mock_list_functions))
+                .route("/btql", web::post().to(mock_list_btql))
         })
         .workers(1)
         .listen(listener)
@@ -359,6 +360,11 @@ async fn mock_insert_functions(
         .expect("inserted functions lock");
     inserted.extend(body.functions.clone());
     HttpResponse::Ok().json(serde_json::json!({ "ignored_count": 0 }))
+}
+
+async fn mock_list_btql(state: web::Data<Arc<MockServerState>>, req: HttpRequest) -> HttpResponse {
+    log_request(&state, &req);
+    HttpResponse::Ok().json(serde_json::json!({"data": []}))
 }
 
 async fn mock_list_functions(
@@ -2803,4 +2809,67 @@ async fn functions_pull_selector_with_unsupported_only_rows_still_succeeds() {
         stderr.contains("skipping 'legacy-code' because it is not a prompt"),
         "expected warning about non-prompt function on stderr, got:\n{stderr}"
     );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn function_lists_use_read_only_auth_with_a_cached_project() {
+    let state = Arc::new(MockServerState::default());
+    state.projects.lock().unwrap().push(MockProject {
+        id: "test-project-id".into(),
+        name: "test-project".into(),
+        org_id: "test-org-id".into(),
+    });
+    let server = MockServer::start(state.clone()).await;
+    let root = tempdir().unwrap();
+    let config = root.path().join("bt");
+    fs::create_dir_all(&config).unwrap();
+    fs::create_dir(root.path().join(".git")).unwrap();
+    fs::write(
+        config.join("config.json"),
+        r#"{"project_id":"test-project-id","org":"test-org"}"#,
+    )
+    .unwrap();
+    for command in [
+        vec!["functions", "list"],
+        vec!["functions"],
+        vec!["tools", "list"],
+        vec!["scorers", "list"],
+    ] {
+        let mut cmd = Command::new(common::bt_binary_path(&repo_root()));
+        for (key, _) in std::env::vars_os() {
+            if key.to_string_lossy().starts_with("BRAINTRUST_") {
+                cmd.env_remove(key);
+            }
+        }
+        let output = cmd
+            .current_dir(root.path())
+            .env("HOME", root.path())
+            .env("XDG_CONFIG_HOME", root.path())
+            .env("BRAINTRUST_API_KEY", "test-key")
+            .env("BRAINTRUST_API_URL", &server.base_url)
+            .env("BRAINTRUST_APP_URL", &server.base_url)
+            .env("BRAINTRUST_ORG_NAME", "test-org")
+            .args(command)
+            .args(["--project", "test-project", "--json"])
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "stdout: {}; stderr: {}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+    let requests = state.requests.lock().unwrap().clone();
+    assert!(
+        !requests
+            .iter()
+            .any(|request| request.contains("/apikey/login")),
+        "{requests:?}"
+    );
+    assert!(
+        requests.iter().any(|request| request.contains("/btql")),
+        "{requests:?}"
+    );
+    server.stop().await;
 }

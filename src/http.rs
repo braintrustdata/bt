@@ -50,6 +50,27 @@ impl std::fmt::Display for HttpError {
 
 impl std::error::Error for HttpError {}
 
+// Keep the status and any received bytes when a server closes an error response early.
+async fn response_error(mut response: reqwest::Response) -> HttpError {
+    let status = response.status();
+    let mut body = Vec::new();
+    loop {
+        match response.chunk().await {
+            Ok(Some(chunk)) => body.extend_from_slice(&chunk),
+            Ok(None) => break,
+            Err(err) => {
+                let detail = format!("\nfailed to read error response body: {err}");
+                body.extend_from_slice(detail.as_bytes());
+                break;
+            }
+        }
+    }
+    HttpError {
+        status,
+        body: String::from_utf8_lossy(&body).into_owned(),
+    }
+}
+
 #[derive(Debug)]
 pub struct ResponseParseError {
     message: String,
@@ -205,9 +226,7 @@ impl ApiClient {
         let response = request.send().await.context("request failed")?;
 
         if !response.status().is_success() {
-            let status = response.status();
-            let body = response.text().await.unwrap_or_default();
-            return Err(HttpError { status, body }.into());
+            return Err(response_error(response).await.into());
         }
 
         parse_json_response(response, "GET", path).await
@@ -228,9 +247,7 @@ impl ApiClient {
             .await
             .context("request failed")?;
         if !response.status().is_success() {
-            let status = response.status();
-            let body = response.text().await.unwrap_or_default();
-            return Err(HttpError { status, body }.into());
+            return Err(response_error(response).await.into());
         }
         parse_json_response(response, method.as_str(), path).await
     }
@@ -289,9 +306,7 @@ impl ApiClient {
         let response = request.send().await.context("request failed")?;
 
         if !response.status().is_success() {
-            let status = response.status();
-            let body = response.text().await.unwrap_or_default();
-            return Err(HttpError { status, body }.into());
+            return Err(response_error(response).await.into());
         }
 
         parse_json_response(response, "POST", path).await
@@ -325,9 +340,7 @@ impl ApiClient {
             .await
             .context("request failed")?;
         if !response.status().is_success() {
-            let status = response.status();
-            let body = response.text().await.unwrap_or_default();
-            return Err(HttpError { status, body }.into());
+            return Err(response_error(response).await.into());
         }
         Ok(response)
     }
@@ -412,15 +425,42 @@ pub async fn put_signed_url_with_headers(
         .await
         .context("signed-url upload request failed")?;
     if !response.status().is_success() {
-        let status = response.status();
-        let body = response.text().await.unwrap_or_default();
-        return Err(HttpError { status, body }.into());
+        return Err(response_error(response).await.into());
     }
     Ok(())
 }
 
 #[cfg(test)]
 mod tests {
+    #[tokio::test]
+    async fn truncated_error_response_preserves_status_body_and_read_failure() {
+        use std::io::{Read, Write};
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let server = std::thread::spawn(move || {
+            let (mut socket, _) = listener.accept().unwrap();
+            let mut request = [0; 4096];
+            assert!(socket.read(&mut request).unwrap() > 0);
+            socket.write_all(b"HTTP/1.1 502 Bad Gateway\r\nContent-Length: 1000\r\nConnection: close\r\n\r\nupstream unavailable").unwrap();
+            socket.flush().unwrap();
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        });
+        let response = build_http_client(DEFAULT_HTTP_TIMEOUT)
+            .unwrap()
+            .get(url)
+            .send()
+            .await
+            .unwrap();
+        let error = response_error(response).await;
+        assert_eq!(error.status, StatusCode::BAD_GATEWAY);
+        assert!(error.body.contains("upstream unavailable"), "{error}");
+        assert!(
+            error.body.contains("failed to read error response body"),
+            "{error}"
+        );
+        server.join().unwrap();
+    }
+
     use super::*;
     use std::net::TcpListener;
     use std::sync::{Arc, Mutex};

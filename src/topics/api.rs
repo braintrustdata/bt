@@ -2360,6 +2360,9 @@ fn parse_duration_to_seconds(value: &str) -> Option<i64> {
         None => (value, 's'),
     };
     let amount = number.trim().parse::<i64>().ok()?;
+    if amount < 0 {
+        return None;
+    }
     let multiplier = match unit.to_ascii_lowercase() {
         's' => 1,
         'm' => 60,
@@ -2368,7 +2371,7 @@ fn parse_duration_to_seconds(value: &str) -> Option<i64> {
         'w' => 7 * 24 * 60 * 60,
         _ => return None,
     };
-    Some(amount * multiplier)
+    amount.checked_mul(multiplier)
 }
 
 fn format_duration_seconds(seconds: i64) -> String {
@@ -2389,6 +2392,13 @@ fn format_duration_seconds(seconds: i64) -> String {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn duration_values_reject_negative_and_overflow() {
+        for value in ["-5m", "-1", "9223372036854775807w"] {
+            assert_eq!(parse_duration_to_seconds(value), None, "{value}");
+        }
+    }
+
     use serde_json::json;
 
     use super::*;

@@ -1794,17 +1794,19 @@ async fn run_login_refresh(base: &BaseArgs) -> Result<()> {
         )
     })?;
 
-    eprintln!(
+    if base.verbose_explicit() {
+        eprintln!(
         "Refreshing OAuth token for profile '{profile_name}' (source: {source}, api_url: {api_url})"
     );
-    if let Some(expires_at) = previous_expires_at {
-        let now = current_unix_timestamp();
-        let remaining = expires_at.saturating_sub(now);
-        eprintln!(
+        if let Some(expires_at) = previous_expires_at {
+            let now = current_unix_timestamp();
+            let remaining = expires_at.saturating_sub(now);
+            eprintln!(
             "Cached access token expiry before refresh: {expires_at} (about {remaining}s remaining)"
         );
-    } else {
-        eprintln!("Cached access token expiry before refresh: unknown");
+        } else {
+            eprintln!("Cached access token expiry before refresh: unknown");
+        }
     }
 
     let refreshed =
@@ -1825,17 +1827,19 @@ async fn run_login_refresh(base: &BaseArgs) -> Result<()> {
     }
     save_auth_store(&store)?;
 
-    if let Some(expires_at) = new_expires_at {
-        let now = current_unix_timestamp();
-        let remaining = expires_at.saturating_sub(now);
-        eprintln!("New access token expiry: {expires_at} (about {remaining}s remaining)");
-    } else {
-        eprintln!("New access token expiry: unknown");
-    }
-    if refresh_rotated {
-        eprintln!("Refresh token rotation: yes");
-    } else {
-        eprintln!("Refresh token rotation: no");
+    if base.verbose_explicit() {
+        if let Some(expires_at) = new_expires_at {
+            let now = current_unix_timestamp();
+            let remaining = expires_at.saturating_sub(now);
+            eprintln!("New access token expiry: {expires_at} (about {remaining}s remaining)");
+        } else {
+            eprintln!("New access token expiry: unknown");
+        }
+        if refresh_rotated {
+            eprintln!("Refresh token rotation: yes");
+        } else {
+            eprintln!("Refresh token rotation: no");
+        }
     }
 
     emit_result(
