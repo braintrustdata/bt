@@ -12,7 +12,7 @@
 //! let response: WithHeaders<Project> = client.post("/v1/project", &body).await?;
 //! let Text(body) = client.get("/text-endpoint").await?;
 //! let NoContent = client.post("/action", &body).await?;
-//! let NoContent = client.delete("/v1/project/test-id").await?;
+//! client.delete("/v1/project/test-id").await?;
 //! // Pages preserve cursors/schema; use TryStreamExt to fold or flatten them.
 //! let pages = Pagination::default().pages(None, 100, |limit, cursor| async move {
 //!     client.btql(&build_query(limit, cursor)).await
@@ -306,7 +306,15 @@ impl ApiClient {
         self.execute(method, path, request).await
     }
 
-    pub async fn delete<T: FromResponse>(&self, path: &str) -> Result<T> {
+    /// Delete an object, ignoring a successful response body.
+    pub async fn delete(&self, path: &str) -> Result<()> {
+        self.delete_with_response::<NoContent>(path)
+            .await
+            .map(|_| ())
+    }
+
+    /// Delete an object and decode the response body.
+    pub async fn delete_with_response<T: FromResponse>(&self, path: &str) -> Result<T> {
         self.send_empty(Method::DELETE, path).await
     }
 }

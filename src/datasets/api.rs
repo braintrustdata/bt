@@ -4,7 +4,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Map, Value};
 use urlencoding::encode;
 
-use crate::http::{ApiClient, BtqlResponse, NoContent, Pagination, Text, WithHeaders};
+use crate::http::{ApiClient, BtqlResponse, Pagination, Text, WithHeaders};
 
 use super::records::DATASET_RECORD_FIELDS;
 
@@ -209,8 +209,7 @@ pub async fn create_dataset_with_metadata(
 
 pub async fn delete_dataset(client: &ApiClient, dataset_id: &str) -> Result<()> {
     let path = format!("/v1/dataset/{}", encode(dataset_id));
-    let _: NoContent = client.delete(&path).await?;
-    Ok(())
+    client.delete(&path).await
 }
 
 pub async fn list_dataset_snapshots(
@@ -249,8 +248,7 @@ pub async fn create_dataset_snapshot(
 
 pub async fn delete_dataset_snapshot(client: &ApiClient, snapshot_id: &str) -> Result<()> {
     let path = format!("/v1/dataset_snapshot/{}", encode(snapshot_id));
-    let _: NoContent = client.delete(&path).await?;
-    Ok(())
+    client.delete(&path).await
 }
 
 pub async fn preview_dataset_restore(

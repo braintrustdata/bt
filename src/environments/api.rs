@@ -74,5 +74,7 @@ pub async fn update(
 }
 
 pub async fn delete(client: &ApiClient, id: &str) -> Result<Environment> {
-    client.delete(&format!("/environment/{}", encode(id))).await
+    client
+        .delete_with_response(&format!("/environment/{}", encode(id)))
+        .await
 }

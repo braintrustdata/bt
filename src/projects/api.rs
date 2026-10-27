@@ -2,7 +2,7 @@ use anyhow::Result;
 use serde::{Deserialize, Serialize};
 use urlencoding::encode;
 
-use crate::http::{ApiClient, HttpOptions, NoContent};
+use crate::http::{ApiClient, HttpOptions};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Project {
@@ -43,8 +43,7 @@ pub async fn create_project(
 
 pub async fn delete_project(client: &ApiClient, project_id: &str) -> Result<()> {
     let path = format!("/v1/project/{}", encode(project_id));
-    let _: NoContent = client.delete(&path).await?;
-    Ok(())
+    client.delete(&path).await
 }
 
 pub async fn get_project_by_name(client: &ApiClient, name: &str) -> Result<Option<Project>> {

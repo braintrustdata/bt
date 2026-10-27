@@ -679,8 +679,11 @@ mod tests {
         let _: Value = client.post("/test/post", &body).await.unwrap();
         let _: Value = client.put("/test/put", &body).await.unwrap();
         let _: Value = client.patch("/test/patch", &body).await.unwrap();
-        let _: NoContent = client.delete("/test/delete").await.unwrap();
-        let deleted: Value = client.delete("/test/delete-json").await.unwrap();
+        client.delete("/test/delete").await.unwrap();
+        let deleted: Value = client
+            .delete_with_response("/test/delete-json")
+            .await
+            .unwrap();
         assert_eq!(deleted["deleted"], true);
         let _: BtqlResponse<Value> = client
             .btql("SELECT * FROM dataset('test-dataset') LIMIT 1")
