@@ -1202,6 +1202,12 @@ packages:
     peerDependencies:
       zod: ^3.25.28 || ^4
 
+  zod@4.6.5:
+    resolution:
+      {
+        integrity: sha512-v5l/aFXZQeai4awLbOpSoHecE9UiMrnfx75tEXLjNonXVARxQ5mOeipTjROUchszUNCqnE+hqAMujRsRHsut2Q==,
+      }
+
   zod@4.6.7:
     resolution:
       {
@@ -1858,5 +1864,7 @@ snapshots:
   zod-to-json-schema@3.25.2(zod@4.6.7):
     dependencies:
       zod: 4.6.7
+
+  zod@4.6.5: {}
 
   zod@4.6.7: {}
