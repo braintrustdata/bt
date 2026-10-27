@@ -1,3 +1,4 @@
+mod common;
 use std::collections::BTreeMap;
 use std::fs::{self, File};
 use std::net::TcpListener;
@@ -43,30 +44,6 @@ fn default_expect_success() -> bool {
 
 fn repo_root() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-}
-
-fn bt_binary_path() -> PathBuf {
-    if let Ok(path) = std::env::var("CARGO_BIN_EXE_bt") {
-        return PathBuf::from(path);
-    }
-
-    let root = repo_root();
-    let candidate = root.join("target").join("debug").join("bt");
-    if !candidate.is_file() {
-        build_bt_binary(&root);
-    }
-    candidate
-}
-
-fn build_bt_binary(root: &Path) {
-    let status = Command::new("cargo")
-        .args(["build", "--bin", "bt"])
-        .current_dir(root)
-        .status()
-        .expect("cargo build --bin bt");
-    if !status.success() {
-        panic!("cargo build --bin bt failed");
-    }
 }
 
 fn read_fixture_config(path: &Path) -> FixtureConfig {
@@ -713,12 +690,9 @@ fn prepare_mock_btql_dataset_for_step(state: &Arc<MockServerState>, dataset_name
 async fn datasets_fixtures() {
     let root = repo_root();
     let fixtures_root = root.join("tests").join("datasets-fixtures");
-    if !fixtures_root.exists() {
-        eprintln!("No dataset fixtures found.");
-        return;
-    }
+    assert!(fixtures_root.is_dir(), "dataset fixtures are missing");
 
-    let bt_path = bt_binary_path();
+    let bt_path = common::bt_binary_path(&repo_root());
     let mut fixture_dirs: Vec<PathBuf> = fs::read_dir(&fixtures_root)
         .expect("read datasets fixture root")
         .filter_map(|entry| entry.ok())
@@ -842,7 +816,5 @@ async fn datasets_fixtures() {
         server.stop().await;
     }
 
-    if !ran_any {
-        eprintln!("No datasets fixtures with fixture.json found.");
-    }
+    assert!(ran_any, "no datasets fixtures executed");
 }

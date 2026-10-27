@@ -31,6 +31,9 @@ importers:
       typescript:
         specifier: 5.4.4
         version: 5.4.4
+      zod:
+        specifier: 4.6.5
+        version: 4.6.5
 
 packages:
   "@braintrust/bt-darwin-arm64@0.12.0":

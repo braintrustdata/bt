@@ -1,3 +1,4 @@
+mod common;
 use assert_cmd::Command;
 use predicates::prelude::*;
 use std::fs;
@@ -63,11 +64,87 @@ fn write_executable(path: &Path) {
     }
 }
 
+// Model the app-server handshake used by the pinned daemon dependency.
+#[cfg(unix)]
+fn codex_probe_script(path: &Path, managed: bool) -> String {
+    use serde_json::json;
+    let events = [
+        "SessionStart",
+        "UserPromptSubmit",
+        "PreToolUse",
+        "PermissionRequest",
+        "PostToolUse",
+        "PreCompact",
+        "PostCompact",
+        "SubagentStart",
+        "SubagentStop",
+        "Stop",
+        "Interrupt",
+        "SessionEnd",
+    ];
+    let quote = |value: &str| format!("'{}'", value.replace('\'', "'\"'\"'"));
+    let hook_path = path.with_extension("hooks.json");
+    let definitions: serde_json::Map<String, serde_json::Value> = events.iter().map(|event| {
+        (event.to_string(), json!([{"hooks":[{"type":"command","command":"bt trace hook --source codex","commandWindows":"bt trace hook --source codex","statusMessage":"Braintrust tracing"}]}]))
+    }).collect();
+    fs::write(
+        &hook_path,
+        serde_json::to_vec(&json!({"hooks": definitions})).unwrap(),
+    )
+    .unwrap();
+    let command = if managed {
+        [
+            env!("CARGO_BIN_EXE_bt"),
+            "trace",
+            "hook",
+            "--source",
+            "codex",
+            "--managed-run-hook",
+        ]
+        .map(quote)
+        .join(" ")
+    } else {
+        "bt trace hook --source codex".to_string()
+    };
+    let hooks: Vec<_> = events.iter().enumerate().map(|(index, event)| {
+        let event = format!("{}{}", event[..1].to_ascii_lowercase(), &event[1..]);
+        json!({"eventName":event,"source":if managed {"sessionFlags"} else {"plugin"},"pluginId":"trace-codex@braintrust-codex-plugins","sourcePath":hook_path,"handlerType":"command","command":command,"enabled":true,"isManaged":false,"trustStatus":"trusted","key":format!("test-hook-{index}"),"currentHash":format!("test-hash-{index}")})
+    }).collect();
+    let mut cases = String::new();
+    for (method, id, result) in [
+        ("initialize", 1, json!({})),
+        (
+            "config/read",
+            2,
+            json!({"config":{"features":{"hooks":true}}}),
+        ),
+        (
+            "plugin/list",
+            3,
+            json!({"marketplaces":[{"plugins":[{"id":"trace-codex@braintrust-codex-plugins","installed":true,"enabled":true}]}]}),
+        ),
+    ] {
+        let response = quote(&json!({"id":id,"result":result}).to_string());
+        cases.push_str(&format!(
+            "*'\"method\":\"{method}\"'*) printf '%s\\n' {response} ;;\n"
+        ));
+    }
+    for id in if managed { vec![2] } else { vec![4, 6] } {
+        let response =
+            quote(&json!({"id":id,"result":{"data":[{"errors":[],"hooks":hooks}]}}).to_string());
+        cases.push_str(&format!(
+            "*'\"id\":{id},'*'\"method\":\"hooks/list\"'*) printf '%s\\n' {response} ;;\n"
+        ));
+    }
+    format!("for argument in \"$@\"; do\nif [ \"$argument\" = app-server ]; then\nwhile IFS= read -r request; do\ncase \"$request\" in\n{cases}esac\ndone\nexit 0\nfi\ndone\n")
+}
+
 #[cfg(unix)]
 fn write_agent_cli(path: &Path, marketplace_json: &str, plugin_json: &str) {
+    let probe = codex_probe_script(path, false);
     let script = format!(
         r#"#!/bin/sh
-printf '%s\n' "$*" >> "$AGENT_SETUP_LOG"
+{probe}printf '%s\n' "$*" >> "$AGENT_SETUP_LOG"
 case "$*" in
   "plugin marketplace list --json")
     printf '%s\n' '{marketplace_json}'
@@ -87,9 +164,10 @@ esac
 
 #[cfg(unix)]
 fn write_run_agent(path: &Path) {
+    let probe = codex_probe_script(path, true);
     fs::write(
         path,
-        "#!/bin/sh\nprintf '%s\\n' \"$*\" > \"$AGENT_RUN_LOG\"\nprintf '%s\\n' \"$BT_TRACE_INVOCATION_SETTINGS\" > \"$AGENT_RUN_SETTINGS\"\nif [ -n \"$AGENT_RUN_DAEMON_ENV\" ]; then printf '%s\\n%s\\n' \"$BT_DAEMON_SOCKET\" \"$BT_DAEMON_DATA_DIR\" > \"$AGENT_RUN_DAEMON_ENV\"; fi\nif [ -n \"$AGENT_RUN_CONFIG\" ]; then printf '%s\\n' \"$OPENCODE_CONFIG_CONTENT\" > \"$AGENT_RUN_CONFIG\"; fi\n",
+        format!("#!/bin/sh\n{probe}{}", "printf '%s\\n' \"$*\" > \"$AGENT_RUN_LOG\"\nprintf '%s\\n' \"$BT_TRACE_INVOCATION_SETTINGS\" > \"$AGENT_RUN_SETTINGS\"\nif [ -n \"$AGENT_RUN_DAEMON_ENV\" ]; then printf '%s\\n%s\\n' \"$BT_DAEMON_SOCKET\" \"$BT_DAEMON_DATA_DIR\" > \"$AGENT_RUN_DAEMON_ENV\"; fi\nif [ -n \"$AGENT_RUN_CONFIG\" ]; then printf '%s\\n' \"$OPENCODE_CONFIG_CONTENT\" > \"$AGENT_RUN_CONFIG\"; fi\n"),
     )
     .expect("write fake run agent");
     use std::os::unix::fs::PermissionsExt;
@@ -3051,6 +3129,9 @@ fn eval_go_runner_failure_shows_runner_stderr() {
 /// Resolved up front so tests can pin it via `BRAINTRUST_EVAL_GO_BIN` and stay
 /// independent of version-manager shims that read the overridden config dirs.
 fn real_go_binary() -> Option<std::path::PathBuf> {
+    if !common::command_exists("go") {
+        return None;
+    }
     let output = std::process::Command::new("go")
         .args(["env", "GOROOT"])
         .output()
@@ -3230,6 +3311,11 @@ func main() {
         .current_dir(module.path())
         .output()
         .expect("run go mod tidy");
+    assert!(
+        tidy.status.success() || !common::in_ci(),
+        "could not fetch Go SDK: {}",
+        String::from_utf8_lossy(&tidy.stderr)
+    );
     if !tidy.status.success() {
         eprintln!(
             "skipping: could not fetch the Go SDK: {}",
