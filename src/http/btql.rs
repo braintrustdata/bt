@@ -670,6 +670,7 @@ mod tests {
             (200, "{}"),
             (200, "{}"),
             (204, ""),
+            (200, "{\"deleted\":true}"),
             (200, "{\"data\":[]}"),
         ])
         .await;
@@ -678,7 +679,9 @@ mod tests {
         let _: Value = client.post("/test/post", &body).await.unwrap();
         let _: Value = client.put("/test/put", &body).await.unwrap();
         let _: Value = client.patch("/test/patch", &body).await.unwrap();
-        client.delete("/test/delete").await.unwrap();
+        let _: NoContent = client.delete("/test/delete").await.unwrap();
+        let deleted: Value = client.delete("/test/delete-json").await.unwrap();
+        assert_eq!(deleted["deleted"], true);
         let _: BtqlResponse<Value> = client
             .btql("SELECT * FROM dataset('test-dataset') LIMIT 1")
             .await
@@ -689,13 +692,13 @@ mod tests {
                 .iter()
                 .map(|request| request.0.as_str())
                 .collect::<Vec<_>>(),
-            vec!["GET", "POST", "PUT", "PATCH", "DELETE", "POST"]
+            vec!["GET", "POST", "PUT", "PATCH", "DELETE", "DELETE", "POST"]
         );
         for request in &requests[1..4] {
             assert_eq!(request.1, body);
         }
         assert_eq!(
-            requests[5].1,
+            requests[6].1,
             json!({"query": "SELECT * FROM dataset('test-dataset') LIMIT 1", "fmt": "json"})
         );
         handle.stop(false).await;

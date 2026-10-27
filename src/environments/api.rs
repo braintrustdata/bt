@@ -74,10 +74,5 @@ pub async fn update(
 }
 
 pub async fn delete(client: &ApiClient, id: &str) -> Result<Environment> {
-    client
-        .request(
-            reqwest::Method::DELETE,
-            &format!("/environment/{}", encode(id)),
-        )
-        .await
+    client.delete(&format!("/environment/{}", encode(id))).await
 }

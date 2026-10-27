@@ -4,7 +4,7 @@ use anyhow::Result;
 use serde::{Deserialize, Serialize};
 use urlencoding::encode;
 
-use crate::http::ApiClient;
+use crate::http::{ApiClient, NoContent};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Experiment {
@@ -78,7 +78,8 @@ pub async fn get_experiment_by_name(
 
 pub async fn delete_experiment(client: &ApiClient, experiment_id: &str) -> Result<()> {
     let path = format!("/v1/experiment/{}", encode(experiment_id));
-    client.delete(&path).await
+    let _: NoContent = client.delete(&path).await?;
+    Ok(())
 }
 
 pub async fn create_experiment(

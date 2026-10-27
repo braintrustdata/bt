@@ -12,6 +12,7 @@
 //! let response: WithHeaders<Project> = client.post("/v1/project", &body).await?;
 //! let Text(body) = client.get("/text-endpoint").await?;
 //! let NoContent = client.post("/action", &body).await?;
+//! let NoContent = client.delete("/v1/project/test-id").await?;
 //! // Pages preserve cursors/schema; use TryStreamExt to fold or flatten them.
 //! let pages = Pagination::default().pages(None, 100, |limit, cursor| async move {
 //!     client.btql(&build_query(limit, cursor)).await
@@ -267,14 +268,12 @@ impl ApiClient {
         inner.query(&self.options.query)
     }
 
-    /// Execute an HTTP method without a body; responses are JSON by default.
-    /// Use `Text` or `WithHeaders<T>` as the result type for other response needs.
-    pub async fn request<T: FromResponse>(&self, method: Method, path: &str) -> Result<T> {
+    async fn send_empty<T: FromResponse>(&self, method: Method, path: &str) -> Result<T> {
         let request = self.prepare(method.clone(), path);
         self.execute(method, path, request).await
     }
     pub async fn get<T: FromResponse>(&self, path: &str) -> Result<T> {
-        self.request(Method::GET, path).await
+        self.send_empty(Method::GET, path).await
     }
     pub async fn post<T: FromResponse>(
         &self,
@@ -307,10 +306,8 @@ impl ApiClient {
         self.execute(method, path, request).await
     }
 
-    pub async fn delete(&self, path: &str) -> Result<()> {
-        self.request::<NoContent>(Method::DELETE, path)
-            .await
-            .map(|_| ())
+    pub async fn delete<T: FromResponse>(&self, path: &str) -> Result<T> {
+        self.send_empty(Method::DELETE, path).await
     }
 }
 

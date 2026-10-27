@@ -1,4 +1,4 @@
-use crate::http::HttpOptions;
+use crate::http::{HttpOptions, NoContent};
 use std::collections::HashSet;
 
 use anyhow::{Context, Result};
@@ -289,7 +289,8 @@ fn is_provider_auth_response(error: &HttpError) -> bool {
 
 pub async fn delete_function(client: &ApiClient, function_id: &str) -> Result<()> {
     let path = format!("/v1/function/{}", encode(function_id));
-    client.delete(&path).await
+    let _: NoContent = client.delete(&path).await?;
+    Ok(())
 }
 
 pub async fn list_functions_page(

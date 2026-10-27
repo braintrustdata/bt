@@ -3,7 +3,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use urlencoding::encode;
 
-use crate::http::{ApiClient, BtqlOptions, BtqlResponse};
+use crate::http::{ApiClient, BtqlOptions, BtqlResponse, NoContent};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Prompt {
@@ -176,12 +176,13 @@ pub async fn unassign_prompt(
         encode(environment),
         encode(client.org_name())
     );
-    client.request(reqwest::Method::DELETE, &path).await
+    client.delete(&path).await
 }
 
 pub async fn delete_prompt(client: &ApiClient, prompt_id: &str) -> Result<()> {
     let path = format!("/v1/prompt/{}", encode(prompt_id));
-    client.delete(&path).await
+    let _: NoContent = client.delete(&path).await?;
+    Ok(())
 }
 
 #[cfg(test)]

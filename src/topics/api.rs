@@ -1,4 +1,4 @@
-use crate::http::BtqlOptions;
+use crate::http::{BtqlOptions, NoContent};
 use std::collections::{BTreeMap, HashMap};
 
 use anyhow::{bail, Result};
@@ -1722,7 +1722,8 @@ async fn load_function_row(
 
 async fn delete_topic_automation(client: &ApiClient, automation_id: &str) -> Result<()> {
     let path = format!("/v1/project_automation/{}", encode(automation_id));
-    client.delete(&path).await
+    let _: NoContent = client.delete(&path).await?;
+    Ok(())
 }
 
 async fn build_topic_status_bars(
