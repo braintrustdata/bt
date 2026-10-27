@@ -235,8 +235,8 @@ async fn run(argv: &[std::ffi::OsString]) -> Result<()> {
             Arg::new("mcp_json_args")
                 .long("args")
                 .global(true)
-                .value_name("JSON|@FILE|-")
-                .help("Pass tool arguments as JSON, read JSON from @FILE, or read it from stdin with -"),
+                .value_name("JSON")
+                .help("Pass tool arguments as a JSON object"),
         );
     let mut input_maps = BTreeMap::new();
     for (index, tool) in tools.iter().enumerate() {
@@ -286,7 +286,11 @@ async fn run(argv: &[std::ffi::OsString]) -> Result<()> {
         .find(|tool| tool.name == tool_name)
         .context("tool schema unavailable")?;
     let arguments = if let Some(raw) = run_matches.get_one::<String>("mcp_json_args") {
-        let value = read_json_arguments(raw)?;
+        let value = parse_json_arguments(raw)?;
+        validate_json_arguments(&value, tool)?;
+        value
+    } else if let Some(source) = tool_matches.get_one::<String>("mcp_input_source") {
+        let value = read_input_arguments(source)?;
         validate_json_arguments(&value, tool)?;
         value
     } else {
@@ -336,6 +340,13 @@ fn tool_command(tool: &Tool, tool_index: usize) -> Result<(Command, ToolArgument
             .about(short_description(description))
             .long_about(description.clone());
     }
+    command = command.arg(
+        Arg::new("mcp_input_source")
+            .index(1)
+            .value_name("FILE|-")
+            .help("Read tool arguments from a JSON file, or from stdin with -")
+            .conflicts_with("mcp_json_args"),
+    );
     let properties = tool
         .input_schema
         .get("properties")
@@ -382,10 +393,8 @@ fn tool_command(tool: &Tool, tool_index: usize) -> Result<(Command, ToolArgument
         let mut arg = Arg::new(id.clone())
             .long(flag)
             .conflicts_with("mcp_json_args")
+            .conflicts_with("mcp_input_source")
             .help(description.to_string());
-        if required.iter().any(|required| required == name) {
-            arg = arg.required_unless_present("mcp_json_args");
-        }
         if is_boolean {
             arg = arg
                 .action(ArgAction::Set)
@@ -427,24 +436,31 @@ fn print_tool_list(tools: &[Tool], json_output: bool) -> Result<()> {
     Ok(())
 }
 
-fn read_json_arguments(raw: &str) -> Result<Value> {
-    let input = if raw == "-" {
-        let mut input = String::new();
-        std::io::stdin()
-            .read_to_string(&mut input)
-            .context("failed to read MCP arguments from stdin")?;
-        input
-    } else if let Some(path) = raw.strip_prefix('@') {
-        std::fs::read_to_string(path)
-            .with_context(|| format!("failed to read MCP arguments from `{path}`"))?
-    } else {
-        raw.to_owned()
-    };
-    let value: Value = serde_json::from_str(&input).context("MCP arguments must be valid JSON")?;
+fn parse_json_arguments(raw: &str) -> Result<Value> {
+    let value: Value = serde_json::from_str(raw).context("MCP arguments must be valid JSON")?;
     if !value.is_object() {
         bail!("MCP arguments must be a JSON object");
     }
     Ok(value)
+}
+
+fn read_input_arguments(source: &str) -> Result<Value> {
+    let stdin = std::io::stdin();
+    read_input_arguments_from(source, &mut stdin.lock())
+}
+
+fn read_input_arguments_from(source: &str, stdin: &mut impl Read) -> Result<Value> {
+    let input = if source == "-" {
+        let mut input = String::new();
+        stdin
+            .read_to_string(&mut input)
+            .context("failed to read MCP argument file from stdin")?;
+        input
+    } else {
+        std::fs::read_to_string(source)
+            .with_context(|| format!("failed to read MCP arguments from `{source}`"))?
+    };
+    parse_json_arguments(&input)
 }
 
 fn validate_json_arguments(arguments: &Value, tool: &Tool) -> Result<()> {
@@ -1000,14 +1016,28 @@ mod tests {
             .clone()
             .try_get_matches_from(["run", "test_tool", "--tool-args", "x"])
             .is_ok());
+        let parsed_file = run
+            .clone()
+            .try_get_matches_from(["run", "test_tool", "arguments.json"])
+            .expect("positional JSON file parses");
+        assert_eq!(
+            parsed_file
+                .subcommand_matches("test_tool")
+                .and_then(|matches| matches.get_one::<String>("mcp_input_source"))
+                .map(String::as_str),
+            Some("arguments.json")
+        );
+        assert!(run
+            .clone()
+            .try_get_matches_from(["run", "test_tool", "-"])
+            .is_ok());
         assert!(run
             .try_get_matches_from([
                 "run",
                 "test_tool",
                 "--args",
                 r#"{"args":"x"}"#,
-                "--tool-args",
-                "y"
+                "arguments.json"
             ])
             .is_err());
     }
@@ -1024,9 +1054,20 @@ mod tests {
                 "additionalProperties": false
             }),
         };
-        let arguments = read_json_arguments(r#"{"count":2}"#).unwrap();
+        let arguments = parse_json_arguments(r#"{"count":2}"#).unwrap();
         validate_json_arguments(&arguments, &tool).unwrap();
-        assert!(read_json_arguments("[]").is_err());
+        let directory = tempfile::tempdir().unwrap();
+        let file_path = directory.path().join("arguments.json");
+        std::fs::write(&file_path, r#"{"count":2}"#).unwrap();
+        assert_eq!(
+            read_input_arguments(file_path.to_str().unwrap()).unwrap(),
+            arguments
+        );
+        assert_eq!(
+            read_input_arguments_from("-", &mut std::io::Cursor::new(r#"{"count":2}"#)).unwrap(),
+            arguments
+        );
+        assert!(parse_json_arguments("[]").is_err());
         assert!(validate_json_arguments(&json!({}), &tool).is_err());
         assert!(validate_json_arguments(&json!({ "count": "2" }), &tool).is_err());
         assert!(validate_json_arguments(&json!({ "count": 2, "other": true }), &tool).is_err());
