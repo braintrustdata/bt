@@ -1,3 +1,4 @@
+use crate::http::HttpOptions;
 use std::collections::HashSet;
 
 use anyhow::{Context, Result};
@@ -244,10 +245,11 @@ pub async fn invoke_function(
     body: &serde_json::Value,
 ) -> Result<serde_json::Value> {
     let result = client
-        .request(reqwest::Method::POST, "/function/invoke")
-        .json(body)
-        .timeout(std::time::Duration::from_secs(300))
-        .send()
+        .with_options(HttpOptions {
+            timeout: Some(std::time::Duration::from_secs(300)),
+            ..Default::default()
+        })
+        .post("/function/invoke", body)
         .await;
 
     match result {

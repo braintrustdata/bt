@@ -1,5 +1,5 @@
 //! BTQL execution and pagination through the shared HTTP transport.
-use super::{ApiClient, BtqlResponse, RetryReason};
+use super::{ApiClient, BtqlResponse};
 use anyhow::{bail, Result};
 use futures_util::{stream, Stream, TryStreamExt};
 use serde::{de::DeserializeOwned, Serialize};
@@ -32,11 +32,6 @@ pub struct BtqlOptions<'a> {
     pub audit_log: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub use_columnstore: Option<bool>,
-    #[serde(skip)]
-    pub on_retry: Option<Box<dyn Fn(RetryReason) + Send + Sync>>,
-    /// Print query and request diagnostics with this label when set.
-    #[serde(skip)]
-    pub trace: Option<&'a str>,
 }
 
 impl ApiClient {
@@ -49,26 +44,26 @@ impl ApiClient {
     pub async fn btql_with_options<T: DeserializeOwned>(
         &self,
         query: &(impl Serialize + ?Sized),
-        mut options: BtqlOptions<'_>,
+        options: BtqlOptions<'_>,
     ) -> Result<T> {
         let strict_lint_mode = options.lint_mode.map(|mode| mode == "strict");
-        let mut request = self.request(reqwest::Method::POST, "/btql").retry();
-        if let Some(observer) = options.on_retry.take() {
-            request = request.on_retry(observer);
-        }
-        if let Some(label) = options.trace {
+        if let Some(label) = &self.options.trace {
             eprintln!("btql[{label}] query:\n{}\n", serde_json::to_string(query)?);
-            request = request.trace(true, label);
         }
-        request
-            .json(&QueryBody {
+        self.with_options(super::HttpOptions {
+            retry: Some(self.options.retry.unwrap_or(true)),
+            ..Default::default()
+        })
+        .post(
+            "/btql",
+            &QueryBody {
                 query,
                 fmt: "json",
                 options,
                 strict_lint_mode,
-            })
-            .send()
-            .await
+            },
+        )
+        .await
     }
 }
 
@@ -194,7 +189,10 @@ pub struct Page<T> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::http::{retry_delay, HttpError, MAX_ATTEMPTS, MAX_DELAY};
+    use crate::http::{
+        retry_delay, HttpError, HttpOptions, NoContent, RetryReason, Text, WithHeaders,
+        MAX_ATTEMPTS, MAX_DELAY,
+    };
     use actix_web::{web, App, HttpRequest, HttpResponse, HttpServer};
     use reqwest::StatusCode;
     use serde_json::{json, Value};
@@ -230,6 +228,17 @@ mod tests {
                 serde_json::from_slice(&body).unwrap()
             },
         ));
+        if req.path() == "/test/scoped" || req.headers().contains_key("x-test-option") {
+            assert_eq!(req.headers().get("x-test-option").unwrap(), "test-value");
+            assert_eq!(req.query_string(), "test-name=test+value");
+        }
+        if req.path() == "/test/unconfigured" {
+            assert!(!req.headers().contains_key("x-test-option"));
+            assert!(req.query_string().is_empty());
+        }
+        if req.headers().contains_key("x-test-delay") {
+            tokio::time::sleep(Duration::from_millis(200)).await;
+        }
         let (status, body) = state
             .replies
             .lock()
@@ -270,6 +279,7 @@ mod tests {
             api_key: "test-key".into(),
             org_id: "test-org-id".into(),
             org_name: "test-org".into(),
+            options: HttpOptions::default(),
         };
         (client, state, handle)
     }
@@ -285,15 +295,18 @@ mod tests {
             let reasons = Arc::new(Mutex::new(Vec::new()));
             let query = json!({"from": {"op":"function","name":"dataset","args":["test-dataset"]}});
             let result: super::super::BtqlResponse<Value> = client
+                .with_options(HttpOptions {
+                    on_retry: Some(Arc::new({
+                        let reasons = Arc::clone(&reasons);
+                        move |reason| reasons.lock().unwrap().push(reason)
+                    })),
+                    ..Default::default()
+                })
                 .btql_with_options(
                     &query,
-                    crate::http::BtqlOptions {
+                    BtqlOptions {
                         source: Some("test-source"),
                         lint_mode: Some("strict"),
-                        on_retry: Some(Box::new({
-                            let reasons = Arc::clone(&reasons);
-                            move |reason| reasons.lock().unwrap().push(reason)
-                        })),
                         ..Default::default()
                     },
                 )
@@ -368,9 +381,11 @@ mod tests {
     async fn async_result_gets_retry_but_api_writes_do_not() {
         let (client, state, handle) = mock(vec![(503, "test retry"), (200, "{\"rows\":[]}")]).await;
         let result: Value = client
-            .request(reqwest::Method::GET, "/btql/async/test-id/result")
-            .retry()
-            .send()
+            .with_options(HttpOptions {
+                retry: Some(true),
+                ..Default::default()
+            })
+            .get("/btql/async/test-id/result")
             .await
             .unwrap();
         assert_eq!(result["rows"], json!([]));
@@ -416,19 +431,18 @@ mod tests {
             api_key: "test-key".into(),
             org_id: "test-org-id".into(),
             org_name: "test-org".into(),
+            options: HttpOptions::default(),
         };
         let reasons = Arc::new(Mutex::new(Vec::new()));
         let response: Value = client
-            .btql_with_options(
-                "SELECT * FROM dataset('test-dataset') LIMIT 1",
-                crate::http::BtqlOptions {
-                    on_retry: Some(Box::new({
-                        let reasons = Arc::clone(&reasons);
-                        move |reason| reasons.lock().unwrap().push(reason)
-                    })),
-                    ..Default::default()
-                },
-            )
+            .with_options(HttpOptions {
+                on_retry: Some(Arc::new({
+                    let reasons = Arc::clone(&reasons);
+                    move |reason| reasons.lock().unwrap().push(reason)
+                })),
+                ..Default::default()
+            })
+            .btql("SELECT * FROM dataset('test-dataset') LIMIT 1")
             .await
             .unwrap();
         assert_eq!(response["data"], json!([]));
@@ -470,7 +484,7 @@ mod tests {
         let _: Value = client
             .btql_with_options(
                 &body["query"],
-                crate::http::BtqlOptions {
+                BtqlOptions {
                     audit_log: Some(true),
                     use_columnstore: Some(false),
                     realtime: Some(true),
@@ -503,24 +517,22 @@ mod tests {
         let (client, state, handle) =
             mock(vec![(200, "{\"ok\":true}"), (200, "{\"ok\":true}")]).await;
         let result: Value = client
-            .request(reqwest::Method::GET, "/test/http")
-            .query(&[("name", "test project/&")])
-            .header("x-test-header", "test-value")
-            .timeout(Duration::from_secs(1))
-            .send()
+            .with_options(HttpOptions {
+                query: vec![("name".into(), "test project/&".into())],
+                headers: vec![("x-test-header".into(), "test-value".into())],
+                timeout: Some(Duration::from_secs(1)),
+                ..Default::default()
+            })
+            .get("/test/http")
             .await
             .unwrap();
         assert_eq!(result["ok"], true);
-        let response = client
-            .request(reqwest::Method::GET, "/test/response")
-            .response()
-            .await
-            .unwrap();
+        let response: WithHeaders<Value> = client.get("/test/response").await.unwrap();
         assert_eq!(
-            response.headers().get("x-test-response").unwrap(),
+            response.headers.get("x-test-response").unwrap(),
             "test-value"
         );
-        assert_eq!(response.json::<Value>().await.unwrap()["ok"], true);
+        assert_eq!(response.body["ok"], true);
         assert_eq!(state.requests.lock().unwrap().len(), 2);
         handle.stop(false).await;
     }
@@ -690,13 +702,93 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn invalid_request_builders_fail_before_network_or_retries() {
+    async fn scoped_options_can_be_reused_without_affecting_the_original_client() {
+        let (client, state, handle) = mock(vec![
+            (200, "{}"),
+            (200, "test text"),
+            (204, ""),
+            (200, "{\"data\":[]}"),
+            (200, "{}"),
+        ])
+        .await;
+        let configured = client.with_options(HttpOptions {
+            headers: vec![("x-test-option".into(), "test-value".into())],
+            query: vec![("test-name".into(), "test value".into())],
+            ..Default::default()
+        });
+        let _: Value = configured.get("/test/scoped").await.unwrap();
+        let text: WithHeaders<Text> = configured.post("/test/scoped", &json!({})).await.unwrap();
+        assert_eq!(text.body.0, "test text");
+        assert_eq!(text.headers.get("x-test-response").unwrap(), "test-value");
+        let _: NoContent = configured.post("/test/scoped", &json!({})).await.unwrap();
+        let _: BtqlResponse<Value> = configured
+            .btql("SELECT * FROM dataset('test-dataset') LIMIT 1")
+            .await
+            .unwrap();
+        let _: Value = client.get("/test/unconfigured").await.unwrap();
+        assert_eq!(state.requests.lock().unwrap().len(), 5);
+        handle.stop(false).await;
+    }
+
+    #[tokio::test]
+    async fn http_options_can_disable_btql_retries() {
+        let (client, state, handle) = mock(vec![(503, "test transient error")]).await;
+        let error = client
+            .with_options(HttpOptions {
+                retry: Some(false),
+                ..Default::default()
+            })
+            .btql::<Value>("SELECT * FROM dataset('test-dataset') LIMIT 1")
+            .await
+            .unwrap_err();
+        assert_eq!(
+            error.downcast_ref::<HttpError>().unwrap().status,
+            StatusCode::SERVICE_UNAVAILABLE
+        );
+        assert_eq!(state.requests.lock().unwrap().len(), 1);
+        handle.stop(false).await;
+    }
+
+    #[tokio::test]
+    async fn timeout_options_apply_to_both_http_and_btql() {
+        for btql in [false, true] {
+            let (client, _, handle) = mock(vec![(200, "{}")]).await;
+            let configured = client
+                .with_options(HttpOptions {
+                    timeout: Some(Duration::from_millis(50)),
+                    retry: Some(false),
+                    ..Default::default()
+                })
+                .with_options(HttpOptions {
+                    headers: vec![("x-test-delay".into(), "true".into())],
+                    ..Default::default()
+                });
+            let result: Result<Value> = if btql {
+                configured
+                    .btql("SELECT * FROM dataset('test-dataset') LIMIT 1")
+                    .await
+            } else {
+                configured.get("/test/timeout").await
+            };
+            assert!(result
+                .unwrap_err()
+                .downcast_ref::<reqwest::Error>()
+                .unwrap()
+                .is_timeout());
+            handle.stop(false).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn invalid_http_options_fail_before_network_or_retries() {
         let (client, state, handle) = mock(vec![]).await;
         let error = client
-            .request(reqwest::Method::GET, "/test/invalid")
-            .header("x-test", "invalid\nvalue")
-            .retry()
-            .send::<Value>()
+            .with_options(HttpOptions {
+                headers: vec![("x-test".into(), "invalid\nvalue".into())],
+                retry: Some(true),
+                ..Default::default()
+            })
+            .get::<Value>("/test/invalid")
             .await
             .unwrap_err();
         assert!(error.downcast_ref::<reqwest::Error>().unwrap().is_builder());

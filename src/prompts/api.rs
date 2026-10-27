@@ -176,7 +176,7 @@ pub async fn unassign_prompt(
         encode(environment),
         encode(client.org_name())
     );
-    client.request(reqwest::Method::DELETE, &path).send().await
+    client.request(reqwest::Method::DELETE, &path).await
 }
 
 pub async fn delete_prompt(client: &ApiClient, prompt_id: &str) -> Result<()> {

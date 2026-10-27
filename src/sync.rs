@@ -22,7 +22,7 @@ use urlencoding::encode;
 use crate::args::BaseArgs;
 use crate::auth::login;
 use crate::experiments::api::create_experiment;
-use crate::http::{ApiClient, BtqlOptions, BtqlResponse, Pagination, RetryReason};
+use crate::http::{ApiClient, BtqlOptions, BtqlResponse, HttpOptions, Pagination, RetryReason};
 use crate::projects::api::{create_project, list_projects, Project};
 use crate::ui::{animations_enabled, fuzzy_select, is_quiet};
 use crate::utils::{app_project_url, parse_duration_to_seconds, write_json_atomic};
@@ -967,12 +967,15 @@ async fn pull_spans_mode(
         |batch_limit, cursor| async move {
             let query = build_spans_query(source_expr, filter, batch_limit, cursor.as_deref());
             client
+                .with_options(HttpOptions {
+                    on_retry: Some(Arc::new(btql_retry_tracker.observer())),
+                    trace: verbose.then_some("spans").map(str::to_owned),
+                    ..Default::default()
+                })
                 .btql_with_options::<BtqlResponse>(
                     &query,
                     BtqlOptions {
                         source: Some("bt_sync"),
-                        on_retry: Some(Box::new(btql_retry_tracker.observer())),
-                        trace: verbose.then_some("spans"),
                         ..Default::default()
                     },
                 )
@@ -1209,12 +1212,15 @@ async fn pull_traces_mode(
                 discovery_cursor.as_deref(),
             );
             let response = client
+                .with_options(HttpOptions {
+                    on_retry: Some(Arc::new(btql_retry_tracker.observer())),
+                    trace: verbose.then_some("discover_roots").map(str::to_owned),
+                    ..Default::default()
+                })
                 .btql_with_options::<BtqlResponse>(
                     &query,
                     BtqlOptions {
                         source: Some("bt_sync"),
-                        on_retry: Some(Box::new(btql_retry_tracker.observer())),
-                        trace: verbose.then_some("discover_roots"),
                         ..Default::default()
                     },
                 )
@@ -1514,12 +1520,15 @@ async fn process_trace_chunk(
             cursor.as_deref(),
         );
         let BtqlResponse { data, cursor, .. } = client
+            .with_options(HttpOptions {
+                on_retry: Some(Arc::new(btql_retry_tracker.observer())),
+                trace: verbose.then_some("fetch_roots").map(str::to_owned),
+                ..Default::default()
+            })
             .btql_with_options::<BtqlResponse>(
                 &query,
                 BtqlOptions {
                     source: Some("bt_sync"),
-                    on_retry: Some(Box::new(btql_retry_tracker.observer())),
-                    trace: verbose.then_some("fetch_roots"),
                     ..Default::default()
                 },
             )
@@ -2331,12 +2340,15 @@ async fn discover_vector_specs_global(
     ]
     .join(" | ");
     let response = client
+        .with_options(HttpOptions {
+            on_retry: Some(Arc::new(btql_retry_tracker.observer())),
+            trace: verbose.then_some("vector_models").map(str::to_owned),
+            ..Default::default()
+        })
         .btql_with_options::<BtqlResponse>(
             &query,
             BtqlOptions {
                 source: Some("bt_sync"),
-                on_retry: Some(Box::new(btql_retry_tracker.observer())),
-                trace: verbose.then_some("vector_models"),
                 ..Default::default()
             },
         )
@@ -2447,12 +2459,15 @@ async fn fetch_vector_columns_for_rows(
         id_literals.len().max(1)
     );
     let response = client
+        .with_options(HttpOptions {
+            on_retry: Some(Arc::new(btql_retry_tracker.observer())),
+            trace: verbose.then_some("vector_rows").map(str::to_owned),
+            ..Default::default()
+        })
         .btql_with_options::<BtqlResponse>(
             &query,
             BtqlOptions {
                 source: Some("bt_sync"),
-                on_retry: Some(Box::new(btql_retry_tracker.observer())),
-                trace: verbose.then_some("vector_rows"),
                 ..Default::default()
             },
         )

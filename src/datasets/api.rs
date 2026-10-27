@@ -4,7 +4,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Map, Value};
 use urlencoding::encode;
 
-use crate::http::{ApiClient, BtqlResponse, Pagination};
+use crate::http::{ApiClient, BtqlResponse, Pagination, Text, WithHeaders};
 
 use super::records::DATASET_RECORD_FIELDS;
 
@@ -236,14 +236,10 @@ pub async fn create_dataset_snapshot(
     if let Some(description) = description {
         body["description"] = Value::String(description.to_string());
     }
-    let response = client
-        .request(reqwest::Method::POST, "/v1/dataset_snapshot")
-        .json(&body)
-        .response()
-        .await?;
+    let response: WithHeaders<DatasetSnapshot> = client.post("/v1/dataset_snapshot", &body).await?;
 
-    let found_existing = found_existing_snapshot_header(response.headers());
-    let dataset_snapshot = response.json().await?;
+    let found_existing = found_existing_snapshot_header(&response.headers);
+    let dataset_snapshot = response.body;
     Ok(CreateDatasetSnapshotResult {
         dataset_snapshot,
         found_existing,
@@ -272,16 +268,11 @@ pub async fn restore_dataset(
     xact_id: &str,
 ) -> Result<DatasetRestoreResult> {
     let path = format!("/v1/dataset/{}/restore", encode(dataset_id));
-    let response = client
-        .request(reqwest::Method::POST, &path)
-        .json(&serde_json::json!({ "version": xact_id }))
-        .response()
+    let response: Text = client
+        .post(&path, &serde_json::json!({ "version": xact_id }))
         .await?;
 
-    let body = response
-        .text()
-        .await
-        .context("failed to read dataset restore response")?;
+    let body = response.0;
     parse_dataset_restore_result_response(&body, xact_id)
 }
 

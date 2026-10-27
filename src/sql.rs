@@ -29,7 +29,7 @@ use urlencoding::encode;
 
 use crate::args::BaseArgs;
 use crate::auth::login;
-use crate::http::{ApiClient, BtqlOptions, HttpError};
+use crate::http::{ApiClient, BtqlOptions, HttpError, HttpOptions};
 use crate::project_context::resolve_required_project;
 use crate::ui::with_spinner;
 use crate::utils::parse_duration_to_seconds;
@@ -651,12 +651,11 @@ async fn wait_for_async_query(
     let started = Instant::now();
     loop {
         let status: AsyncQueryStatusResponse = client
-            .request(
-                reqwest::Method::GET,
-                &format!("/btql/async/{}", encode(automation_id)),
-            )
-            .retry()
-            .send()
+            .with_options(HttpOptions {
+                retry: Some(true),
+                ..Default::default()
+            })
+            .get(&format!("/btql/async/{}", encode(automation_id)))
             .await?;
         if status.status.is_terminal() {
             return Ok(status);
@@ -684,12 +683,15 @@ async fn collect_async_query_result(
         .pages(None, page_size, |limit, cursor| async move {
             loop {
                 let page: AsyncQueryResultPage = client
-                    .request(
-                        reqwest::Method::GET,
-                        &async_query_result_path(automation_id, limit as u64, cursor.as_deref()),
-                    )
-                    .retry()
-                    .send()
+                    .with_options(HttpOptions {
+                        retry: Some(true),
+                        ..Default::default()
+                    })
+                    .get(&async_query_result_path(
+                        automation_id,
+                        limit as u64,
+                        cursor.as_deref(),
+                    ))
                     .await?;
                 if page.status == AsyncQueryStatus::Queued {
                     tokio::time::sleep(args.poll_interval).await;
