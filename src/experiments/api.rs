@@ -44,7 +44,7 @@ pub async fn list_experiments(client: &ApiClient, project: &str) -> Result<Vec<E
         encode(client.org_name()),
         encode(project)
     );
-    let list: ListResponse = client.get(&path).send().await?;
+    let list: ListResponse = client.get(&path).await?;
     Ok(list.objects)
 }
 
@@ -57,7 +57,7 @@ pub async fn list_experiments_by_project_id(
         encode(client.org_name()),
         encode(project_id)
     );
-    let list: ListResponse = client.get(&path).send().await?;
+    let list: ListResponse = client.get(&path).await?;
     Ok(list.objects)
 }
 
@@ -72,13 +72,13 @@ pub async fn get_experiment_by_name(
         encode(project),
         encode(name)
     );
-    let list: ListResponse = client.get(&path).send().await?;
+    let list: ListResponse = client.get(&path).await?;
     Ok(list.objects.into_iter().next())
 }
 
 pub async fn delete_experiment(client: &ApiClient, experiment_id: &str) -> Result<()> {
     let path = format!("/v1/experiment/{}", encode(experiment_id));
-    client.delete(&path).discard().await
+    client.delete(&path).await
 }
 
 pub async fn create_experiment(
@@ -91,7 +91,7 @@ pub async fn create_experiment(
         "project_id": project_id,
         "org_name": client.org_name(),
     });
-    client.post("/v1/experiment").json(&body).send().await
+    client.post("/v1/experiment", &body).await
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -147,5 +147,5 @@ pub async fn summarize_experiment(
         path.push_str(&encode(comparison_experiment_id));
     }
 
-    client.get(&path).send().await
+    client.get(&path).await
 }

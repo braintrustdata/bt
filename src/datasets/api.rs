@@ -129,7 +129,7 @@ pub async fn list_datasets(client: &ApiClient, project_id: &str) -> Result<Vec<D
         encode(client.org_name()),
         encode(project_id)
     );
-    let list: ListResponse = client.get(&path).send().await?;
+    let list: ListResponse = client.get(&path).await?;
     Ok(list.objects)
 }
 
@@ -160,7 +160,6 @@ pub async fn list_dataset_rows_limited(
                         cursor.as_deref(),
                         preview_length,
                     ))
-                    .send()
                     .await
             },
         )
@@ -174,7 +173,7 @@ pub async fn get_dataset_row_by_id(
     row_id: &str,
 ) -> Result<Option<DatasetRow>> {
     let query = build_dataset_row_by_id_query(dataset_id, row_id, DatasetRowsPreviewLength::Full);
-    let response: BtqlResponse<DatasetRow> = client.btql(&query).send().await?;
+    let response: BtqlResponse<DatasetRow> = client.btql(&query).await?;
     Ok(response.data.into_iter().next())
 }
 
@@ -205,12 +204,12 @@ pub async fn create_dataset_with_metadata(
     if let Some(metadata) = metadata {
         body["metadata"] = metadata.clone();
     }
-    client.post("/v1/dataset").json(&body).send().await
+    client.post("/v1/dataset", &body).await
 }
 
 pub async fn delete_dataset(client: &ApiClient, dataset_id: &str) -> Result<()> {
     let path = format!("/v1/dataset/{}", encode(dataset_id));
-    client.delete(&path).discard().await
+    client.delete(&path).await
 }
 
 pub async fn list_dataset_snapshots(
@@ -218,7 +217,7 @@ pub async fn list_dataset_snapshots(
     dataset_id: &str,
 ) -> Result<Vec<DatasetSnapshot>> {
     let path = format!("/v1/dataset_snapshot?dataset_id={}", encode(dataset_id));
-    let list: ListResponseGeneric<DatasetSnapshot> = client.get(&path).send().await?;
+    let list: ListResponseGeneric<DatasetSnapshot> = client.get(&path).await?;
     Ok(list.objects)
 }
 
@@ -238,7 +237,7 @@ pub async fn create_dataset_snapshot(
         body["description"] = Value::String(description.to_string());
     }
     let response = client
-        .post("/v1/dataset_snapshot")
+        .request(reqwest::Method::POST, "/v1/dataset_snapshot")
         .json(&body)
         .response()
         .await?;
@@ -253,7 +252,7 @@ pub async fn create_dataset_snapshot(
 
 pub async fn delete_dataset_snapshot(client: &ApiClient, snapshot_id: &str) -> Result<()> {
     let path = format!("/v1/dataset_snapshot/{}", encode(snapshot_id));
-    client.delete(&path).discard().await
+    client.delete(&path).await
 }
 
 pub async fn preview_dataset_restore(
@@ -263,9 +262,7 @@ pub async fn preview_dataset_restore(
 ) -> Result<DatasetRestorePreview> {
     let path = format!("/v1/dataset/{}/restore/preview", encode(dataset_id));
     client
-        .post(&path)
-        .json(&serde_json::json!({ "version": xact_id }))
-        .send()
+        .post(&path, &serde_json::json!({ "version": xact_id }))
         .await
 }
 
@@ -276,7 +273,7 @@ pub async fn restore_dataset(
 ) -> Result<DatasetRestoreResult> {
     let path = format!("/v1/dataset/{}/restore", encode(dataset_id));
     let response = client
-        .post(&path)
+        .request(reqwest::Method::POST, &path)
         .json(&serde_json::json!({ "version": xact_id }))
         .response()
         .await?;
@@ -293,7 +290,7 @@ pub async fn get_dataset_head_xact_id(
     dataset_id: &str,
 ) -> Result<Option<String>> {
     let query = build_dataset_head_xact_query(dataset_id);
-    let response: BtqlResponse<DatasetHeadXactRow> = client.btql(&query).send().await?;
+    let response: BtqlResponse<DatasetHeadXactRow> = client.btql(&query).await?;
     let head = response.data.into_iter().find_map(|row| {
         row.xact_id
             .map(|value| value.trim().to_string())

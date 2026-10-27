@@ -1,8 +1,8 @@
-//! BTQL adds query options to the same HTTP request builder.
-use super::{ApiClient, BtqlResponse, Request, RetryReason};
+//! BTQL execution and pagination through the shared HTTP transport.
+use super::{ApiClient, BtqlResponse, RetryReason};
 use anyhow::{bail, Result};
+use futures_util::{stream, Stream, TryStreamExt};
 use serde::{de::DeserializeOwned, Serialize};
-use serde_json::{Map, Value};
 use std::collections::HashSet;
 use std::future::Future;
 
@@ -11,75 +11,64 @@ struct QueryBody<'a, Q: ?Sized> {
     query: &'a Q,
     fmt: &'static str,
     #[serde(flatten)]
-    options: Map<String, Value>,
+    options: BtqlOptions<'a>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    strict_lint_mode: Option<bool>,
 }
 
-pub struct BtqlQuery<'a, Q: ?Sized> {
-    request: Request,
-    body: QueryBody<'a, Q>,
+/// Optional BTQL execution settings. Omitted fields preserve server defaults.
+#[derive(Default, Serialize)]
+pub struct BtqlOptions<'a> {
+    #[serde(skip_serializing_if = "Option::is_none", rename = "query_source")]
+    pub source: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub lint_mode: Option<&'a str>,
+    #[serde(
+        skip_serializing_if = "Option::is_none",
+        rename = "brainstore_realtime"
+    )]
+    pub realtime: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub audit_log: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub use_columnstore: Option<bool>,
+    #[serde(skip)]
+    pub on_retry: Option<Box<dyn Fn(RetryReason) + Send + Sync>>,
+    /// Print query and request diagnostics with this label when set.
+    #[serde(skip)]
+    pub trace: Option<&'a str>,
 }
 
 impl ApiClient {
-    /// Accepts either SQL/pipeline text or a structured BTQL query. `send`
-    /// decodes the requested response type, just like an HTTP request.
-    pub fn btql<'a, Q: Serialize + ?Sized>(&self, query: &'a Q) -> BtqlQuery<'a, Q> {
-        BtqlQuery {
-            request: self.post("/btql").retry(),
-            body: QueryBody {
+    /// Execute SQL/pipeline text or a structured BTQL query with default settings.
+    pub async fn btql<T: DeserializeOwned>(&self, query: &(impl Serialize + ?Sized)) -> Result<T> {
+        self.btql_with_options(query, BtqlOptions::default()).await
+    }
+
+    /// Execute BTQL with explicit settings through the shared HTTP transport.
+    pub async fn btql_with_options<T: DeserializeOwned>(
+        &self,
+        query: &(impl Serialize + ?Sized),
+        mut options: BtqlOptions<'_>,
+    ) -> Result<T> {
+        let strict_lint_mode = options.lint_mode.map(|mode| mode == "strict");
+        let mut request = self.request(reqwest::Method::POST, "/btql").retry();
+        if let Some(observer) = options.on_retry.take() {
+            request = request.on_retry(observer);
+        }
+        if let Some(label) = options.trace {
+            eprintln!("btql[{label}] query:\n{}\n", serde_json::to_string(query)?);
+            request = request.trace(true, label);
+        }
+        request
+            .json(&QueryBody {
                 query,
                 fmt: "json",
-                options: Map::new(),
-            },
-        }
-    }
-}
-
-impl<Q: Serialize + ?Sized> BtqlQuery<'_, Q> {
-    pub fn source(mut self, source: &str) -> Self {
-        self.body
-            .options
-            .insert("query_source".into(), source.into());
-        self
-    }
-    pub fn lint_mode(mut self, mode: &str) -> Self {
-        self.body.options.insert("lint_mode".into(), mode.into());
-        self.body
-            .options
-            .insert("strict_lint_mode".into(), (mode == "strict").into());
-        self
-    }
-    pub fn realtime(mut self, enabled: bool) -> Self {
-        self.body
-            .options
-            .insert("brainstore_realtime".into(), enabled.into());
-        self
-    }
-    pub fn audit_log(mut self, enabled: bool) -> Self {
-        self.body.options.insert("audit_log".into(), enabled.into());
-        self
-    }
-    pub fn use_columnstore(mut self, enabled: bool) -> Self {
-        self.body
-            .options
-            .insert("use_columnstore".into(), enabled.into());
-        self
-    }
-    pub fn on_retry(mut self, observer: impl Fn(RetryReason) + Send + Sync + 'static) -> Self {
-        self.request = self.request.on_retry(observer);
-        self
-    }
-    pub fn trace(mut self, enabled: bool, label: &str) -> Self {
-        self.request = self.request.trace(enabled, label);
-        self
-    }
-    pub async fn send<T: DeserializeOwned>(self) -> Result<T> {
-        if let Some(label) = &self.request.trace {
-            eprintln!(
-                "btql[{label}] query:\n{}\n",
-                serde_json::to_string(self.body.query)?
-            );
-        }
-        self.request.json(&self.body).send().await
+                options,
+                strict_lint_mode,
+            })
+            .send()
+            .await
     }
 }
 
@@ -97,8 +86,17 @@ pub struct Pagination {
     cursors: HashSet<String>,
     pages: usize,
     max_pages: Option<usize>,
+    initial_cursor: Option<String>,
 }
 impl Pagination {
+    /// Resume fetching after a durably checkpointed cursor.
+    pub fn from_cursor(cursor: Option<String>) -> Self {
+        Self {
+            initial_cursor: cursor,
+            ..Self::default()
+        }
+    }
+
     pub fn with_max_pages(max_pages: usize) -> Self {
         Self {
             max_pages: Some(max_pages),
@@ -121,50 +119,76 @@ impl Pagination {
         Ok(())
     }
 
-    /// Collect bounded or unbounded pages. The callback owns only query
-    /// construction; limits, cursor checks, truncation and termination are shared.
-    pub async fn collect<T, F, Fut>(
+    /// Lazily fetch pages, preserving cursors and schema for page-level consumers.
+    /// Dropping the stream stops pagination; no requests run ahead of the reader.
+    pub fn pages<T, F, Fut>(
         mut self,
         max_rows: Option<usize>,
         page_size: usize,
-        mut fetch: F,
+        fetch: F,
+    ) -> impl Stream<Item = Result<Page<T>>>
+    where
+        F: FnMut(usize, Option<String>) -> Fut,
+        Fut: Future<Output = Result<BtqlResponse<T>>>,
+    {
+        let cursor = self.initial_cursor.take();
+        stream::try_unfold(
+            (self, fetch, cursor, 0usize, false),
+            move |(mut pagination, mut fetch, cursor, count, done)| async move {
+                if page_size == 0 {
+                    bail!("page size must be greater than zero");
+                }
+                let remaining = max_rows.map_or(usize::MAX, |max| max.saturating_sub(count));
+                if done || remaining == 0 {
+                    return Ok(None);
+                }
+                pagination.check(cursor.as_deref())?;
+                let mut response = fetch(remaining.min(page_size), cursor).await?;
+                if response.data.is_empty() && response.cursor.is_some() {
+                    bail!("query returned an empty page with a cursor");
+                }
+                let truncated = response.data.len() > remaining
+                    || (response.data.len() == remaining && response.cursor.is_some());
+                response.data.truncate(remaining);
+                let count = count + response.data.len();
+                let cursor = response.cursor.clone();
+                let done = truncated || cursor.is_none();
+                Ok(Some((
+                    Page {
+                        response,
+                        truncated,
+                    },
+                    (pagination, fetch, cursor, count, done),
+                )))
+            },
+        )
+    }
+
+    /// Convenience for callers that need all rows and a truncation indicator.
+    pub async fn collect<T, F, Fut>(
+        self,
+        max_rows: Option<usize>,
+        page_size: usize,
+        fetch: F,
     ) -> Result<(Vec<T>, bool)>
     where
         F: FnMut(usize, Option<String>) -> Fut,
         Fut: Future<Output = Result<BtqlResponse<T>>>,
     {
-        if page_size == 0 {
-            bail!("page size must be greater than zero");
-        }
-        let mut rows = Vec::new();
-        let mut cursor = None;
-        loop {
-            let limit = max_rows.map_or(page_size, |max| {
-                max.saturating_sub(rows.len()).min(page_size)
-            });
-            if limit == 0 {
-                return Ok((rows, false));
-            }
-            self.check(cursor.as_deref())?;
-            let page = fetch(limit, cursor).await?;
-            cursor = page.cursor;
-            if page.data.is_empty() {
-                if cursor.is_some() {
-                    bail!("query returned an empty page with a cursor");
-                }
-                return Ok((rows, false));
-            }
-            let remaining = max_rows.map_or(usize::MAX, |max| max.saturating_sub(rows.len()));
-            let overflow = page.data.len() > remaining;
-            rows.extend(page.data.into_iter().take(remaining));
-            if overflow || (max_rows.is_some_and(|max| rows.len() >= max) && cursor.is_some()) {
-                return Ok((rows, true));
-            }
-            if cursor.is_none() {
-                return Ok((rows, false));
-            }
-        }
+        self.pages(max_rows, page_size, fetch)
+            .try_fold((Vec::new(), false), |(mut rows, _), page| async move {
+                rows.extend(page.response.data);
+                Ok((rows, page.truncated))
+            })
+            .await
     }
+}
+
+/// One fetched page and whether a requested row bound cut the result short.
+/// `response.data` is a Vec, so use `.get(index)` for checked positional access.
+pub struct Page<T> {
+    pub response: BtqlResponse<T>,
+    pub truncated: bool,
 }
 
 #[cfg(test)]
@@ -173,7 +197,7 @@ mod tests {
     use crate::http::{retry_delay, HttpError, MAX_ATTEMPTS, MAX_DELAY};
     use actix_web::{web, App, HttpRequest, HttpResponse, HttpServer};
     use reqwest::StatusCode;
-    use serde_json::json;
+    use serde_json::{json, Value};
     use std::collections::VecDeque;
     use std::net::TcpListener;
     use std::sync::{Arc, Mutex};
@@ -261,14 +285,18 @@ mod tests {
             let reasons = Arc::new(Mutex::new(Vec::new()));
             let query = json!({"from": {"op":"function","name":"dataset","args":["test-dataset"]}});
             let result: super::super::BtqlResponse<Value> = client
-                .btql(&query)
-                .source("test-source")
-                .lint_mode("strict")
-                .on_retry({
-                    let reasons = Arc::clone(&reasons);
-                    move |reason| reasons.lock().unwrap().push(reason)
-                })
-                .send()
+                .btql_with_options(
+                    &query,
+                    crate::http::BtqlOptions {
+                        source: Some("test-source"),
+                        lint_mode: Some("strict"),
+                        on_retry: Some(Box::new({
+                            let reasons = Arc::clone(&reasons);
+                            move |reason| reasons.lock().unwrap().push(reason)
+                        })),
+                        ..Default::default()
+                    },
+                )
                 .await
                 .unwrap();
             assert!(result.data.is_empty());
@@ -288,8 +316,9 @@ mod tests {
         for status in [400, 401, 403, 404] {
             let (client, state, handle) = mock(vec![(status, "test permanent error")]).await;
             let error = client
-                .btql("SELECT * FROM dataset('test-dataset') LIMIT 1")
-                .send::<crate::http::BtqlResponse<Value>>()
+                .btql::<crate::http::BtqlResponse<Value>>(
+                    "SELECT * FROM dataset('test-dataset') LIMIT 1",
+                )
                 .await
                 .unwrap_err();
             assert_eq!(
@@ -303,8 +332,9 @@ mod tests {
         for body in ["{bad json", "{\"data\":false}"] {
             let (client, state, handle) = mock(vec![(200, body)]).await;
             let error = client
-                .btql("SELECT * FROM dataset('test-dataset') LIMIT 1")
-                .send::<crate::http::BtqlResponse<Value>>()
+                .btql::<crate::http::BtqlResponse<Value>>(
+                    "SELECT * FROM dataset('test-dataset') LIMIT 1",
+                )
                 .await
                 .unwrap_err();
             assert!(error
@@ -319,8 +349,9 @@ mod tests {
     async fn retries_are_bounded_and_keep_the_final_typed_error() {
         let (client, state, handle) = mock(vec![(503, "test exhausted error"); MAX_ATTEMPTS]).await;
         let error = client
-            .btql("SELECT * FROM dataset('test-dataset') LIMIT 1")
-            .send::<crate::http::BtqlResponse<Value>>()
+            .btql::<crate::http::BtqlResponse<Value>>(
+                "SELECT * FROM dataset('test-dataset') LIMIT 1",
+            )
             .await
             .unwrap_err();
         assert_eq!(
@@ -337,7 +368,7 @@ mod tests {
     async fn async_result_gets_retry_but_api_writes_do_not() {
         let (client, state, handle) = mock(vec![(503, "test retry"), (200, "{\"rows\":[]}")]).await;
         let result: Value = client
-            .get("/btql/async/test-id/result")
+            .request(reqwest::Method::GET, "/btql/async/test-id/result")
             .retry()
             .send()
             .await
@@ -348,7 +379,7 @@ mod tests {
 
         for path in ["/v1/dataset", "/btql/async"] {
             let (client, state, handle) = mock(vec![(503, "test write error")]).await;
-            let result: Result<Value> = client.post(path).json(&json!({})).send().await;
+            let result: Result<Value> = client.post(path, &json!({})).await;
             assert!(result.is_err());
             assert_eq!(state.requests.lock().unwrap().len(), 1);
             handle.stop(false).await;
@@ -388,12 +419,16 @@ mod tests {
         };
         let reasons = Arc::new(Mutex::new(Vec::new()));
         let response: Value = client
-            .btql("SELECT * FROM dataset('test-dataset') LIMIT 1")
-            .on_retry({
-                let reasons = Arc::clone(&reasons);
-                move |reason| reasons.lock().unwrap().push(reason)
-            })
-            .send()
+            .btql_with_options(
+                "SELECT * FROM dataset('test-dataset') LIMIT 1",
+                crate::http::BtqlOptions {
+                    on_retry: Some(Box::new({
+                        let reasons = Arc::clone(&reasons);
+                        move |reason| reasons.lock().unwrap().push(reason)
+                    })),
+                    ..Default::default()
+                },
+            )
             .await
             .unwrap();
         assert_eq!(response["data"], json!([]));
@@ -433,11 +468,15 @@ mod tests {
         let (client, state, handle) = mock(vec![(503, "test retry"), (200, "{\"data\":[]}")]).await;
         let body = json!({"query": "SELECT * FROM project_prompts('test-project') LIMIT 1", "fmt":"json", "audit_log":true, "use_columnstore":false, "brainstore_realtime":true});
         let _: Value = client
-            .btql(&body["query"])
-            .audit_log(true)
-            .use_columnstore(false)
-            .realtime(true)
-            .send()
+            .btql_with_options(
+                &body["query"],
+                crate::http::BtqlOptions {
+                    audit_log: Some(true),
+                    use_columnstore: Some(false),
+                    realtime: Some(true),
+                    ..Default::default()
+                },
+            )
             .await
             .unwrap();
         let requests = state.requests.lock().unwrap().clone();
@@ -464,7 +503,7 @@ mod tests {
         let (client, state, handle) =
             mock(vec![(200, "{\"ok\":true}"), (200, "{\"ok\":true}")]).await;
         let result: Value = client
-            .get("/test/http")
+            .request(reqwest::Method::GET, "/test/http")
             .query(&[("name", "test project/&")])
             .header("x-test-header", "test-value")
             .timeout(Duration::from_secs(1))
@@ -472,7 +511,11 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(result["ok"], true);
-        let response = client.get("/test/response").response().await.unwrap();
+        let response = client
+            .request(reqwest::Method::GET, "/test/response")
+            .response()
+            .await
+            .unwrap();
         assert_eq!(
             response.headers().get("x-test-response").unwrap(),
             "test-value"
@@ -556,10 +599,101 @@ mod tests {
         assert!(!truncated);
     }
     #[tokio::test]
+    async fn page_stream_is_lazy_resumes_and_preserves_page_metadata() {
+        let calls = std::cell::Cell::new(0);
+        {
+            let pages = Pagination::from_cursor(Some("test-resume".into())).pages(
+                None,
+                2,
+                |limit, cursor| {
+                    calls.set(calls.get() + 1);
+                    assert_eq!(limit, 2);
+                    assert_eq!(cursor.as_deref(), Some("test-resume"));
+                    std::future::ready(Ok(BtqlResponse {
+                        data: vec![1, 2],
+                        cursor: Some("test-next".into()),
+                        schema: Some(json!({"test-column": "number"})),
+                    }))
+                },
+            );
+            assert_eq!(calls.get(), 0);
+            futures_util::pin_mut!(pages);
+            let page = pages.try_next().await.unwrap().unwrap();
+            assert_eq!(page.response.data, vec![1, 2]);
+            assert_eq!(page.response.cursor.as_deref(), Some("test-next"));
+            assert_eq!(page.response.schema, Some(json!({"test-column": "number"})));
+            assert!(!page.truncated);
+            // Dropping here must not fetch the next page.
+        }
+        assert_eq!(calls.get(), 1);
+    }
+
+    #[tokio::test]
+    async fn page_stream_can_flatten_rows_and_propagates_fetch_errors_once() {
+        let mut replies = VecDeque::from([
+            Ok(page(vec![1, 2], Some("test-next"))),
+            Err(anyhow::anyhow!("test page failure")),
+        ]);
+        let pages = Pagination::default().pages(None, 2, |_, _| {
+            std::future::ready(replies.pop_front().unwrap())
+        });
+        let rows = pages
+            .map_ok(|page| stream::iter(page.response.data.into_iter().map(Ok::<_, anyhow::Error>)))
+            .try_flatten();
+        futures_util::pin_mut!(rows);
+        assert_eq!(rows.try_next().await.unwrap(), Some(1));
+        assert_eq!(rows.try_next().await.unwrap(), Some(2));
+        assert_eq!(
+            rows.try_next().await.unwrap_err().to_string(),
+            "test page failure"
+        );
+        assert!(rows.try_next().await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn default_btql_omits_optional_settings_and_http_shortcuts_share_transport() {
+        let (client, state, handle) = mock(vec![
+            (200, "{}"),
+            (200, "{}"),
+            (200, "{}"),
+            (200, "{}"),
+            (204, ""),
+            (200, "{\"data\":[]}"),
+        ])
+        .await;
+        let body = json!({"name": "test-object"});
+        let _: Value = client.get("/test/get").await.unwrap();
+        let _: Value = client.post("/test/post", &body).await.unwrap();
+        let _: Value = client.put("/test/put", &body).await.unwrap();
+        let _: Value = client.patch("/test/patch", &body).await.unwrap();
+        client.delete("/test/delete").await.unwrap();
+        let _: BtqlResponse<Value> = client
+            .btql("SELECT * FROM dataset('test-dataset') LIMIT 1")
+            .await
+            .unwrap();
+        let requests = state.requests.lock().unwrap().clone();
+        assert_eq!(
+            requests
+                .iter()
+                .map(|request| request.0.as_str())
+                .collect::<Vec<_>>(),
+            vec!["GET", "POST", "PUT", "PATCH", "DELETE", "POST"]
+        );
+        for request in &requests[1..4] {
+            assert_eq!(request.1, body);
+        }
+        assert_eq!(
+            requests[5].1,
+            json!({"query": "SELECT * FROM dataset('test-dataset') LIMIT 1", "fmt": "json"})
+        );
+        handle.stop(false).await;
+    }
+
+    #[tokio::test]
     async fn invalid_request_builders_fail_before_network_or_retries() {
         let (client, state, handle) = mock(vec![]).await;
         let error = client
-            .get("/test/invalid")
+            .request(reqwest::Method::GET, "/test/invalid")
             .header("x-test", "invalid\nvalue")
             .retry()
             .send::<Value>()

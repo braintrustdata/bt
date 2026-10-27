@@ -169,7 +169,7 @@ pub async fn list_functions(
     function_type: Option<&str>,
 ) -> Result<Vec<Function>> {
     let query = list_functions_query(project_id, function_type);
-    let response: BtqlResponse<Function> = client.btql(&query).send().await?;
+    let response: BtqlResponse<Function> = client.btql(&query).await?;
 
     Ok(response.data)
 }
@@ -244,7 +244,7 @@ pub async fn invoke_function(
     body: &serde_json::Value,
 ) -> Result<serde_json::Value> {
     let result = client
-        .post("/function/invoke")
+        .request(reqwest::Method::POST, "/function/invoke")
         .json(body)
         .timeout(std::time::Duration::from_secs(300))
         .send()
@@ -287,7 +287,7 @@ fn is_provider_auth_response(error: &HttpError) -> bool {
 
 pub async fn delete_function(client: &ApiClient, function_id: &str) -> Result<()> {
     let path = format!("/v1/function/{}", encode(function_id));
-    client.delete(&path).discard().await
+    client.delete(&path).await
 }
 
 pub async fn list_functions_page(
@@ -333,7 +333,6 @@ pub async fn list_functions_page(
 
     let raw: Value = client
         .get(&path)
-        .send()
         .await
         .with_context(|| format!("failed to list functions via {path}"))?;
 
@@ -374,11 +373,11 @@ pub async fn list_all_functions(client: &ApiClient, project_id: &str) -> Result<
 }
 
 pub async fn create_function(client: &ApiClient, body: &Value) -> Result<Function> {
-    client.post("/v1/function").json(body).send().await
+    client.post("/v1/function", body).await
 }
 
 pub async fn replace_function(client: &ApiClient, body: &Value) -> Result<Function> {
-    client.put("/v1/function").json(body).send().await
+    client.put("/v1/function", body).await
 }
 
 fn parse_function_list_page(raw: Value) -> Result<FunctionListPage> {
@@ -424,9 +423,7 @@ pub async fn request_code_upload_slot(
     });
 
     client
-        .post("/function/code")
-        .json(&body)
-        .send()
+        .post("/function/code", &body)
         .await
         .context("failed to request code upload slot")
 }
@@ -446,7 +443,7 @@ pub async fn insert_functions(
     functions: &[Value],
 ) -> Result<InsertFunctionsResult> {
     let body = insert_functions_body(functions);
-    let raw: Value = match client.post("/insert-functions").json(&body).send().await {
+    let raw: Value = match client.post("/insert-functions", &body).await {
         Ok(raw) => raw,
         Err(error) => {
             let Some(http_error) = error.downcast_ref::<HttpError>() else {

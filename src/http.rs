@@ -1,14 +1,19 @@
-//! Authenticated API access. Use the same request builder for JSON endpoints
-//! and BTQL; headers, errors, decoding, and retries live here.
+//! Authenticated API access. Headers, errors, decoding, and retries live here.
+//! Use `request(method, path)` for custom HTTP headers, timeouts, or retries.
 //!
 //! ```ignore
-//! let project: Project = client.get("/v1/project/test-id").send().await?;
-//! let created: Project = client.post("/v1/project").json(&body).send().await?;
-//! let page: BtqlResponse<Row> = client.btql(&query).send().await?;
-//! let result: SqlResponse = client.btql(&sql).lint_mode("strict").send().await?;
+//! let project: Project = client.get("/v1/project/test-id").await?;
+//! let created: Project = client.post("/v1/project", &body).await?;
+//! let page: BtqlResponse<Row> = client.btql(&query).await?;
+//! let options = BtqlOptions { lint_mode: Some("strict"), ..Default::default() };
+//! let result: SqlResponse = client.btql_with_options(&sql, options).await?;
+//! // Pages preserve cursors/schema; use TryStreamExt to fold or flatten them.
+//! let pages = Pagination::default().pages(None, 100, |limit, cursor| async move {
+//!     client.btql(&build_query(limit, cursor)).await
+//! });
 //! ```
 pub mod btql;
-pub use btql::Pagination;
+pub use btql::{BtqlOptions, Pagination};
 
 use backoff::{backoff::Backoff, ExponentialBackoffBuilder};
 use std::collections::HashMap;
@@ -245,20 +250,32 @@ impl ApiClient {
         }
     }
 
-    pub fn get(&self, path: &str) -> Request {
-        self.request(Method::GET, path)
+    pub async fn get<T: DeserializeOwned>(&self, path: &str) -> Result<T> {
+        self.request(Method::GET, path).send().await
     }
-    pub fn post(&self, path: &str) -> Request {
-        self.request(Method::POST, path)
+    pub async fn post<T: DeserializeOwned, B: Serialize + ?Sized>(
+        &self,
+        path: &str,
+        body: &B,
+    ) -> Result<T> {
+        self.request(Method::POST, path).json(body).send().await
     }
-    pub fn put(&self, path: &str) -> Request {
-        self.request(Method::PUT, path)
+    pub async fn put<T: DeserializeOwned, B: Serialize + ?Sized>(
+        &self,
+        path: &str,
+        body: &B,
+    ) -> Result<T> {
+        self.request(Method::PUT, path).json(body).send().await
     }
-    pub fn patch(&self, path: &str) -> Request {
-        self.request(Method::PATCH, path)
+    pub async fn patch<T: DeserializeOwned, B: Serialize + ?Sized>(
+        &self,
+        path: &str,
+        body: &B,
+    ) -> Result<T> {
+        self.request(Method::PATCH, path).json(body).send().await
     }
-    pub fn delete(&self, path: &str) -> Request {
-        self.request(Method::DELETE, path)
+    pub async fn delete(&self, path: &str) -> Result<()> {
+        self.request(Method::DELETE, path).discard().await
     }
 }
 

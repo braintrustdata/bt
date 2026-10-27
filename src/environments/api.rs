@@ -48,7 +48,6 @@ pub async fn list(client: &ApiClient) -> Result<Vec<Environment>> {
             "/environment?org_name={}",
             encode(client.org_name())
         ))
-        .send()
         .await?;
     Ok(response.objects)
 }
@@ -61,7 +60,7 @@ pub async fn get_by_slug(client: &ApiClient, slug: &str) -> Result<Option<Enviro
 }
 
 pub async fn create(client: &ApiClient, body: &CreateEnvironment<'_>) -> Result<Environment> {
-    client.post("/environment").json(body).send().await
+    client.post("/environment", body).await
 }
 
 pub async fn update(
@@ -70,15 +69,16 @@ pub async fn update(
     body: &UpdateEnvironment<'_>,
 ) -> Result<Environment> {
     client
-        .patch(&format!("/environment/{}", encode(id)))
-        .json(body)
-        .send()
+        .patch(&format!("/environment/{}", encode(id)), body)
         .await
 }
 
 pub async fn delete(client: &ApiClient, id: &str) -> Result<Environment> {
     client
-        .delete(&format!("/environment/{}", encode(id)))
+        .request(
+            reqwest::Method::DELETE,
+            &format!("/environment/{}", encode(id)),
+        )
         .send()
         .await
 }

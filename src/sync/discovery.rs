@@ -3,7 +3,7 @@ use std::collections::{HashMap, HashSet};
 use anyhow::Result;
 use serde_json::{json, Map, Value};
 
-use crate::http::{ApiClient, BtqlResponse, Pagination};
+use crate::http::{ApiClient, BtqlOptions, BtqlResponse, Pagination};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum ProjectLogRefScope {
@@ -79,9 +79,13 @@ where
         let query =
             build_project_log_ref_query(project_id, filter, limit, cursor.as_deref(), scope);
         let response: BtqlResponse = client
-            .btql(&query)
-            .source("bt_sync_discovery")
-            .send()
+            .btql_with_options(
+                &query,
+                BtqlOptions {
+                    source: Some("bt_sync_discovery"),
+                    ..Default::default()
+                },
+            )
             .await?;
         let row_count = response.data.len();
 

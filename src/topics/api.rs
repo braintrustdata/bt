@@ -1,3 +1,4 @@
+use crate::http::BtqlOptions;
 use std::collections::{BTreeMap, HashMap};
 
 use anyhow::{bail, Result};
@@ -28,7 +29,7 @@ pub(crate) async fn list_project_automations(
     project_id: &str,
 ) -> Result<Vec<ProjectAutomation>> {
     let path = format!("/v1/project_automation?project_id={}", encode(project_id));
-    let response: ListResponse<ProjectAutomation> = client.get(&path).send().await?;
+    let response: ListResponse<ProjectAutomation> = client.get(&path).await?;
     Ok(response.objects)
 }
 
@@ -36,18 +37,14 @@ pub(crate) async fn create_project_automation(
     client: &ApiClient,
     body: &Value,
 ) -> Result<ProjectAutomation> {
-    client
-        .post("/v1/project_automation")
-        .json(body)
-        .send()
-        .await
+    client.post("/v1/project_automation", body).await
 }
 
 pub(crate) async fn replace_project_automation(
     client: &ApiClient,
     body: &Value,
 ) -> Result<ProjectAutomation> {
-    client.put("/v1/project_automation").json(body).send().await
+    client.put("/v1/project_automation", body).await
 }
 
 pub(crate) async fn patch_project_automation(
@@ -56,7 +53,7 @@ pub(crate) async fn patch_project_automation(
     body: &Value,
 ) -> Result<ProjectAutomation> {
     let path = format!("/v1/project_automation/{}", encode(automation_id));
-    client.patch(&path).json(body).send().await
+    client.patch(&path, body).await
 }
 
 const DEFAULT_TOPIC_AUTOMATION_NAME: &str = "Topics";
@@ -462,9 +459,7 @@ pub async fn poke_topic_automations(ctx: &ProjectContext) -> Result<TopicsPokeRe
         };
         let _: Value = ctx
             .client
-            .post("/brainstore/automation/upsert-object-cursor")
-            .json(&body)
-            .send()
+            .post("/brainstore/automation/upsert-object-cursor", &body)
             .await?;
 
         queued.push(TopicAutomationPokeResult {
@@ -600,9 +595,7 @@ pub async fn enable_topics_config(
 
     let response: Value = ctx
         .client
-        .post("/api/project_automation/register")
-        .json(&request)
-        .send()
+        .post("/api/project_automation/register", &request)
         .await?;
     let automation_row = project_automation_row_from_response(&response)?;
     seed_topic_automation_cursors(
@@ -746,9 +739,7 @@ pub async fn update_topics_config(
 
     let response: Value = ctx
         .client
-        .post("/api/project_automation/patch_id")
-        .json(&Value::Object(payload))
-        .send()
+        .post("/api/project_automation/patch_id", &Value::Object(payload))
         .await?;
     let updated_row = project_automation_row_from_response(&response)?;
     let mut function_cache = HashMap::new();
@@ -879,12 +870,7 @@ pub async fn update_topic_map_config(
     payload.insert("function_data".to_string(), Value::Object(function_data));
 
     let path = format!("/v1/function/{}", encode(&resolved.function_id));
-    let _: Value = ctx
-        .client
-        .patch(&path)
-        .json(&Value::Object(payload))
-        .send()
-        .await?;
+    let _: Value = ctx.client.patch(&path, &Value::Object(payload)).await?;
 
     let mut updated_function_cache = HashMap::new();
     let automation = build_topic_automation_config(
@@ -913,11 +899,7 @@ pub async fn fetch_topic_map_report_url(
         function_id,
         version,
     };
-    client
-        .post("/topic-map-report-url")
-        .json(&request)
-        .send()
-        .await
+    client.post("/topic-map-report-url", &request).await
 }
 
 pub async fn fetch_topic_map_btmap_url(
@@ -929,11 +911,7 @@ pub async fn fetch_topic_map_btmap_url(
         function_id,
         version,
     };
-    client
-        .post("/topic-map-btmap-url")
-        .json(&request)
-        .send()
-        .await
+    client.post("/topic-map-btmap-url", &request).await
 }
 
 fn topic_automation_object_id(project_id: &str, data_scope: Option<&Value>) -> Result<String> {
@@ -1005,9 +983,7 @@ async fn seed_topic_automation_cursors(
         start_xact_id: start_xact_id.clone(),
     };
     let _: Value = client
-        .post("/brainstore/automation/reset-cursors")
-        .json(&reset_body)
-        .send()
+        .post("/brainstore/automation/reset-cursors", &reset_body)
         .await?;
 
     let upsert_body = UpsertObjectCursorRequest {
@@ -1015,9 +991,7 @@ async fn seed_topic_automation_cursors(
         object_id: object_id.clone(),
     };
     let _: Value = client
-        .post("/brainstore/automation/upsert-object-cursor")
-        .json(&upsert_body)
-        .send()
+        .post("/brainstore/automation/upsert-object-cursor", &upsert_body)
         .await?;
 
     Ok(SeededTopicAutomationCursors {
@@ -1156,7 +1130,7 @@ async fn resolve_topic_map_target(
 
 async fn list_topic_automation_rows(client: &ApiClient, project_id: &str) -> Result<Vec<Value>> {
     let path = format!("/v1/project_automation?project_id={}", encode(project_id));
-    let response: Value = client.get(&path).send().await?;
+    let response: Value = client.get(&path).await?;
     Ok(extract_objects(&response)
         .iter()
         .filter(|row| {
@@ -1230,11 +1204,7 @@ async fn create_topic_map_function_refs(
             })
             .collect(),
     };
-    let response: Value = client
-        .post("/insert-functions")
-        .json(&request)
-        .send()
-        .await?;
+    let response: Value = client.post("/insert-functions", &request).await?;
     let created = response
         .get("functions")
         .and_then(Value::as_array)
@@ -1455,9 +1425,7 @@ async fn fetch_cursor_snapshot(
         project_id: project_id.to_string(),
     };
     let response: Value = client
-        .post("/brainstore/automation/get-cursors")
-        .json(&body)
-        .send()
+        .post("/brainstore/automation/get-cursors", &body)
         .await?;
     let map = response.as_object();
 
@@ -1487,9 +1455,7 @@ async fn fetch_object_cursor_snapshot(
         project_id: project_id.to_string(),
     };
     let response: Value = client
-        .post("/brainstore/automation/get-object-cursors")
-        .json(&body)
-        .send()
+        .post("/brainstore/automation/get-object-cursors", &body)
         .await?;
     let map = response.as_object();
 
@@ -1749,14 +1715,14 @@ async fn load_function_row(
         return Ok(value.clone());
     }
     let path = format!("/v1/function/{}", encode(function_id));
-    let value: Value = client.get(&path).send().await?;
+    let value: Value = client.get(&path).await?;
     function_cache.insert(function_id.to_string(), value.clone());
     Ok(value)
 }
 
 async fn delete_topic_automation(client: &ApiClient, automation_id: &str) -> Result<()> {
     let path = format!("/v1/project_automation/{}", encode(automation_id));
-    client.delete(&path).discard().await
+    client.delete(&path).await
 }
 
 async fn build_topic_status_bars(
@@ -2019,9 +1985,13 @@ async fn fetch_topic_automation_progress(
         "from: project_logs('{escaped_project_id}') spans | measures: count_distinct(root_span_id) as total_traces | filter: {time_filter_clause}"
     );
     let total_response = client
-        .btql(&total_query)
-        .realtime(true)
-        .send::<Value>()
+        .btql_with_options::<Value>(
+            &total_query,
+            BtqlOptions {
+                realtime: Some(true),
+                ..Default::default()
+            },
+        )
         .await?;
     let total_row = first_btql_row(&total_response);
     let aggregate_row = if measure_expressions.is_empty() {
@@ -2032,9 +2002,13 @@ async fn fetch_topic_automation_progress(
             measure_expressions.join(", ")
         );
         let aggregate_response = client
-            .btql(&aggregate_query)
-            .realtime(true)
-            .send::<Value>()
+            .btql_with_options::<Value>(
+                &aggregate_query,
+                BtqlOptions {
+                    realtime: Some(true),
+                    ..Default::default()
+                },
+            )
             .await?;
         first_btql_row(&aggregate_response).cloned()
     };

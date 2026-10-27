@@ -11,6 +11,7 @@ use crossterm::terminal::{
     disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen,
 };
 use crossterm::ExecutableCommand;
+use futures_util::TryStreamExt;
 use ratatui::backend::CrosstermBackend;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::prelude::Frame;
@@ -28,7 +29,7 @@ use urlencoding::encode;
 
 use crate::args::BaseArgs;
 use crate::auth::login;
-use crate::http::{ApiClient, HttpError};
+use crate::http::{ApiClient, BtqlOptions, HttpError};
 use crate::project_context::resolve_required_project;
 use crate::ui::with_spinner;
 use crate::utils::parse_duration_to_seconds;
@@ -577,10 +578,14 @@ fn format_response(response: &SqlResponse, json_output: bool) -> Result<String> 
 
 async fn execute_query(client: &ApiClient, query: &str, lint_mode: &str) -> Result<SqlResponse> {
     match client
-        .btql(query)
-        .source("bt_sql")
-        .lint_mode(lint_mode)
-        .send()
+        .btql_with_options(
+            query,
+            BtqlOptions {
+                source: Some("bt_sql"),
+                lint_mode: Some(lint_mode),
+                ..Default::default()
+            },
+        )
         .await
     {
         Ok(response) => Ok(response),
@@ -635,7 +640,7 @@ async fn submit_async_query(
     batch_size: Option<u64>,
 ) -> Result<SubmitAsyncQueryResponse> {
     let body = async_query_submit_body(query, batch_size);
-    client.post("/btql/async").json(&body).send().await
+    client.post("/btql/async", &body).await
 }
 
 async fn wait_for_async_query(
@@ -646,7 +651,10 @@ async fn wait_for_async_query(
     let started = Instant::now();
     loop {
         let status: AsyncQueryStatusResponse = client
-            .get(&format!("/btql/async/{}", encode(automation_id)))
+            .request(
+                reqwest::Method::GET,
+                &format!("/btql/async/{}", encode(automation_id)),
+            )
             .retry()
             .send()
             .await?;
@@ -672,15 +680,14 @@ async fn collect_async_query_result(
 ) -> Result<SqlResponse> {
     let page_size =
         usize::try_from(args.async_result_limit).context("async result page limit is too large")?;
-    let (rows, _) = Pagination::default()
-        .collect(None, page_size, |limit, cursor| async move {
+    let rows = Pagination::default()
+        .pages(None, page_size, |limit, cursor| async move {
             loop {
                 let page: AsyncQueryResultPage = client
-                    .get(&async_query_result_path(
-                        automation_id,
-                        limit as u64,
-                        cursor.as_deref(),
-                    ))
+                    .request(
+                        reqwest::Method::GET,
+                        &async_query_result_path(automation_id, limit as u64, cursor.as_deref()),
+                    )
                     .retry()
                     .send()
                     .await?;
@@ -706,6 +713,10 @@ async fn collect_async_query_result(
                     schema: None,
                 });
             }
+        })
+        .try_fold(Vec::new(), |mut rows, page| async move {
+            rows.extend(page.response.data);
+            Ok(rows)
         })
         .await?;
 

@@ -2234,8 +2234,7 @@ async fn maybe_create_api_key_for_oauth(base: &BaseArgs, client: &ApiClient) -> 
     }
 
     let existing: Vec<String> = client
-        .get("/v1/api_key")
-        .send::<ApiKeyList>()
+        .get::<ApiKeyList>("/v1/api_key")
         .await
         .context("failed to list existing Braintrust API keys before creating one")?
         .objects
@@ -2253,7 +2252,7 @@ async fn maybe_create_api_key_for_oauth(base: &BaseArgs, client: &ApiClient) -> 
     };
 
     let body = serde_json::json!({ "name": name, "org_id": org_id });
-    let created: CreatedKey = client.post("/v1/api_key").json(&body).send().await?;
+    let created: CreatedKey = client.post("/v1/api_key", &body).await?;
 
     let explicitly_quiet = base.quiet && base.quiet_source.is_some();
     if std::io::stderr().is_terminal() && !explicitly_quiet {

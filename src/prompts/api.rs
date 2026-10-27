@@ -3,7 +3,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use urlencoding::encode;
 
-use crate::http::{ApiClient, BtqlResponse};
+use crate::http::{ApiClient, BtqlOptions, BtqlResponse};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Prompt {
@@ -52,7 +52,7 @@ pub async fn list_prompts(
     if let Some(environment) = environment {
         path.push_str(&format!("&environment={}", encode(environment)));
     }
-    let list: ListResponse<Prompt> = client.get(&path).send().await?;
+    let list: ListResponse<Prompt> = client.get(&path).await?;
     Ok(list.objects)
 }
 
@@ -82,7 +82,7 @@ pub async fn get_prompt_by_slug(
         .map(|(key, value)| format!("{}={}", encode(key), encode(value)))
         .collect::<Vec<_>>()
         .join("&");
-    let list: ListResponse<Prompt> = client.get(&format!("/v1/prompt?{query}")).send().await?;
+    let list: ListResponse<Prompt> = client.get(&format!("/v1/prompt?{query}")).await?;
     Ok(list.objects.into_iter().next())
 }
 
@@ -93,11 +93,15 @@ pub async fn list_prompt_versions(
 ) -> Result<Vec<String>> {
     let query = prompt_versions_query(project_id, prompt_id);
     let response: BtqlResponse<Value> = client
-        .btql(&query)
-        .audit_log(true)
-        .use_columnstore(false)
-        .realtime(true)
-        .send()
+        .btql_with_options(
+            &query,
+            BtqlOptions {
+                audit_log: Some(true),
+                use_columnstore: Some(false),
+                realtime: Some(true),
+                ..Default::default()
+            },
+        )
         .await?;
 
     Ok(prompt_versions_from_rows(response.data))
@@ -158,7 +162,7 @@ pub async fn assign_prompt(
         "object_version": object_version,
         "org_name": client.org_name(),
     });
-    client.put(&path).json(&body).send().await
+    client.put(&path, &body).await
 }
 
 pub async fn unassign_prompt(
@@ -172,12 +176,12 @@ pub async fn unassign_prompt(
         encode(environment),
         encode(client.org_name())
     );
-    client.delete(&path).send().await
+    client.request(reqwest::Method::DELETE, &path).send().await
 }
 
 pub async fn delete_prompt(client: &ApiClient, prompt_id: &str) -> Result<()> {
     let path = format!("/v1/prompt/{}", encode(prompt_id));
-    client.delete(&path).discard().await
+    client.delete(&path).await
 }
 
 #[cfg(test)]

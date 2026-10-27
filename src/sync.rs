@@ -11,6 +11,7 @@ use anyhow::{anyhow, bail, Context, Result};
 use base64::prelude::{Engine as _, BASE64_STANDARD};
 use braintrust_sdk_rust::Logs3BatchUploader;
 use clap::{Args, Subcommand, ValueEnum};
+use futures_util::TryStreamExt;
 use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
@@ -21,7 +22,7 @@ use urlencoding::encode;
 use crate::args::BaseArgs;
 use crate::auth::login;
 use crate::experiments::api::create_experiment;
-use crate::http::{ApiClient, BtqlResponse, Pagination, RetryReason};
+use crate::http::{ApiClient, BtqlOptions, BtqlResponse, Pagination, RetryReason};
 use crate::projects::api::{create_project, list_projects, Project};
 use crate::ui::{animations_enabled, fuzzy_select, is_quiet};
 use crate::utils::{app_project_url, parse_duration_to_seconds, write_json_atomic};
@@ -960,18 +961,27 @@ async fn pull_spans_mode(
 
     let mut writer = open_jsonl_part_writer(output_dir, state.items_done > 0)?;
 
-    let mut pagination = Pagination::default();
-    while state.items_done < limit {
-        pagination.check(state.cursor.as_deref())?;
-        let batch_limit = (limit - state.items_done).min(spec.page_size);
-        let query = build_spans_query(source_expr, filter, batch_limit, state.cursor.as_deref());
-        let BtqlResponse { data, cursor, .. } = client
-            .btql(&query)
-            .source("bt_sync")
-            .on_retry(btql_retry_tracker.observer())
-            .trace(verbose, "spans")
-            .send::<BtqlResponse>()
-            .await?;
+    let pages = Pagination::from_cursor(state.cursor.clone()).pages(
+        Some(limit.saturating_sub(state.items_done)),
+        spec.page_size,
+        |batch_limit, cursor| async move {
+            let query = build_spans_query(source_expr, filter, batch_limit, cursor.as_deref());
+            client
+                .btql_with_options::<BtqlResponse>(
+                    &query,
+                    BtqlOptions {
+                        source: Some("bt_sync"),
+                        on_retry: Some(Box::new(btql_retry_tracker.observer())),
+                        trace: verbose.then_some("spans"),
+                        ..Default::default()
+                    },
+                )
+                .await
+        },
+    );
+    futures_util::pin_mut!(pages);
+    while let Some(page) = pages.try_next().await? {
+        let BtqlResponse { data, cursor, .. } = page.response;
         let mut rows = data;
         let batch_count = rows.len();
 
@@ -1199,11 +1209,15 @@ async fn pull_traces_mode(
                 discovery_cursor.as_deref(),
             );
             let response = client
-                .btql(&query)
-                .source("bt_sync")
-                .on_retry(btql_retry_tracker.observer())
-                .trace(verbose, "discover_roots")
-                .send::<BtqlResponse>()
+                .btql_with_options::<BtqlResponse>(
+                    &query,
+                    BtqlOptions {
+                        source: Some("bt_sync"),
+                        on_retry: Some(Box::new(btql_retry_tracker.observer())),
+                        trace: verbose.then_some("discover_roots"),
+                        ..Default::default()
+                    },
+                )
                 .await?;
             let row_count = response.data.len();
 
@@ -1500,11 +1514,15 @@ async fn process_trace_chunk(
             cursor.as_deref(),
         );
         let BtqlResponse { data, cursor, .. } = client
-            .btql(&query)
-            .source("bt_sync")
-            .on_retry(btql_retry_tracker.observer())
-            .trace(verbose, "fetch_roots")
-            .send::<BtqlResponse>()
+            .btql_with_options::<BtqlResponse>(
+                &query,
+                BtqlOptions {
+                    source: Some("bt_sync"),
+                    on_retry: Some(Box::new(btql_retry_tracker.observer())),
+                    trace: verbose.then_some("fetch_roots"),
+                    ..Default::default()
+                },
+            )
             .await?;
         let mut rows = data;
         let batch_count = rows.len();
@@ -2313,11 +2331,15 @@ async fn discover_vector_specs_global(
     ]
     .join(" | ");
     let response = client
-        .btql(&query)
-        .source("bt_sync")
-        .on_retry(btql_retry_tracker.observer())
-        .trace(verbose, "vector_models")
-        .send::<BtqlResponse>()
+        .btql_with_options::<BtqlResponse>(
+            &query,
+            BtqlOptions {
+                source: Some("bt_sync"),
+                on_retry: Some(Box::new(btql_retry_tracker.observer())),
+                trace: verbose.then_some("vector_models"),
+                ..Default::default()
+            },
+        )
         .await?;
 
     let mut specs = Vec::new();
@@ -2425,11 +2447,15 @@ async fn fetch_vector_columns_for_rows(
         id_literals.len().max(1)
     );
     let response = client
-        .btql(&query)
-        .source("bt_sync")
-        .on_retry(btql_retry_tracker.observer())
-        .trace(verbose, "vector_rows")
-        .send::<BtqlResponse>()
+        .btql_with_options::<BtqlResponse>(
+            &query,
+            BtqlOptions {
+                source: Some("bt_sync"),
+                on_retry: Some(Box::new(btql_retry_tracker.observer())),
+                trace: verbose.then_some("vector_rows"),
+                ..Default::default()
+            },
+        )
         .await?;
 
     let mut by_xact = BTreeMap::new();
@@ -3384,7 +3410,7 @@ async fn create_dataset(
         "project_id": project_id,
         "org_name": client.org_name(),
     });
-    client.post("/v1/dataset").json(&body).send().await
+    client.post("/v1/dataset", &body).await
 }
 
 async fn list_project_named_objects(
@@ -3398,7 +3424,7 @@ async fn list_project_named_objects(
         encode(client.org_name()),
         encode(project_id)
     );
-    let response: NamedObjectListResponse = client.get(&path).send().await?;
+    let response: NamedObjectListResponse = client.get(&path).await?;
     Ok(response.objects)
 }
 

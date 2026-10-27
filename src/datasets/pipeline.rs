@@ -1687,9 +1687,7 @@ async fn upload_deferred_attachment(
         "org_id": client.org_id(),
     });
     let metadata: AttachmentUploadMetadata = client
-        .post("/attachment")
-        .json(&request)
-        .send()
+        .post("/attachment", &request)
         .await
         .context("failed to request signed URL from API server")?;
     let data = deferred_attachment_bytes(spec, base_dir)?;
@@ -1707,9 +1705,7 @@ async fn upload_deferred_attachment(
         "status": status,
     });
     let _: Value = client
-        .post("/attachment/status")
-        .json(&status_request)
-        .send()
+        .post("/attachment/status", &status_request)
         .await
         .context("failed to log attachment status")?;
     upload_result.context("failed to upload attachment to object store")?;

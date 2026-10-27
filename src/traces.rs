@@ -35,7 +35,7 @@ use urlencoding::{decode, encode};
 use crate::args::BaseArgs;
 use crate::auth::login;
 use crate::experiments::api as experiments_api;
-use crate::http::{ApiClient, BtqlResponse};
+use crate::http::{ApiClient, BtqlOptions, BtqlResponse};
 use crate::projects::api::Project;
 use crate::ui::{fuzzy_select, is_interactive, with_spinner};
 use crate::utils::parse_duration_to_seconds;
@@ -1467,9 +1467,13 @@ async fn fetch_span_item(
     maybe_print_query(print_queries, label, &query);
     let response = with_spinner("Loading span...", async {
         client
-            .btql(&query)
-            .source("bt_traces")
-            .send::<BtqlResponse>()
+            .btql_with_options::<BtqlResponse>(
+                &query,
+                BtqlOptions {
+                    source: Some("bt_traces"),
+                    ..Default::default()
+                },
+            )
             .await
             .with_context(|| format!("BTQL query failed: {query}"))
     })
@@ -1852,7 +1856,7 @@ fn select_project_selector<'a>(
 
 async fn list_projects(client: &ApiClient) -> Result<Vec<ProjectInfo>> {
     let path = format!("/v1/project?org_name={}", encode(client.org_name()));
-    let response: ProjectsListResponse = client.get(&path).send().await?;
+    let response: ProjectsListResponse = client.get(&path).await?;
     Ok(response.objects)
 }
 
@@ -1862,7 +1866,7 @@ async fn get_project_by_name(client: &ApiClient, name: &str) -> Result<Option<Pr
         encode(client.org_name()),
         encode(name)
     );
-    let response: ProjectsListResponse = client.get(&path).send().await?;
+    let response: ProjectsListResponse = client.get(&path).await?;
     Ok(response.objects.into_iter().next())
 }
 
@@ -6049,9 +6053,13 @@ async fn lookup_root_span_id_for_query(
 ) -> Result<Option<String>> {
     maybe_print_query(print_queries, label, query);
     let response = client
-        .btql(query)
-        .source("bt_traces")
-        .send::<BtqlResponse>()
+        .btql_with_options::<BtqlResponse>(
+            query,
+            BtqlOptions {
+                source: Some("bt_traces"),
+                ..Default::default()
+            },
+        )
         .await
         .with_context(|| format!("BTQL query failed: {query}"))?;
 
@@ -6298,9 +6306,13 @@ async fn fetch_summary_rows(
                 );
                 maybe_print_query(query_ctx.print_queries, "summary", &query);
                 client
-                    .btql(&query)
-                    .source("bt_traces")
-                    .send::<BtqlResponse>()
+                    .btql_with_options::<BtqlResponse>(
+                        &query,
+                        BtqlOptions {
+                            source: Some("bt_traces"),
+                            ..Default::default()
+                        },
+                    )
                     .await
                     .with_context(|| format!("BTQL query failed: {query}"))
             },
@@ -6327,9 +6339,13 @@ async fn fetch_logs_page(
     );
     maybe_print_query(query_ctx.print_queries, "logs", &query);
     client
-        .btql(&query)
-        .source("bt_traces")
-        .send::<BtqlResponse>()
+        .btql_with_options::<BtqlResponse>(
+            &query,
+            BtqlOptions {
+                source: Some("bt_traces"),
+                ..Default::default()
+            },
+        )
         .await
         .with_context(|| format!("BTQL query failed: {query}"))
 }
@@ -6346,9 +6362,13 @@ async fn fetch_trace_spans_page(
     let query = build_trace_spans_query(source_expr, root_span_id, preview_length, limit, cursor);
     maybe_print_query(print_queries, "trace", &query);
     client
-        .btql(&query)
-        .source("bt_traces")
-        .send::<BtqlResponse>()
+        .btql_with_options::<BtqlResponse>(
+            &query,
+            BtqlOptions {
+                source: Some("bt_traces"),
+                ..Default::default()
+            },
+        )
         .await
         .with_context(|| format!("BTQL query failed: {query}"))
 }
@@ -6366,9 +6386,13 @@ async fn fetch_waterfall_spans_page(
         build_waterfall_spans_query(source_expr, root_span_id, preview_length, limit, cursor);
     maybe_print_query(print_queries, "waterfall", &query);
     client
-        .btql(&query)
-        .source("bt_traces")
-        .send::<BtqlResponse>()
+        .btql_with_options::<BtqlResponse>(
+            &query,
+            BtqlOptions {
+                source: Some("bt_traces"),
+                ..Default::default()
+            },
+        )
         .await
         .with_context(|| format!("BTQL query failed: {query}"))
 }
@@ -6395,9 +6419,13 @@ async fn fetch_trace_span_rows_for_tree(
                 );
                 maybe_print_query(print_queries, "spans-tree", &query);
                 client
-                    .btql(&query)
-                    .source("bt_traces")
-                    .send::<BtqlResponse>()
+                    .btql_with_options::<BtqlResponse>(
+                        &query,
+                        BtqlOptions {
+                            source: Some("bt_traces"),
+                            ..Default::default()
+                        },
+                    )
                     .await
                     .with_context(|| format!("BTQL query failed: {query}"))
             },
@@ -6416,9 +6444,13 @@ async fn fetch_full_span_row(
     maybe_print_query(print_queries, "span-full", &query);
 
     let response = client
-        .btql(&query)
-        .source("bt_traces")
-        .send::<BtqlResponse>()
+        .btql_with_options::<BtqlResponse>(
+            &query,
+            BtqlOptions {
+                source: Some("bt_traces"),
+                ..Default::default()
+            },
+        )
         .await
         .with_context(|| format!("BTQL query failed: {query}"))?;
 
@@ -6722,7 +6754,7 @@ fn poll_pending_thread_load(app: &mut TraceViewerApp) {
 }
 
 async fn execute_invoke(client: &ApiClient, request: &Value) -> Result<Value> {
-    client.post("/function/invoke").json(request).send().await
+    client.post("/function/invoke", request).await
 }
 
 #[cfg(test)]
