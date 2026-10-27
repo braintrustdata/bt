@@ -3,7 +3,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use urlencoding::encode;
 
-use crate::http::ApiClient;
+use crate::http::{ApiClient, BtqlResponse};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Prompt {
@@ -39,12 +39,6 @@ struct ListResponse<T> {
     objects: Vec<T>,
 }
 
-#[derive(Debug, Deserialize)]
-struct PromptVersionsResponse {
-    #[serde(default)]
-    data: Vec<Value>,
-}
-
 pub async fn list_prompts(
     client: &ApiClient,
     project: &str,
@@ -58,7 +52,7 @@ pub async fn list_prompts(
     if let Some(environment) = environment {
         path.push_str(&format!("&environment={}", encode(environment)));
     }
-    let list: ListResponse<Prompt> = client.get(&path).await?;
+    let list: ListResponse<Prompt> = client.get(&path).send().await?;
     Ok(list.objects)
 }
 
@@ -88,7 +82,7 @@ pub async fn get_prompt_by_slug(
         .map(|(key, value)| format!("{}={}", encode(key), encode(value)))
         .collect::<Vec<_>>()
         .join("&");
-    let list: ListResponse<Prompt> = client.get(&format!("/v1/prompt?{query}")).await?;
+    let list: ListResponse<Prompt> = client.get(&format!("/v1/prompt?{query}")).send().await?;
     Ok(list.objects.into_iter().next())
 }
 
@@ -97,15 +91,20 @@ pub async fn list_prompt_versions(
     project_id: &str,
     prompt_id: &str,
 ) -> Result<Vec<String>> {
-    let body = prompt_versions_request(project_id, prompt_id);
-    let response: PromptVersionsResponse = client.query_with_body(&body).await?;
+    let query = prompt_versions_query(project_id, prompt_id);
+    let response: BtqlResponse<Value> = client
+        .btql(&query)
+        .audit_log(true)
+        .use_columnstore(false)
+        .realtime(true)
+        .send()
+        .await?;
 
     Ok(prompt_versions_from_rows(response.data))
 }
 
-fn prompt_versions_request(project_id: &str, prompt_id: &str) -> Value {
+fn prompt_versions_query(project_id: &str, prompt_id: &str) -> Value {
     json!({
-        "query": {
             "from": {
                 "op": "function",
                 "name": { "op": "ident", "name": ["project_prompts"] },
@@ -121,11 +120,6 @@ fn prompt_versions_request(project_id: &str, prompt_id: &str) -> Value {
                 "left": { "op": "ident", "name": ["id"] },
                 "right": { "op": "literal", "value": prompt_id }
             }
-        },
-        "audit_log": true,
-        "use_columnstore": false,
-        "brainstore_realtime": true,
-        "fmt": "json"
     })
 }
 
@@ -164,7 +158,7 @@ pub async fn assign_prompt(
         "object_version": object_version,
         "org_name": client.org_name(),
     });
-    client.put(&path, &body).await
+    client.put(&path).json(&body).send().await
 }
 
 pub async fn unassign_prompt(
@@ -178,12 +172,12 @@ pub async fn unassign_prompt(
         encode(environment),
         encode(client.org_name())
     );
-    client.delete_with_response(&path).await
+    client.delete(&path).send().await
 }
 
 pub async fn delete_prompt(client: &ApiClient, prompt_id: &str) -> Result<()> {
     let path = format!("/v1/prompt/{}", encode(prompt_id));
-    client.delete(&path).await
+    client.delete(&path).discard().await
 }
 
 #[cfg(test)]
@@ -192,17 +186,11 @@ mod tests {
 
     #[test]
     fn prompt_versions_request_scopes_audit_log_to_prompt() {
-        let request = prompt_versions_request("proj_test", "prompt_test");
+        let request = prompt_versions_query("proj_test", "prompt_test");
 
-        assert_eq!(
-            request["query"]["from"]["name"]["name"],
-            json!(["project_prompts"])
-        );
-        assert_eq!(request["query"]["from"]["args"][0]["value"], "proj_test");
-        assert_eq!(request["query"]["filter"]["right"]["value"], "prompt_test");
-        assert_eq!(request["audit_log"], true);
-        assert_eq!(request["use_columnstore"], false);
-        assert_eq!(request["brainstore_realtime"], true);
+        assert_eq!(request["from"]["name"]["name"], json!(["project_prompts"]));
+        assert_eq!(request["from"]["args"][0]["value"], "proj_test");
+        assert_eq!(request["filter"]["right"]["value"], "prompt_test");
     }
 
     #[test]

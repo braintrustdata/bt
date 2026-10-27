@@ -16,7 +16,7 @@ use crate::args::BaseArgs;
 use crate::auth;
 use crate::datasets::api as datasets_api;
 use crate::functions::{self, api as functions_api, IfExistsMode};
-use crate::http::ApiClient;
+use crate::http::{ApiClient, BtqlResponse};
 use crate::js_bundle::{
     collect_matching_files, run_node_metadata_runner, swc_bundle_js_module, BundledModule,
     SwcBundleTarget, VirtualModule,
@@ -485,8 +485,6 @@ struct PushedView {
     function_id: String,
     url: String,
 }
-
-type BtqlResponse = crate::http::BtqlResponse<Map<String, Value>>;
 
 struct PreviewServerState {
     client: ApiClient,
@@ -1873,7 +1871,10 @@ async fn fetch_trace_rows(
         sql_quote(root_span_id),
         limit,
     );
-    execute_query(client, &query)
+    client
+        .btql(&query)
+        .source("bt_views_preview")
+        .send::<BtqlResponse>()
         .await
         .with_context(|| format!("BTQL query failed: {query}"))
         .map(|response| response.data)
@@ -1888,22 +1889,13 @@ async fn fetch_full_span_row(
         "select: * | from: {source_expr} spans | filter: id = {} | preview_length: -1 | limit: 1",
         sql_quote(row_id),
     );
-    execute_query(client, &query)
+    client
+        .btql(&query)
+        .source("bt_views_preview")
+        .send::<BtqlResponse>()
         .await
         .with_context(|| format!("BTQL query failed: {query}"))
         .map(|response| response.data.into_iter().next())
-}
-
-async fn execute_query(client: &ApiClient, query: &str) -> Result<BtqlResponse> {
-    client
-        .query(
-            query,
-            crate::http::btql::QueryOptions {
-                source: Some("bt_views_preview_7e8680d0f2484e2fbef8a61f2de0b9df"),
-                lint_mode: None,
-            },
-        )
-        .await
 }
 
 fn sql_quote(value: &str) -> String {

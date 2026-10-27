@@ -33,7 +33,7 @@ use crate::project_context::resolve_required_project;
 use crate::ui::with_spinner;
 use crate::utils::parse_duration_to_seconds;
 
-use crate::http::btql::{Pagination, QueryOptions, SQL_QUERY_SOURCE as QUERY_SOURCE};
+use crate::http::Pagination;
 static LOGS_SOURCE_RE: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(r"(?i)\bfrom[ \t\r\n]+(?P<source>logs)\b").expect("valid logs source regex")
 });
@@ -577,13 +577,10 @@ fn format_response(response: &SqlResponse, json_output: bool) -> Result<String> 
 
 async fn execute_query(client: &ApiClient, query: &str, lint_mode: &str) -> Result<SqlResponse> {
     match client
-        .query(
-            query,
-            QueryOptions {
-                source: Some(QUERY_SOURCE),
-                lint_mode: Some(lint_mode),
-            },
-        )
+        .btql(query)
+        .source("bt_sql")
+        .lint_mode(lint_mode)
+        .send()
         .await
     {
         Ok(response) => Ok(response),
@@ -638,10 +635,7 @@ async fn submit_async_query(
     batch_size: Option<u64>,
 ) -> Result<SubmitAsyncQueryResponse> {
     let body = async_query_submit_body(query, batch_size);
-    let headers = client.org_headers();
-    client
-        .post_with_headers("/btql/async", &body, &headers)
-        .await
+    client.post("/btql/async").json(&body).send().await
 }
 
 async fn wait_for_async_query(
@@ -652,7 +646,9 @@ async fn wait_for_async_query(
     let started = Instant::now();
     loop {
         let status: AsyncQueryStatusResponse = client
-            .get_query_result(&format!("/btql/async/{}", encode(automation_id)))
+            .get(&format!("/btql/async/{}", encode(automation_id)))
+            .retry()
+            .send()
             .await?;
         if status.status.is_terminal() {
             return Ok(status);
@@ -674,42 +670,44 @@ async fn collect_async_query_result(
     automation_id: &str,
     args: &SqlArgs,
 ) -> Result<SqlResponse> {
-    let mut cursor = None;
-    let mut rows = Vec::new();
-    let mut pagination = Pagination::default();
-
-    loop {
-        let page = get_async_query_result_page(
-            client,
-            automation_id,
-            args.async_result_limit,
-            cursor.as_deref(),
-        )
+    let page_size =
+        usize::try_from(args.async_result_limit).context("async result page limit is too large")?;
+    let (rows, _) = Pagination::default()
+        .collect(None, page_size, |limit, cursor| async move {
+            loop {
+                let page: AsyncQueryResultPage = client
+                    .get(&async_query_result_path(
+                        automation_id,
+                        limit as u64,
+                        cursor.as_deref(),
+                    ))
+                    .retry()
+                    .send()
+                    .await?;
+                if page.status == AsyncQueryStatus::Queued {
+                    tokio::time::sleep(args.poll_interval).await;
+                    continue;
+                }
+                if matches!(
+                    page.status,
+                    AsyncQueryStatus::Failed | AsyncQueryStatus::Canceled
+                ) {
+                    bail!(
+                        "{}",
+                        page.error.unwrap_or_else(|| format!(
+                            "Async query {automation_id} {}",
+                            page.status
+                        ))
+                    );
+                }
+                return Ok(crate::http::BtqlResponse {
+                    data: page.rows,
+                    cursor: page.cursor,
+                    schema: None,
+                });
+            }
+        })
         .await?;
-
-        if page.status == AsyncQueryStatus::Queued {
-            tokio::time::sleep(args.poll_interval).await;
-            continue;
-        }
-
-        if matches!(
-            page.status,
-            AsyncQueryStatus::Failed | AsyncQueryStatus::Canceled
-        ) {
-            bail!(
-                "{}",
-                page.error
-                    .unwrap_or_else(|| format!("Async query {automation_id} {}", page.status))
-            );
-        }
-
-        pagination.check(cursor.as_deref())?;
-        rows.extend(page.rows);
-        cursor = page.cursor.filter(|cursor| !cursor.is_empty());
-        if cursor.is_none() {
-            break;
-        }
-    }
 
     Ok(SqlResponse {
         data: rows,
@@ -720,28 +718,6 @@ async fn collect_async_query_result(
         warnings: Vec::new(),
         extra: HashMap::new(),
     })
-}
-
-async fn get_async_query_result_page(
-    client: &ApiClient,
-    automation_id: &str,
-    limit: u64,
-    cursor: Option<&str>,
-) -> Result<AsyncQueryResultPage> {
-    client
-        .get_query_result(&async_query_result_path(automation_id, limit, cursor))
-        .await
-}
-
-#[cfg(test)]
-fn query_body(query: &str, lint_mode: &str) -> Value {
-    crate::http::btql::query_body(
-        query,
-        QueryOptions {
-            source: Some(QUERY_SOURCE),
-            lint_mode: Some(lint_mode),
-        },
-    )
 }
 
 fn async_query_submit_body(query: &str, batch_size: Option<u64>) -> SubmitAsyncQueryRequest<'_> {
@@ -1119,17 +1095,6 @@ mod tests {
     struct SqlArgsHarness {
         #[command(flatten)]
         args: SqlArgs,
-    }
-
-    #[test]
-    fn query_body_sets_lint_mode() {
-        let body = query_body("select 1", "strict");
-
-        assert_eq!(body["query"], "select 1");
-        assert_eq!(body["fmt"], "json");
-        assert_eq!(body["lint_mode"], "strict");
-        assert_eq!(body["strict_lint_mode"], true);
-        assert_eq!(body["query_source"], QUERY_SOURCE);
     }
 
     #[test]

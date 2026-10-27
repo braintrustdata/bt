@@ -1,6 +1,19 @@
+//! Authenticated API access. Use the same request builder for JSON endpoints
+//! and BTQL; headers, errors, decoding, and retries live here.
+//!
+//! ```ignore
+//! let project: Project = client.get("/v1/project/test-id").send().await?;
+//! let created: Project = client.post("/v1/project").json(&body).send().await?;
+//! let page: BtqlResponse<Row> = client.btql(&query).send().await?;
+//! let result: SqlResponse = client.btql(&sql).lint_mode("strict").send().await?;
+//! ```
 pub mod btql;
+pub use btql::Pagination;
 
+use backoff::{backoff::Backoff, ExponentialBackoffBuilder};
 use std::collections::HashMap;
+use std::future::Future;
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
 use reqwest::header::{HeaderValue, CONTENT_TYPE};
@@ -85,7 +98,7 @@ impl std::fmt::Display for ResponseParseError {
 
 impl std::error::Error for ResponseParseError {}
 
-pub(crate) async fn parse_json_response<T: DeserializeOwned>(
+async fn parse_json_response<T: DeserializeOwned>(
     response: reqwest::Response,
     method: &str,
     path: &str,
@@ -168,7 +181,7 @@ fn parse_response_error<T>(
 }
 
 #[derive(Debug, Serialize, Deserialize)]
-pub struct BtqlResponse<T> {
+pub struct BtqlResponse<T = serde_json::Map<String, serde_json::Value>> {
     pub data: Vec<T>,
     #[serde(default, deserialize_with = "btql::deserialize_cursor")]
     pub cursor: Option<String>,
@@ -210,162 +223,219 @@ impl ApiClient {
         &self.org_name
     }
 
-    async fn send_request<B: Serialize + ?Sized>(
-        &self,
-        method: Method,
-        path: &str,
-        body: Option<&B>,
-        headers: &[(&str, &str)],
-        timeout: Option<std::time::Duration>,
-    ) -> Result<reqwest::Response> {
-        let mut request = self
+    /// Start an authenticated HTTP request. Writes make one attempt; opt into
+    /// retries only for operations that are safe to repeat.
+    pub fn request(&self, method: Method, path: &str) -> Request {
+        let inner = self
             .http
             .request(method.clone(), self.url(path))
             .bearer_auth(&self.api_key);
-        if let Some(body) = body {
-            request = request.json(body);
+        let request = Request {
+            inner,
+            method,
+            path: path.to_owned(),
+            retry: false,
+            observer: None,
+            trace: None,
+        };
+        if self.org_name.is_empty() {
+            request
+        } else {
+            request.header("x-bt-org-name", &self.org_name)
         }
-        for (key, value) in headers {
-            request = request.header(*key, *value);
-        }
-        if let Some(timeout) = timeout {
-            request = request.timeout(timeout);
-        }
-        request
-            .send()
+    }
+
+    pub fn get(&self, path: &str) -> Request {
+        self.request(Method::GET, path)
+    }
+    pub fn post(&self, path: &str) -> Request {
+        self.request(Method::POST, path)
+    }
+    pub fn put(&self, path: &str) -> Request {
+        self.request(Method::PUT, path)
+    }
+    pub fn patch(&self, path: &str) -> Request {
+        self.request(Method::PATCH, path)
+    }
+    pub fn delete(&self, path: &str) -> Request {
+        self.request(Method::DELETE, path)
+    }
+}
+
+/// A JSON request with consistent authentication, response errors and decoding.
+/// Use `send` for JSON, `discard` when the response body is irrelevant, or
+/// `response` when headers or a text response are needed.
+pub struct Request {
+    inner: reqwest::RequestBuilder,
+    method: Method,
+    path: String,
+    retry: bool,
+    observer: Option<Box<dyn Fn(RetryReason) + Send + Sync>>,
+    trace: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RetryReason {
+    Status(u16),
+    Network,
+}
+
+const MAX_ATTEMPTS: usize = 5;
+const MAX_DELAY: Duration = Duration::from_secs(8);
+
+fn retry_reason(error: &anyhow::Error) -> Option<RetryReason> {
+    if let Some(error) = error.downcast_ref::<HttpError>() {
+        let status = error.status;
+        return (status.is_server_error()
+            || status == StatusCode::PAYLOAD_TOO_LARGE
+            || status == StatusCode::TOO_MANY_REQUESTS)
+            .then_some(RetryReason::Status(status.as_u16()));
+    }
+    error.downcast_ref::<reqwest::Error>().and_then(|error| {
+        (!error.is_builder()
+            && (error.is_connect() || error.is_timeout() || error.is_request() || error.is_body()))
+        .then_some(RetryReason::Network)
+    })
+}
+
+fn retry_delay(retry_after: Option<Duration>, backoff: &mut impl Backoff) -> Duration {
+    // Server rate-limit windows take precedence over the local backoff cap.
+    retry_after.unwrap_or_else(|| backoff.next_backoff().unwrap_or(MAX_DELAY).min(MAX_DELAY))
+}
+
+impl Request {
+    pub fn json<B: Serialize + ?Sized>(mut self, body: &B) -> Self {
+        self.inner = self.inner.json(body);
+        self
+    }
+    pub fn query<Q: Serialize + ?Sized>(mut self, params: &Q) -> Self {
+        self.inner = self.inner.query(params);
+        self
+    }
+    pub fn header(mut self, name: &str, value: &str) -> Self {
+        self.inner = self.inner.header(name, value);
+        self
+    }
+    pub fn timeout(mut self, timeout: Duration) -> Self {
+        self.inner = self.inner.timeout(timeout);
+        self
+    }
+    pub fn retry(mut self) -> Self {
+        self.retry = true;
+        self
+    }
+    pub fn on_retry(mut self, observer: impl Fn(RetryReason) + Send + Sync + 'static) -> Self {
+        self.observer = Some(Box::new(observer));
+        self
+    }
+    pub fn trace(mut self, enabled: bool, label: &str) -> Self {
+        self.trace = enabled.then(|| label.to_owned());
+        self
+    }
+
+    pub async fn send<T: DeserializeOwned>(self) -> Result<T> {
+        let (method, path) = (self.method.to_string(), self.path.clone());
+        self.execute(|response| parse_json_response(response, &method, &path))
             .await
-            .with_context(|| format!("{method} {path} request failed"))
     }
-
-    pub(crate) async fn checked_response(response: reqwest::Response) -> Result<reqwest::Response> {
-        if !response.status().is_success() {
-            return Err(response_error(response).await.into());
-        }
-        Ok(response)
+    pub async fn discard(self) -> Result<()> {
+        self.execute(|_| async { Ok(()) }).await
     }
-
-    pub async fn get<T: DeserializeOwned>(&self, path: &str) -> Result<T> {
-        self.get_with_headers(path, &[]).await
-    }
-
-    pub async fn get_with_headers<T: DeserializeOwned>(
-        &self,
-        path: &str,
-        headers: &[(&str, &str)],
-    ) -> Result<T> {
-        let response = self
-            .send_request::<()>(Method::GET, path, None, headers, None)
-            .await?;
-        parse_json_response(Self::checked_response(response).await?, "GET", path).await
-    }
-
-    async fn send_json<T: DeserializeOwned, B: Serialize>(
-        &self,
-        method: Method,
-        path: &str,
-        body: &B,
-    ) -> Result<T> {
-        let response = self
-            .send_request(method.clone(), path, Some(body), &[], None)
-            .await?;
-        parse_json_response(
-            Self::checked_response(response).await?,
-            method.as_str(),
+    pub async fn response(self) -> Result<Response> {
+        let (method, path) = (self.method.to_string(), self.path.clone());
+        let inner = self.execute(|response| async { Ok(response) }).await?;
+        Ok(Response {
+            inner,
+            method,
             path,
-        )
-        .await
+        })
     }
 
-    pub async fn post<T: DeserializeOwned, B: Serialize>(&self, path: &str, body: &B) -> Result<T> {
-        self.send_json(Method::POST, path, body).await
-    }
-
-    pub async fn put<T: DeserializeOwned, B: Serialize>(&self, path: &str, body: &B) -> Result<T> {
-        self.send_json(Method::PUT, path, body).await
-    }
-
-    pub async fn patch<T: DeserializeOwned, B: Serialize>(
-        &self,
-        path: &str,
-        body: &B,
-    ) -> Result<T> {
-        self.send_json(Method::PATCH, path, body).await
-    }
-
-    pub async fn post_with_headers<T, B>(
-        &self,
-        path: &str,
-        body: &B,
-        headers: &[(&str, &str)],
-    ) -> Result<T>
+    async fn execute<T, F, Fut>(self, decode: F) -> Result<T>
     where
-        T: DeserializeOwned,
-        B: Serialize,
+        F: Fn(reqwest::Response) -> Fut,
+        Fut: Future<Output = Result<T>>,
     {
-        self.post_with_headers_timeout(path, body, headers, None)
+        let started = Instant::now();
+        let mut backoff = ExponentialBackoffBuilder::new()
+            .with_initial_interval(Duration::from_millis(300))
+            .with_multiplier(2.0)
+            .with_randomization_factor(0.2)
+            .with_max_interval(MAX_DELAY)
+            .with_max_elapsed_time(None)
+            .build();
+        let attempts = if self.retry { MAX_ATTEMPTS } else { 1 };
+        let (client, request) = self.inner.build_split();
+        let request = request.context("failed to build API request")?;
+        let mut attempt = 0;
+        loop {
+            attempt += 1;
+            let request = request
+                .try_clone()
+                .context("request body cannot be replayed for retry")?;
+            let mut retry_after = None;
+            let result = async {
+                let response = client.execute(request).await?;
+                retry_after = response
+                    .headers()
+                    .get(reqwest::header::RETRY_AFTER)
+                    .and_then(|value| value.to_str().ok())
+                    .and_then(|value| value.parse::<u64>().ok())
+                    .map(Duration::from_secs);
+                if !response.status().is_success() {
+                    return Err(response_error(response).await.into());
+                }
+                decode(response).await
+            }
+            .await;
+            if let Err(error) = &result {
+                if attempt < attempts {
+                    if let Some(reason) = retry_reason(error) {
+                        if let Some(observer) = &self.observer {
+                            observer(reason);
+                        }
+                        tokio::time::sleep(retry_delay(retry_after, &mut backoff)).await;
+                        continue;
+                    }
+                }
+            }
+            if let Some(label) = &self.trace {
+                eprintln!(
+                    "{label}: {} {} {}ms {}",
+                    self.method,
+                    self.path,
+                    started.elapsed().as_millis(),
+                    if result.is_ok() { "ok" } else { "failed" }
+                );
+            }
+            return result.map_err(|error| {
+                let message = format!(
+                    "{} {} failed after {attempt} attempt(s): {error}",
+                    self.method, self.path
+                );
+                error.context(message)
+            });
+        }
+    }
+}
+
+pub struct Response {
+    inner: reqwest::Response,
+    method: String,
+    path: String,
+}
+impl Response {
+    pub fn headers(&self) -> &reqwest::header::HeaderMap {
+        self.inner.headers()
+    }
+    pub async fn json<T: DeserializeOwned>(self) -> Result<T> {
+        parse_json_response(self.inner, &self.method, &self.path).await
+    }
+    pub async fn text(self) -> Result<String> {
+        self.inner
+            .text()
             .await
-    }
-
-    pub async fn post_with_headers_timeout<T, B>(
-        &self,
-        path: &str,
-        body: &B,
-        headers: &[(&str, &str)],
-        timeout: Option<std::time::Duration>,
-    ) -> Result<T>
-    where
-        T: DeserializeOwned,
-        B: Serialize,
-    {
-        let response = self
-            .send_request(Method::POST, path, Some(body), headers, timeout)
-            .await?;
-        parse_json_response(Self::checked_response(response).await?, "POST", path).await
-    }
-
-    pub async fn post_with_headers_raw<B: Serialize>(
-        &self,
-        path: &str,
-        body: &B,
-        headers: &[(&str, &str)],
-    ) -> Result<reqwest::Response> {
-        self.send_request(Method::POST, path, Some(body), headers, None)
-            .await
-    }
-
-    async fn send_delete(&self, path: &str) -> Result<reqwest::Response> {
-        let response = self
-            .send_request::<()>(Method::DELETE, path, None, &[], None)
-            .await?;
-        Self::checked_response(response).await
-    }
-
-    pub async fn delete(&self, path: &str) -> Result<()> {
-        self.send_delete(path).await.map(|_| ())
-    }
-
-    pub async fn delete_with_response<T: DeserializeOwned>(&self, path: &str) -> Result<T> {
-        parse_json_response(self.send_delete(path).await?, "DELETE", path).await
-    }
-
-    pub async fn btql<T: DeserializeOwned>(&self, query: &str) -> Result<BtqlResponse<T>> {
-        self.btql_with_query(query).await
-    }
-
-    pub async fn btql_structured<T, Q>(&self, query: &Q) -> Result<BtqlResponse<T>>
-    where
-        T: DeserializeOwned,
-        Q: Serialize + ?Sized,
-    {
-        self.btql_with_query(query).await
-    }
-
-    async fn btql_with_query<T, Q>(&self, query: &Q) -> Result<BtqlResponse<T>>
-    where
-        T: DeserializeOwned,
-        Q: Serialize + ?Sized,
-    {
-        self.query(query, btql::QueryOptions::default()).await
+            .context("failed to read response body")
     }
 }
 

@@ -19,12 +19,9 @@ use sha2::{Digest, Sha256};
 use urlencoding::encode;
 
 use crate::args::BaseArgs;
-use crate::auth::{login, LoginContext};
+use crate::auth::login;
 use crate::experiments::api::create_experiment;
-use crate::http::{
-    btql::{Pagination, QueryOptions, RetryReason, SYNC_QUERY_SOURCE},
-    ApiClient,
-};
+use crate::http::{ApiClient, BtqlResponse, Pagination, RetryReason};
 use crate::projects::api::{create_project, list_projects, Project};
 use crate::ui::{animations_enabled, fuzzy_select, is_quiet};
 use crate::utils::{app_project_url, parse_duration_to_seconds, write_json_atomic};
@@ -400,8 +397,6 @@ struct PushState {
     completed_at: Option<u64>,
 }
 
-type BtqlResponse = crate::http::BtqlResponse<Map<String, Value>>;
-
 #[derive(Debug, Clone, Deserialize)]
 struct NamedObject {
     id: String,
@@ -497,6 +492,14 @@ struct BtqlRetryTracker {
 }
 
 impl BtqlRetryTracker {
+    fn observer(self: &Arc<Self>) -> impl Fn(RetryReason) + Send + Sync + 'static {
+        let tracker = Arc::clone(self);
+        move |reason| match reason {
+            RetryReason::Status(status) => tracker.record_status(status),
+            RetryReason::Network => tracker.record_network(),
+        }
+    }
+
     fn record_status(&self, status_code: u16) {
         self.record(format!("{status_code}"));
     }
@@ -586,12 +589,11 @@ pub async fn run(base: BaseArgs, args: SyncArgs) -> Result<()> {
     match command {
         SyncCommand::Pull(pull) => {
             let verbose = base.verbose_explicit();
-            run_pull(base.json, verbose, &ctx, &client, project.as_deref(), pull).await
+            run_pull(base.json, verbose, &client, project.as_deref(), pull).await
         }
         SyncCommand::Push(push) => {
             run_push(
                 base.json,
-                &ctx,
                 &client,
                 &app_public_url,
                 project.as_deref(),
@@ -615,7 +617,6 @@ pub(crate) async fn push_jsonl_file(base: BaseArgs, args: SyncPushFileArgs) -> R
 
     run_push(
         json_output,
-        &ctx,
         &client,
         &app_public_url,
         project.as_deref(),
@@ -639,7 +640,6 @@ pub(crate) async fn push_jsonl_file(base: BaseArgs, args: SyncPushFileArgs) -> R
 async fn run_pull(
     json_output: bool,
     verbose: bool,
-    ctx: &LoginContext,
     client: &ApiClient,
     project_selector: Option<&str>,
     args: PullArgs,
@@ -793,7 +793,6 @@ async fn run_pull(
         ScopeArg::Spans => {
             pull_spans_mode(
                 client,
-                ctx,
                 &source_expr,
                 &spec,
                 &output_path,
@@ -810,7 +809,6 @@ async fn run_pull(
         ScopeArg::Traces => {
             pull_traces_mode(
                 client,
-                ctx,
                 &source_expr,
                 &spec,
                 &output_path,
@@ -842,7 +840,7 @@ async fn run_pull(
     )?;
 
     if json_output {
-        let org_name = ctx.login.org_name().unwrap_or_default();
+        let org_name = client.org_name().to_owned();
         let warning = if state.items_done == 0 {
             Some(format!(
                 "no rows found for {} in org '{}'; verify object id and active credentials",
@@ -878,7 +876,7 @@ async fn run_pull(
         let spans_per_sec = spans_done as f64 / elapsed_secs as f64;
         let bytes_per_sec = state.bytes_written as f64 / elapsed_secs as f64;
         if state.items_done == 0 {
-            let org_name = ctx.login.org_name().unwrap_or_default();
+            let org_name = client.org_name().to_owned();
             let org_label = if org_name.trim().is_empty() {
                 "(default)".to_string()
             } else {
@@ -916,7 +914,6 @@ async fn run_pull(
 #[allow(clippy::too_many_arguments)]
 async fn pull_spans_mode(
     client: &ApiClient,
-    ctx: &LoginContext,
     source_expr: &str,
     spec: &SyncSpec,
     output_dir: &Path,
@@ -954,15 +951,8 @@ async fn pull_spans_mode(
     let mut seen_roots: HashSet<String> = state.root_ids.iter().cloned().collect();
     let vector_specs = if include_vectors {
         Some(Arc::new(
-            discover_vector_specs_global(
-                client,
-                ctx,
-                source_expr,
-                filter,
-                btql_retry_tracker,
-                verbose,
-            )
-            .await?,
+            discover_vector_specs_global(client, source_expr, filter, btql_retry_tracker, verbose)
+                .await?,
         ))
     } else {
         None
@@ -975,15 +965,13 @@ async fn pull_spans_mode(
         pagination.check(state.cursor.as_deref())?;
         let batch_limit = (limit - state.items_done).min(spec.page_size);
         let query = build_spans_query(source_expr, filter, batch_limit, state.cursor.as_deref());
-        let BtqlResponse { data, cursor, .. } = execute_btql_query_timed(
-            client,
-            ctx,
-            &query,
-            Some(Arc::clone(btql_retry_tracker)),
-            verbose,
-            "spans",
-        )
-        .await?;
+        let BtqlResponse { data, cursor, .. } = client
+            .btql(&query)
+            .source("bt_sync")
+            .on_retry(btql_retry_tracker.observer())
+            .trace(verbose, "spans")
+            .send::<BtqlResponse>()
+            .await?;
         let mut rows = data;
         let batch_count = rows.len();
 
@@ -995,7 +983,6 @@ async fn pull_spans_mode(
         if let Some(specs) = vector_specs.as_deref() {
             enrich_rows_with_vectors(
                 client,
-                ctx,
                 source_expr,
                 filter,
                 &mut rows,
@@ -1018,7 +1005,7 @@ async fn pull_spans_mode(
 
         state.items_done += batch_count;
         state.pages_done += 1;
-        state.cursor = cursor.filter(|c| !c.is_empty());
+        state.cursor = cursor;
         state.updated_at = epoch_seconds();
 
         write_json_atomic(state_path, state)?;
@@ -1056,7 +1043,6 @@ async fn pull_spans_mode(
 #[allow(clippy::too_many_arguments)]
 async fn pull_traces_mode(
     client: &ApiClient,
-    ctx: &LoginContext,
     source_expr: &str,
     spec: &SyncSpec,
     output_dir: &Path,
@@ -1121,7 +1107,6 @@ async fn pull_traces_mode(
         Some(Arc::new(
             discover_vector_specs_global(
                 client,
-                ctx,
                 source_expr,
                 discovery_filter.as_deref(),
                 btql_retry_tracker,
@@ -1135,7 +1120,6 @@ async fn pull_traces_mode(
 
     for _ in 0..worker_count {
         let client = client.clone();
-        let ctx = ctx.clone();
         let source_expr = source_expr.to_string();
         let state_path = state_path.to_path_buf();
         let shared_state = Arc::clone(&shared_state);
@@ -1167,7 +1151,6 @@ async fn pull_traces_mode(
 
                 let result = process_trace_chunk(
                     &client,
-                    &ctx,
                     &source_expr,
                     fetch_filter.as_deref(),
                     vector_filter.as_deref(),
@@ -1215,15 +1198,13 @@ async fn pull_traces_mode(
                 page_limit,
                 discovery_cursor.as_deref(),
             );
-            let response = execute_btql_query_timed(
-                client,
-                ctx,
-                &query,
-                Some(Arc::clone(btql_retry_tracker)),
-                verbose,
-                "discover_roots",
-            )
-            .await?;
+            let response = client
+                .btql(&query)
+                .source("bt_sync")
+                .on_retry(btql_retry_tracker.observer())
+                .trace(verbose, "discover_roots")
+                .send::<BtqlResponse>()
+                .await?;
             let row_count = response.data.len();
 
             let new_chunks;
@@ -1241,7 +1222,7 @@ async fn pull_traces_mode(
                 }
 
                 shared.pages_done += 1;
-                discovery_cursor = response.cursor.filter(|c| !c.is_empty());
+                discovery_cursor = response.cursor;
                 shared.root_discovery_cursor = discovery_cursor.clone();
                 new_chunks = append_trace_chunks(&mut shared, ROOT_FETCH_CHUNK_SIZE, false);
                 shared.updated_at = epoch_seconds();
@@ -1474,7 +1455,6 @@ fn trace_progress_roots_from_state(state: &PullState) -> HashSet<String> {
 #[allow(clippy::too_many_arguments)]
 async fn process_trace_chunk(
     client: &ApiClient,
-    ctx: &LoginContext,
     source_expr: &str,
     fetch_filter: Option<&str>,
     vector_filter: Option<&str>,
@@ -1519,23 +1499,20 @@ async fn process_trace_chunk(
             page_size,
             cursor.as_deref(),
         );
-        let BtqlResponse { data, cursor, .. } = execute_btql_query_timed(
-            client,
-            ctx,
-            &query,
-            Some(Arc::clone(btql_retry_tracker)),
-            verbose,
-            "fetch_roots",
-        )
-        .await?;
+        let BtqlResponse { data, cursor, .. } = client
+            .btql(&query)
+            .source("bt_sync")
+            .on_retry(btql_retry_tracker.observer())
+            .trace(verbose, "fetch_roots")
+            .send::<BtqlResponse>()
+            .await?;
         let mut rows = data;
         let batch_count = rows.len();
-        let next_cursor = cursor.filter(|c| !c.is_empty());
+        let next_cursor = cursor;
 
         if let Some(specs) = vector_specs.as_deref() {
             enrich_rows_with_vectors(
                 client,
-                ctx,
                 source_expr,
                 vector_filter,
                 &mut rows,
@@ -1659,7 +1636,6 @@ async fn process_trace_chunk(
 
 async fn run_push(
     json_output: bool,
-    ctx: &LoginContext,
     client: &ApiClient,
     app_public_url: &str,
     project_selector: Option<&str>,
@@ -1790,13 +1766,9 @@ async fn run_push(
     });
 
     let uploader_template = Logs3BatchUploader::new(
-        ctx.api_url.clone(),
-        ctx.login
-            .api_key()
-            .context("login state missing API key for sync uploader")?,
-        ctx.login
-            .org_name()
-            .filter(|org_name| !org_name.trim().is_empty()),
+        client.base_url(),
+        client.api_key().to_owned(),
+        (!client.org_name().trim().is_empty()).then(|| client.org_name().to_owned()),
     )
     .context("failed to initialize logs3 uploader")?;
 
@@ -2248,90 +2220,9 @@ fn run_status(json_output: bool, args: StatusArgs) -> Result<()> {
     Ok(())
 }
 
-async fn execute_btql_request<Q, T>(
-    client: &ApiClient,
-    _ctx: &LoginContext,
-    query: &Q,
-    query_source: &str,
-    btql_retry_tracker: Option<Arc<BtqlRetryTracker>>,
-) -> Result<T>
-where
-    Q: Serialize + ?Sized,
-    T: DeserializeOwned,
-{
-    client
-        .query_with_retry_observer(
-            query,
-            QueryOptions {
-                source: Some(query_source),
-                lint_mode: None,
-            },
-            |reason| {
-                if let Some(tracker) = btql_retry_tracker.as_ref() {
-                    match reason {
-                        RetryReason::Status(status) => tracker.record_status(status),
-                        RetryReason::Network => tracker.record_network(),
-                    }
-                }
-            },
-        )
-        .await
-}
-
-async fn execute_btql_query(
-    client: &ApiClient,
-    ctx: &LoginContext,
-    query: &str,
-    btql_retry_tracker: Option<Arc<BtqlRetryTracker>>,
-) -> Result<BtqlResponse> {
-    execute_btql_request(client, ctx, query, SYNC_QUERY_SOURCE, btql_retry_tracker).await
-}
-
-async fn execute_btql_json_query<T: DeserializeOwned>(
-    client: &ApiClient,
-    ctx: &LoginContext,
-    query: &Value,
-    query_source: &str,
-) -> Result<T> {
-    execute_btql_request(client, ctx, query, query_source, None).await
-}
-
-async fn execute_btql_query_timed(
-    client: &ApiClient,
-    ctx: &LoginContext,
-    query: &str,
-    btql_retry_tracker: Option<Arc<BtqlRetryTracker>>,
-    verbose: bool,
-    label: &str,
-) -> Result<BtqlResponse> {
-    if !verbose {
-        return execute_btql_query(client, ctx, query, btql_retry_tracker).await;
-    }
-    let start = Instant::now();
-    eprintln!("btql[{label}] query:\n{query}\n");
-    let result = execute_btql_query(client, ctx, query, btql_retry_tracker).await;
-    let elapsed_ms = start.elapsed().as_millis();
-    match &result {
-        Ok(response) => {
-            let row_count = response.data.len();
-            let cursor = if response.cursor.as_deref().unwrap_or("").is_empty() {
-                "none"
-            } else {
-                "set"
-            };
-            eprintln!("btql[{label}] {elapsed_ms}ms rows={row_count} cursor={cursor}");
-        }
-        Err(err) => {
-            eprintln!("btql[{label}] {elapsed_ms}ms error={err}");
-        }
-    }
-    result
-}
-
 #[allow(clippy::too_many_arguments)]
 async fn enrich_rows_with_vectors(
     client: &ApiClient,
-    ctx: &LoginContext,
     source_expr: &str,
     filter: Option<&str>,
     rows: &mut [Map<String, Value>],
@@ -2348,7 +2239,6 @@ async fn enrich_rows_with_vectors(
 
     let fetched_rows = fetch_vector_columns_for_rows(
         client,
-        ctx,
         source_expr,
         filter,
         rows,
@@ -2410,7 +2300,6 @@ async fn enrich_rows_with_vectors(
 
 async fn discover_vector_specs_global(
     client: &ApiClient,
-    ctx: &LoginContext,
     source_expr: &str,
     filter: Option<&str>,
     btql_retry_tracker: &Arc<BtqlRetryTracker>,
@@ -2423,15 +2312,13 @@ async fn discover_vector_specs_global(
         "limit: 1".to_string(),
     ]
     .join(" | ");
-    let response = execute_btql_query_timed(
-        client,
-        ctx,
-        &query,
-        Some(Arc::clone(btql_retry_tracker)),
-        verbose,
-        "vector_models",
-    )
-    .await?;
+    let response = client
+        .btql(&query)
+        .source("bt_sync")
+        .on_retry(btql_retry_tracker.observer())
+        .trace(verbose, "vector_models")
+        .send::<BtqlResponse>()
+        .await?;
 
     let mut specs = Vec::new();
     let Some(row) = response.data.first() else {
@@ -2485,7 +2372,6 @@ async fn discover_vector_specs_global(
 #[allow(clippy::too_many_arguments)]
 async fn fetch_vector_columns_for_rows(
     client: &ApiClient,
-    ctx: &LoginContext,
     source_expr: &str,
     filter: Option<&str>,
     rows: &[Map<String, Value>],
@@ -2538,15 +2424,13 @@ async fn fetch_vector_columns_for_rows(
         select_columns.join(", "),
         id_literals.len().max(1)
     );
-    let response = execute_btql_query_timed(
-        client,
-        ctx,
-        &query,
-        Some(Arc::clone(btql_retry_tracker)),
-        verbose,
-        "vector_rows",
-    )
-    .await?;
+    let response = client
+        .btql(&query)
+        .source("bt_sync")
+        .on_retry(btql_retry_tracker.observer())
+        .trace(verbose, "vector_rows")
+        .send::<BtqlResponse>()
+        .await?;
 
     let mut by_xact = BTreeMap::new();
     for row in response.data {
@@ -3500,7 +3384,7 @@ async fn create_dataset(
         "project_id": project_id,
         "org_name": client.org_name(),
     });
-    client.post("/v1/dataset", &body).await
+    client.post("/v1/dataset").json(&body).send().await
 }
 
 async fn list_project_named_objects(
@@ -3514,7 +3398,7 @@ async fn list_project_named_objects(
         encode(client.org_name()),
         encode(project_id)
     );
-    let response: NamedObjectListResponse = client.get(&path).await?;
+    let response: NamedObjectListResponse = client.get(&path).send().await?;
     Ok(response.objects)
 }
 

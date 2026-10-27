@@ -38,3 +38,5 @@
 - Keep progress indicators on stderr and machine-readable output on stdout.
 - Prefer actionable errors with exact command hints where possible, and add `anyhow::Context` when it improves user-facing debugging.
 - For API helpers, follow existing list/get conventions: `ListResponse { objects }`, `get_by_* -> Option<T>`, and URL-encoded query params.
+- Use the shared `ApiClient` builders for authenticated Braintrust requests: `get(path).send()`, `post(path).json(body).send()`, and `btql(query).send()`. Set headers, timeouts, retries, and BTQL options on the builder; keep request construction, status handling, and JSON decoding in the shared client.
+- Use `Pagination::collect` for in-memory paginated reads. Streaming or checkpointed consumers should use its cursor guard while retaining their per-page processing.

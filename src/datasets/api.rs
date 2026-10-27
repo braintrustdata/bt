@@ -4,7 +4,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Map, Value};
 use urlencoding::encode;
 
-use crate::http::ApiClient;
+use crate::http::{ApiClient, BtqlResponse, Pagination};
 
 use super::records::DATASET_RECORD_FIELDS;
 
@@ -129,7 +129,7 @@ pub async fn list_datasets(client: &ApiClient, project_id: &str) -> Result<Vec<D
         encode(client.org_name()),
         encode(project_id)
     );
-    let list: ListResponse = client.get(&path).await?;
+    let list: ListResponse = client.get(&path).send().await?;
     Ok(list.objects)
 }
 
@@ -148,69 +148,24 @@ pub async fn list_dataset_rows_limited(
     max_rows: Option<usize>,
     preview_length: DatasetRowsPreviewLength,
 ) -> Result<(Vec<DatasetRow>, bool)> {
-    if matches!(max_rows, Some(0)) {
-        return Ok((Vec::new(), false));
-    }
-
-    let mut rows = Vec::new();
-    let mut cursor: Option<String> = None;
-    let mut pagination = crate::http::btql::Pagination::with_max_pages(10_000);
-    let mut truncated = false;
-
-    loop {
-        let Some(page_limit) = resolve_dataset_rows_page_limit(max_rows, rows.len()) else {
-            truncated = true;
-            break;
-        };
-
-        pagination
-            .check(cursor.as_deref())
-            .with_context(|| format!("failed to paginate dataset '{dataset_id}'"))?;
-
-        let query =
-            build_dataset_rows_query(dataset_id, page_limit, cursor.as_deref(), preview_length);
-        let response = client.btql_structured::<DatasetRow, _>(&query).await?;
-
-        let next_cursor = response.cursor.filter(|cursor| !cursor.is_empty());
-
-        if response.data.is_empty() {
-            if next_cursor.is_some() {
-                bail!(
-                    "dataset rows response for '{}' returned an empty page with a cursor",
-                    dataset_id
-                );
-            }
-            break;
-        }
-
-        if let Some(max_rows) = max_rows {
-            let remaining = max_rows.saturating_sub(rows.len());
-            if remaining == 0 {
-                truncated = true;
-                break;
-            }
-            if response.data.len() > remaining {
-                rows.extend(response.data.into_iter().take(remaining));
-                truncated = true;
-                break;
-            }
-        }
-
-        rows.extend(response.data);
-
-        match next_cursor {
-            Some(next_cursor) => {
-                if max_rows.is_some_and(|max_rows| rows.len() >= max_rows) {
-                    truncated = true;
-                    break;
-                }
-                cursor = Some(next_cursor);
-            }
-            None => break,
-        }
-    }
-
-    Ok((rows, truncated))
+    Pagination::with_max_pages(10_000)
+        .collect(
+            max_rows,
+            MAX_DATASET_ROWS_PAGE_LIMIT,
+            |limit, cursor| async move {
+                client
+                    .btql(&build_dataset_rows_query(
+                        dataset_id,
+                        limit,
+                        cursor.as_deref(),
+                        preview_length,
+                    ))
+                    .send()
+                    .await
+            },
+        )
+        .await
+        .with_context(|| format!("failed to paginate dataset '{dataset_id}'"))
 }
 
 pub async fn get_dataset_row_by_id(
@@ -219,7 +174,7 @@ pub async fn get_dataset_row_by_id(
     row_id: &str,
 ) -> Result<Option<DatasetRow>> {
     let query = build_dataset_row_by_id_query(dataset_id, row_id, DatasetRowsPreviewLength::Full);
-    let response = client.btql_structured::<DatasetRow, _>(&query).await?;
+    let response: BtqlResponse<DatasetRow> = client.btql(&query).send().await?;
     Ok(response.data.into_iter().next())
 }
 
@@ -250,12 +205,12 @@ pub async fn create_dataset_with_metadata(
     if let Some(metadata) = metadata {
         body["metadata"] = metadata.clone();
     }
-    client.post("/v1/dataset", &body).await
+    client.post("/v1/dataset").json(&body).send().await
 }
 
 pub async fn delete_dataset(client: &ApiClient, dataset_id: &str) -> Result<()> {
     let path = format!("/v1/dataset/{}", encode(dataset_id));
-    client.delete(&path).await
+    client.delete(&path).discard().await
 }
 
 pub async fn list_dataset_snapshots(
@@ -263,7 +218,7 @@ pub async fn list_dataset_snapshots(
     dataset_id: &str,
 ) -> Result<Vec<DatasetSnapshot>> {
     let path = format!("/v1/dataset_snapshot?dataset_id={}", encode(dataset_id));
-    let list: ListResponseGeneric<DatasetSnapshot> = client.get(&path).await?;
+    let list: ListResponseGeneric<DatasetSnapshot> = client.get(&path).send().await?;
     Ok(list.objects)
 }
 
@@ -283,13 +238,13 @@ pub async fn create_dataset_snapshot(
         body["description"] = Value::String(description.to_string());
     }
     let response = client
-        .post_with_headers_raw("/v1/dataset_snapshot", &body, &[])
+        .post("/v1/dataset_snapshot")
+        .json(&body)
+        .response()
         .await?;
-    let response = ApiClient::checked_response(response).await?;
 
     let found_existing = found_existing_snapshot_header(response.headers());
-    let dataset_snapshot =
-        crate::http::parse_json_response(response, "POST", "/v1/dataset_snapshot").await?;
+    let dataset_snapshot = response.json().await?;
     Ok(CreateDatasetSnapshotResult {
         dataset_snapshot,
         found_existing,
@@ -298,7 +253,7 @@ pub async fn create_dataset_snapshot(
 
 pub async fn delete_dataset_snapshot(client: &ApiClient, snapshot_id: &str) -> Result<()> {
     let path = format!("/v1/dataset_snapshot/{}", encode(snapshot_id));
-    client.delete(&path).await
+    client.delete(&path).discard().await
 }
 
 pub async fn preview_dataset_restore(
@@ -308,7 +263,9 @@ pub async fn preview_dataset_restore(
 ) -> Result<DatasetRestorePreview> {
     let path = format!("/v1/dataset/{}/restore/preview", encode(dataset_id));
     client
-        .post(&path, &serde_json::json!({ "version": xact_id }))
+        .post(&path)
+        .json(&serde_json::json!({ "version": xact_id }))
+        .send()
         .await
 }
 
@@ -319,9 +276,10 @@ pub async fn restore_dataset(
 ) -> Result<DatasetRestoreResult> {
     let path = format!("/v1/dataset/{}/restore", encode(dataset_id));
     let response = client
-        .post_with_headers_raw(&path, &serde_json::json!({ "version": xact_id }), &[])
+        .post(&path)
+        .json(&serde_json::json!({ "version": xact_id }))
+        .response()
         .await?;
-    let response = ApiClient::checked_response(response).await?;
 
     let body = response
         .text()
@@ -335,29 +293,13 @@ pub async fn get_dataset_head_xact_id(
     dataset_id: &str,
 ) -> Result<Option<String>> {
     let query = build_dataset_head_xact_query(dataset_id);
-    let response = client
-        .btql_structured::<DatasetHeadXactRow, _>(&query)
-        .await?;
+    let response: BtqlResponse<DatasetHeadXactRow> = client.btql(&query).send().await?;
     let head = response.data.into_iter().find_map(|row| {
         row.xact_id
             .map(|value| value.trim().to_string())
             .filter(|value| !value.is_empty())
     });
     Ok(head)
-}
-
-fn resolve_dataset_rows_page_limit(max_rows: Option<usize>, loaded_rows: usize) -> Option<usize> {
-    match max_rows {
-        None => Some(MAX_DATASET_ROWS_PAGE_LIMIT),
-        Some(max_rows) => {
-            let remaining = max_rows.saturating_sub(loaded_rows);
-            if remaining == 0 {
-                None
-            } else {
-                Some(remaining.min(MAX_DATASET_ROWS_PAGE_LIMIT))
-            }
-        }
-    }
 }
 
 fn build_dataset_rows_query(
@@ -725,25 +667,6 @@ mod tests {
             error.to_string(),
             "restore to xact '1000192656880881099' changed rows (1 restored, 0 deleted) but the response did not include a result xact"
         );
-    }
-
-    #[test]
-    fn dataset_rows_page_limit_defaults_to_api_max() {
-        assert_eq!(
-            resolve_dataset_rows_page_limit(None, 0),
-            Some(MAX_DATASET_ROWS_PAGE_LIMIT)
-        );
-    }
-
-    #[test]
-    fn dataset_rows_page_limit_caps_to_remaining() {
-        assert_eq!(resolve_dataset_rows_page_limit(Some(200), 0), Some(200));
-        assert_eq!(resolve_dataset_rows_page_limit(Some(1500), 600), Some(900));
-    }
-
-    #[test]
-    fn dataset_rows_page_limit_stops_when_limit_reached() {
-        assert_eq!(resolve_dataset_rows_page_limit(Some(200), 200), None);
     }
 
     #[test]
