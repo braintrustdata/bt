@@ -18,6 +18,12 @@ pub struct StatusArgs {
     /// Include all saved login profiles and their connection status
     #[arg(long)]
     all: bool,
+
+    // Populated from clap's value provenance, not from a second argv parser.
+    #[arg(skip)]
+    pub(crate) cli_org: Option<String>,
+    #[arg(skip)]
+    pub(crate) cli_project: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -70,11 +76,9 @@ pub async fn run(base: BaseArgs, args: StatusArgs) -> Result<()> {
         .map(|p| config::load_file(p))
         .unwrap_or_default();
 
-    let cli_org = cli_flag_value(&["--org", "-o"]);
-    let cli_project = cli_flag_value(&["--project", "-p"]);
     let (mut org, mut project, source) = resolve_config(
-        cli_org,
-        cli_project,
+        args.cli_org,
+        args.cli_project,
         &global_cfg,
         &local_cfg,
         &local_path,
@@ -270,32 +274,6 @@ pub(crate) fn resolve_config(
     };
 
     (org, project, source)
-}
-
-fn cli_flag_value(flags: &[&str]) -> Option<String> {
-    let args: Vec<String> = std::env::args().collect();
-    for (i, arg) in args.iter().enumerate() {
-        if arg == "--" {
-            break;
-        }
-        for flag in flags {
-            if arg == *flag {
-                return args.get(i + 1).cloned();
-            }
-            if let Some(val) = arg.strip_prefix(&format!("{flag}=")) {
-                return Some(val.to_string());
-            }
-            // Handle -oVALUE style (short flags only)
-            if flag.len() == 2 && flag.starts_with('-') {
-                if let Some(val) = arg.strip_prefix(flag) {
-                    if !val.is_empty() {
-                        return Some(val.to_string());
-                    }
-                }
-            }
-        }
-    }
-    None
 }
 
 #[cfg(test)]

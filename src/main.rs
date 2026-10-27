@@ -358,6 +358,14 @@ fn try_main() -> Result<()> {
 
     let matches = Cli::command().get_matches_from(&argv);
     let mut cli = Cli::from_arg_matches(&matches).expect("clap matches should parse");
+    if let Commands::Status(cmd) = &mut cli.command {
+        if find_value_source(&matches, "org_name") == Some(ValueSource::CommandLine) {
+            cmd.args.cli_org = cmd.base.org_name.clone();
+        }
+        if find_value_source(&matches, "project") == Some(ValueSource::CommandLine) {
+            cmd.args.cli_project = cmd.base.project.clone();
+        }
+    }
     apply_base_arg_sources(&matches, cli.command.base_mut());
     cli.command.base_mut().profile_explicit = has_explicit_profile_arg(&argv);
     apply_base_output_defaults(&mut cli.command);
