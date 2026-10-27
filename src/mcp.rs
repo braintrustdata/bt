@@ -1,6 +1,7 @@
 use std::{
     collections::{BTreeMap, BTreeSet},
     ffi::OsString,
+    io::Read,
 };
 
 use anyhow::{anyhow, bail, Context, Result};
@@ -128,7 +129,7 @@ fn normalize_global_args(argv: &[OsString], args: &[Arg]) -> Vec<OsString> {
     normalized
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 struct Tool {
     name: String,
     #[serde(default)]
@@ -226,16 +227,30 @@ async fn run(argv: &[std::ffi::OsString]) -> Result<()> {
     client.initialize().await?;
     let tools = client.list_tools().await?;
 
-    let mut mcp = Command::new("mcp")
-        .about("Run tools exposed by the Braintrust MCP server")
+    let mut run = Command::new("run")
+        .about("Run a tool exposed by the Braintrust MCP server")
         .subcommand_required(true)
-        .arg_required_else_help(true);
+        .arg_required_else_help(true)
+        .arg(
+            Arg::new("mcp_json_args")
+                .long("args")
+                .global(true)
+                .value_name("JSON|@FILE|-")
+                .help("Pass tool arguments as JSON, read JSON from @FILE, or read it from stdin with -"),
+        );
     let mut input_maps = BTreeMap::new();
     for (index, tool) in tools.iter().enumerate() {
         let (tool_command, arg_map) = tool_command(tool, index)?;
         input_maps.insert(tool.name.clone(), arg_map);
-        mcp = mcp.subcommand(tool_command);
+        run = run.subcommand(tool_command);
     }
+    let list = Command::new("list").about("List tools exposed by the Braintrust MCP server");
+    let mcp = Command::new("mcp")
+        .about("Discover and run tools exposed by the Braintrust MCP server")
+        .subcommand_required(true)
+        .arg_required_else_help(true)
+        .subcommand(list)
+        .subcommand(run);
     let mut command = Command::new("bt")
         .version(crate::CLI_VERSION)
         .subcommand(mcp);
@@ -246,16 +261,39 @@ async fn run(argv: &[std::ffi::OsString]) -> Result<()> {
         return Ok(());
     };
     let base = BaseArgs::from_arg_matches(&matches).context("failed to parse global options")?;
-    let Some((tool_name, tool_matches)) = matches
+    let Some((mcp_subcommand, mcp_matches)) = matches
         .subcommand_matches("mcp")
         .and_then(ArgMatches::subcommand)
     else {
         return Ok(());
     };
+    if mcp_subcommand == "list" {
+        print_tool_list(&tools, base.json)?;
+        return Ok(());
+    }
+    if mcp_subcommand != "run" {
+        bail!("unknown MCP command `{mcp_subcommand}`");
+    }
+    let run_matches = mcp_matches;
+    let Some((tool_name, tool_matches)) = run_matches.subcommand() else {
+        return Ok(());
+    };
     let arg_map = input_maps
         .get(tool_name)
         .context("tool arguments unavailable")?;
-    let arguments = arguments_from_matches(tool_matches, arg_map)?;
+    let tool = tools
+        .iter()
+        .find(|tool| tool.name == tool_name)
+        .context("tool schema unavailable")?;
+    let arguments = if let Some(raw) = run_matches.get_one::<String>("mcp_json_args") {
+        let value = read_json_arguments(raw)?;
+        validate_json_arguments(&value, tool)?;
+        value
+    } else {
+        let value = arguments_from_matches(tool_matches, arg_map)?;
+        validate_json_arguments(&value, tool)?;
+        value
+    };
     let result = client.call_tool(tool_name, arguments).await?;
     let output = format_tool_result(&result, base.json)?;
     if !output.is_empty() {
@@ -317,7 +355,13 @@ fn tool_command(tool: &Tool, tool_index: usize) -> Result<(Command, ToolArgument
     let mut flags = BTreeSet::new();
     for (field_index, (name, schema)) in properties.iter().enumerate() {
         let id = format!("mcp_{tool_index}_{field_index}");
-        let flag = name.replace('_', "-");
+        // Keep the stable JSON-input flag available when the server exposes a
+        // field named `args`; that one field uses --tool-args instead.
+        let flag = if name == "args" {
+            "tool-args".to_owned()
+        } else {
+            name.replace('_', "-")
+        };
         if !is_cli_name(&flag) || flag == "help" {
             bail!(
                 "MCP argument `{name}` on tool `{}` cannot be represented as a CLI flag",
@@ -337,9 +381,10 @@ fn tool_command(tool: &Tool, tool_index: usize) -> Result<(Command, ToolArgument
         let is_boolean = schema.get("type").and_then(Value::as_str) == Some("boolean");
         let mut arg = Arg::new(id.clone())
             .long(flag)
+            .conflicts_with("mcp_json_args")
             .help(description.to_string());
         if required.iter().any(|required| required == name) {
-            arg = arg.required(true);
+            arg = arg.required_unless_present("mcp_json_args");
         }
         if is_boolean {
             arg = arg
@@ -352,7 +397,102 @@ fn tool_command(tool: &Tool, tool_index: usize) -> Result<(Command, ToolArgument
         command = command.arg(arg);
         arg_map.insert(id, (name.clone(), schema.clone()));
     }
+    if !required.is_empty() {
+        command = command.after_help(format!(
+            "Required fields: {}. Provide them with generated flags or --args.",
+            required.join(", ")
+        ));
+    }
     Ok((command, arg_map))
+}
+
+fn print_tool_list(tools: &[Tool], json_output: bool) -> Result<()> {
+    if json_output {
+        let value = json!({ "tools": tools });
+        println!("{}", serde_json::to_string(&value)?);
+    } else {
+        for tool in tools {
+            let description = tool
+                .description
+                .as_deref()
+                .map(short_description)
+                .unwrap_or_default();
+            if description.is_empty() {
+                println!("{}", tool.name);
+            } else {
+                println!("{}\t{}", tool.name, description);
+            }
+        }
+    }
+    Ok(())
+}
+
+fn read_json_arguments(raw: &str) -> Result<Value> {
+    let input = if raw == "-" {
+        let mut input = String::new();
+        std::io::stdin()
+            .read_to_string(&mut input)
+            .context("failed to read MCP arguments from stdin")?;
+        input
+    } else if let Some(path) = raw.strip_prefix('@') {
+        std::fs::read_to_string(path)
+            .with_context(|| format!("failed to read MCP arguments from `{path}`"))?
+    } else {
+        raw.to_owned()
+    };
+    let value: Value = serde_json::from_str(&input).context("MCP arguments must be valid JSON")?;
+    if !value.is_object() {
+        bail!("MCP arguments must be a JSON object");
+    }
+    Ok(value)
+}
+
+fn validate_json_arguments(arguments: &Value, tool: &Tool) -> Result<()> {
+    let arguments = arguments
+        .as_object()
+        .context("MCP arguments must be a JSON object")?;
+    let properties = tool
+        .input_schema
+        .get("properties")
+        .and_then(Value::as_object);
+    let required = tool
+        .input_schema
+        .get("required")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(Value::as_str);
+    for name in required {
+        if !arguments.contains_key(name) {
+            bail!(
+                "missing required MCP argument `{name}` for tool `{}`",
+                tool.name
+            );
+        }
+    }
+    if tool.input_schema.get("additionalProperties") == Some(&Value::Bool(false)) {
+        if let Some(name) = arguments
+            .keys()
+            .find(|name| !properties.is_some_and(|properties| properties.contains_key(*name)))
+        {
+            bail!("unknown MCP argument `{name}` for tool `{}`", tool.name);
+        }
+    }
+    if let Some(properties) = properties {
+        for (name, value) in arguments {
+            let Some(schema) = properties.get(name) else {
+                continue;
+            };
+            let types = schema_types(schema);
+            if !types.is_empty() && !value_matches_schema_type(value, &types) {
+                bail!(
+                    "MCP argument `{name}` has the wrong JSON type for tool `{}`",
+                    tool.name
+                );
+            }
+        }
+    }
+    Ok(())
 }
 
 fn short_description(description: &str) -> String {
@@ -819,6 +959,77 @@ mod tests {
             .map(OsString::from)
             .collect::<Vec<_>>();
         assert!(crate::args::has_explicit_profile_arg(&argv));
+    }
+
+    #[test]
+    fn generated_tool_flags_and_json_args_are_alternative_inputs() {
+        let tool = Tool {
+            name: "test_tool".to_owned(),
+            description: Some("Synthetic test tool".to_owned()),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "args": { "type": "string" },
+                    "count": { "type": "integer" }
+                },
+                "required": ["args"]
+            }),
+        };
+        let (tool_command, _) = tool_command(&tool, 0).unwrap();
+        let run = Command::new("run")
+            .subcommand_required(true)
+            .arg_required_else_help(true)
+            .arg(
+                Arg::new("mcp_json_args")
+                    .long("args")
+                    .global(true)
+                    .value_name("JSON|@FILE|-"),
+            )
+            .subcommand(tool_command);
+        let parsed = run
+            .clone()
+            .try_get_matches_from(["run", "test_tool", "--args", r#"{"args":"x"}"#])
+            .expect("JSON arguments parse");
+        assert_eq!(
+            parsed
+                .get_one::<String>("mcp_json_args")
+                .map(String::as_str),
+            Some(r#"{"args":"x"}"#)
+        );
+        assert!(run
+            .clone()
+            .try_get_matches_from(["run", "test_tool", "--tool-args", "x"])
+            .is_ok());
+        assert!(run
+            .try_get_matches_from([
+                "run",
+                "test_tool",
+                "--args",
+                r#"{"args":"x"}"#,
+                "--tool-args",
+                "y"
+            ])
+            .is_err());
+    }
+
+    #[test]
+    fn json_arguments_require_object_and_validate_schema() {
+        let tool = Tool {
+            name: "test_tool".to_owned(),
+            description: None,
+            input_schema: json!({
+                "type": "object",
+                "properties": { "count": { "type": "integer" } },
+                "required": ["count"],
+                "additionalProperties": false
+            }),
+        };
+        let arguments = read_json_arguments(r#"{"count":2}"#).unwrap();
+        validate_json_arguments(&arguments, &tool).unwrap();
+        assert!(read_json_arguments("[]").is_err());
+        assert!(validate_json_arguments(&json!({}), &tool).is_err());
+        assert!(validate_json_arguments(&json!({ "count": "2" }), &tool).is_err());
+        assert!(validate_json_arguments(&json!({ "count": 2, "other": true }), &tool).is_err());
     }
 
     #[test]
