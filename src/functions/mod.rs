@@ -146,7 +146,7 @@ struct SlugArgs {
     #[arg(value_name = "SLUG")]
     slug_positional: Option<String>,
     /// Function slug
-    #[arg(long = "slug", short = 's')]
+    #[arg(long = "slug", short = 's', conflicts_with = "slug_positional")]
     slug_flag: Option<String>,
 }
 
@@ -477,6 +477,7 @@ impl ViewArgs {
             (Some(_), Some(_), _) | (Some(_), _, Some(_)) => {
                 bail!("use either --id or a slug, not both")
             }
+            (None, Some(_), Some(_)) => bail!("use either a positional slug or --slug, not both"),
             (Some(id), None, None) => Ok(ViewSelector::Id(id)),
             (None, Some(positional), None) if is_likely_function_id(positional) => {
                 Ok(ViewSelector::Id(positional))
@@ -645,6 +646,13 @@ pub(crate) async fn run_typed_command(
 ) -> Result<()> {
     let ft = Some(kind);
     match command {
+        None | Some(FunctionCommands::List) => {
+            let ctx =
+                crate::project_context::resolve_project_command_context_with_auth_mode(&base, true)
+                    .await?;
+            list::run(&ctx, base.json, ft).await
+        }
+
         Some(FunctionCommands::View(v)) => match v.selector()? {
             ViewSelector::Id(id) => {
                 let auth_ctx = resolve_auth_context(&base).await?;
@@ -678,6 +686,19 @@ pub(crate) async fn run_scorer_create(base: BaseArgs, args: create::CreateArgs) 
 pub async fn run(base: BaseArgs, args: FunctionsArgs) -> Result<()> {
     let function_type = args.function_type;
     match args.command {
+        None => {
+            let ctx =
+                crate::project_context::resolve_project_command_context_with_auth_mode(&base, true)
+                    .await?;
+            list::run(&ctx, base.json, function_type).await
+        }
+        Some(FunctionsCommands::List(la)) => {
+            let ctx =
+                crate::project_context::resolve_project_command_context_with_auth_mode(&base, true)
+                    .await?;
+            list::run(&ctx, base.json, la.function_type.or(function_type)).await
+        }
+
         Some(FunctionsCommands::Push(push_args)) => push::run(base, push_args).await,
         Some(FunctionsCommands::Pull(pull_args)) => pull::run(base, pull_args).await,
         Some(FunctionsCommands::View(v)) => {
@@ -718,6 +739,13 @@ pub async fn run(base: BaseArgs, args: FunctionsArgs) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn view_rejects_positional_and_flag_slugs() {
+        let _guard = test_lock();
+        let err = parse(&["functions", "view", "test-slug", "--slug", "other-slug"]).unwrap_err();
+        assert!(err.to_string().contains("cannot be used with"));
+    }
+
     use std::sync::{Mutex, MutexGuard, OnceLock};
 
     use clap::{Parser, Subcommand};

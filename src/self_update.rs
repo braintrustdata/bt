@@ -719,8 +719,8 @@ fn stable_check_message(current: &str, release_tag: &str) -> String {
 /// release never accidentally compares equal to a local canary build.
 fn format_canary_version(target_commitish: Option<&str>) -> String {
     let short_sha = target_commitish
-        .map(|sha| &sha[..sha.len().min(12)])
-        .unwrap_or("unknown");
+        .map(|sha| sha.chars().take(12).collect::<String>())
+        .unwrap_or_else(|| "unknown".to_string());
     format!("{}-canary.{}", env!("CARGO_PKG_VERSION"), short_sha)
 }
 
@@ -833,6 +833,12 @@ mod tests {
         let pkg = env!("CARGO_PKG_VERSION");
         let formatted = format_canary_version(Some("abc123def456789012345678901234567890aaaa"));
         assert_eq!(formatted, format!("{pkg}-canary.abc123def456"));
+    }
+
+    #[test]
+    fn format_canary_version_handles_non_ascii_commitish() {
+        assert!(format_canary_version(Some("12345678901éabc")).ends_with("12345678901é"));
+        assert!(format_canary_version(Some("短い")).ends_with("短い"));
     }
 
     #[test]
