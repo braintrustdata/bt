@@ -1,3 +1,6 @@
+mod common;
+use common::{bt_binary_path, command_exists, ensure_python_env, python_can_import_braintrust};
+
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::io::{BufRead, BufReader, Read};
@@ -36,23 +39,11 @@ fn eval_fixtures() {
     let _guard = test_lock();
     let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     let fixtures_root = root.join("tests").join("evals");
-    if !fixtures_root.exists() {
-        eprintln!("No eval fixtures found.");
-        return;
-    }
+    assert!(fixtures_root.is_dir(), "eval fixtures are missing");
 
     enforce_required_runtimes(&fixtures_root);
 
-    let bt_path = match std::env::var("CARGO_BIN_EXE_bt") {
-        Ok(path) => PathBuf::from(path),
-        Err(_) => {
-            let candidate = root.join("target").join("debug").join("bt");
-            if !candidate.is_file() {
-                build_bt_binary(&root);
-            }
-            candidate
-        }
-    };
+    let bt_path = bt_binary_path(&root);
 
     let mut fixture_dirs: Vec<PathBuf> = Vec::new();
     for runtime_dir in ["js", "py"] {
@@ -77,7 +68,6 @@ fn eval_fixtures() {
         if !config_path.exists() {
             continue;
         }
-        ran_any = true;
 
         let config = read_fixture_config(&config_path);
         let fixture_name = dir.file_name().unwrap().to_string_lossy().to_string();
@@ -191,6 +181,7 @@ fn eval_fixtures() {
                     runner.as_deref().unwrap_or("default")
                 );
             }
+            ran_any = true;
             ran_variant = true;
         }
 
@@ -199,9 +190,7 @@ fn eval_fixtures() {
         }
     }
 
-    if !ran_any {
-        eprintln!("No eval fixtures with fixture.json found.");
-    }
+    assert!(ran_any, "no eval fixtures executed");
 }
 
 #[test]
@@ -1305,19 +1294,6 @@ fn collect_deno_eval_diagnostics(dir: &Path, files: &[String]) -> Option<String>
     ))
 }
 
-fn bt_binary_path(root: &Path) -> PathBuf {
-    match std::env::var("CARGO_BIN_EXE_bt") {
-        Ok(path) => PathBuf::from(path),
-        Err(_) => {
-            let candidate = root.join("target").join("debug").join("bt");
-            if !candidate.is_file() {
-                build_bt_binary(root);
-            }
-            candidate
-        }
-    }
-}
-
 struct FileRestoreGuard {
     path: PathBuf,
     original: Vec<u8>,
@@ -1601,88 +1577,6 @@ fn js_module_resolves(dir: &Path, module_name: &str) -> bool {
     Command::new("node")
         .args(["-e", "require.resolve(process.argv[1])", module_name])
         .current_dir(dir)
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status()
-        .map(|status| status.success())
-        .unwrap_or(false)
-}
-
-fn build_bt_binary(root: &Path) {
-    let status = Command::new("cargo")
-        .args(["build", "--bin", "bt"])
-        .current_dir(root)
-        .status()
-        .expect("cargo build --bin bt");
-    if !status.success() {
-        panic!("cargo build --bin bt failed");
-    }
-}
-
-fn command_exists(command: &str) -> bool {
-    let paths = match std::env::var_os("PATH") {
-        Some(paths) => paths,
-        None => return false,
-    };
-
-    for dir in std::env::split_paths(&paths) {
-        let candidate = dir.join(command);
-        if candidate.is_file() {
-            return true;
-        }
-    }
-
-    false
-}
-
-fn ensure_python_env(fixtures_root: &Path) -> Option<PathBuf> {
-    if !command_exists("uv") {
-        return None;
-    }
-
-    let venv_dir = fixtures_root.join(".venv");
-    let python = venv_python_path(&venv_dir);
-
-    if !python.is_file() {
-        let status = Command::new("uv")
-            .args(["venv", venv_dir.to_string_lossy().as_ref()])
-            .status()
-            .ok()?;
-        if !status.success() {
-            return None;
-        }
-    }
-
-    if !python_can_import_braintrust(python.to_string_lossy().as_ref()) {
-        let status = Command::new("uv")
-            .args([
-                "pip",
-                "install",
-                "--python",
-                python.to_string_lossy().as_ref(),
-                "braintrust",
-            ])
-            .status()
-            .ok()?;
-        if !status.success() {
-            return None;
-        }
-    }
-
-    Some(python)
-}
-
-fn venv_python_path(venv: &Path) -> PathBuf {
-    if cfg!(windows) {
-        venv.join("Scripts").join("python.exe")
-    } else {
-        venv.join("bin").join("python")
-    }
-}
-
-fn python_can_import_braintrust(python: &str) -> bool {
-    Command::new(python)
-        .args(["-c", "import braintrust"])
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .status()

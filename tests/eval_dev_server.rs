@@ -1,3 +1,6 @@
+mod common;
+use common::{bt_binary_path, ensure_python_env};
+
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
@@ -47,7 +50,9 @@ fn read_http_request(stream: &mut TcpStream) -> Option<String> {
         request.extend_from_slice(&buf[..n]);
 
         if expected_len.is_none() {
-            let header_end = find_header_terminator(&request)?;
+            let Some(header_end) = find_header_terminator(&request) else {
+                continue;
+            };
             let headers = std::str::from_utf8(&request[..header_end]).ok()?;
             let content_length = parse_content_length(headers);
             expected_len = Some(header_end + content_length);
@@ -135,6 +140,10 @@ fn start_mock_api_server() -> (u16, Arc<AtomicUsize>, thread::JoinHandle<()>) {
                 format!(
                     r#"{{"org_info": [{{"name": "test-org", "id": "org-test", "api_url": "http://127.0.0.1:{port}", "proxy_url": "http://127.0.0.1:{port}"}}]}}"#
                 )
+            } else if first_line.contains("/v1/project") {
+                r#"{"id":"proj-test","name":"test-project"}"#.to_string()
+            } else if first_line.contains("/v1/experiment") && !first_line.contains("/summarize") {
+                r#"{"id":"exp-test","name":"test-experiment","project_id":"proj-test"}"#.to_string()
             } else if first_line.contains("/experiment/register") {
                 r#"{"project": {"id": "proj-test", "name": "test"}, "experiment": {"id": "exp-test", "name": "test"}}"#.to_string()
             } else {
@@ -269,91 +278,16 @@ fn curl_post(url: &str, headers: &[(&str, &str)], body: &str) -> String {
     String::from_utf8_lossy(&output.stdout).to_string()
 }
 
-fn ensure_python_env(fixtures_py_root: &std::path::Path) -> Option<PathBuf> {
-    if !command_exists("uv") {
-        return None;
-    }
-    let venv_dir = fixtures_py_root.join(".venv");
-    let python = venv_python_path(&venv_dir);
-    if !python.is_file() {
-        let status = Command::new("uv")
-            .args(["venv", venv_dir.to_string_lossy().as_ref()])
-            .status()
-            .ok()?;
-        if !status.success() {
-            return None;
-        }
-    }
-    if !python_can_import("braintrust", python.to_string_lossy().as_ref()) {
-        let status = Command::new("uv")
-            .args([
-                "pip",
-                "install",
-                "--python",
-                python.to_string_lossy().as_ref(),
-                "braintrust",
-            ])
-            .status()
-            .ok()?;
-        if !status.success() {
-            return None;
-        }
-    }
-    Some(python)
-}
-
-fn venv_python_path(venv: &std::path::Path) -> PathBuf {
-    if cfg!(windows) {
-        venv.join("Scripts").join("python.exe")
-    } else {
-        venv.join("bin").join("python")
-    }
-}
-
-fn python_can_import(module: &str, python: &str) -> bool {
-    Command::new(python)
-        .args(["-c", &format!("import {module}")])
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status()
-        .map(|s| s.success())
-        .unwrap_or(false)
-}
-
-fn command_exists(command: &str) -> bool {
-    std::env::var_os("PATH")
-        .map(|paths| std::env::split_paths(&paths).any(|dir| dir.join(command).is_file()))
-        .unwrap_or(false)
-}
-
-fn bt_binary_path(root: &std::path::Path) -> PathBuf {
-    match std::env::var("CARGO_BIN_EXE_bt") {
-        Ok(path) => PathBuf::from(path),
-        Err(_) => {
-            let candidate = root.join("target").join("debug").join("bt");
-            if !candidate.is_file() {
-                let status = Command::new("cargo")
-                    .args(["build", "--bin", "bt"])
-                    .current_dir(root)
-                    .status()
-                    .expect("cargo build");
-                assert!(status.success(), "cargo build --bin bt failed");
-            }
-            candidate
-        }
-    }
-}
-
 #[test]
 fn eval_dev_server_streams_python_events() {
     let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     let fixtures_root = root.join("tests").join("evals");
     let fixture_dir = fixtures_root.join("py").join("streaming");
 
-    if !fixture_dir.join("fixture.json").exists() {
-        eprintln!("Skipping eval_dev_server_streams_python_events (streaming fixture missing).");
-        return;
-    }
+    assert!(
+        fixture_dir.join("fixture.json").is_file(),
+        "dev-server fixture is missing"
+    );
 
     let python = match ensure_python_env(&fixtures_root.join("py")) {
         Some(python) => python,
@@ -370,26 +304,28 @@ fn eval_dev_server_streams_python_events() {
 
     // 2. Start bt eval --dev on the streaming fixture.
     let dev_port = free_port();
-    let mut child = Command::new(&bt_path)
-        .args([
-            "eval",
-            "--dev",
-            "--dev-port",
-            &dev_port.to_string(),
-            "--no-send-logs",
-            "eval_streaming.py",
-        ])
-        .current_dir(&fixture_dir)
-        .env(
-            "BRAINTRUST_APP_URL",
-            format!("http://127.0.0.1:{mock_auth_port}"),
-        )
-        .env("BRAINTRUST_API_KEY", "test-key")
-        .env("BRAINTRUST_EVAL_PYTHON_RUNNER", &python)
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .expect("spawn bt eval --dev");
+    let mut child = common::TestChild(
+        Command::new(&bt_path)
+            .args([
+                "eval",
+                "--dev",
+                "--dev-port",
+                &dev_port.to_string(),
+                "--no-send-logs",
+                "eval_streaming.py",
+            ])
+            .current_dir(&fixture_dir)
+            .env(
+                "BRAINTRUST_APP_URL",
+                format!("http://127.0.0.1:{mock_auth_port}"),
+            )
+            .env("BRAINTRUST_API_KEY", "test-key")
+            .env("BRAINTRUST_EVAL_PYTHON_RUNNER", &python)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("spawn bt eval --dev"),
+    );
 
     let output = Arc::new(Mutex::new(String::new()));
     let mut threads = Vec::new();
@@ -421,6 +357,18 @@ fn eval_dev_server_streams_python_events() {
     assert!(
         health.contains("Hello"),
         "health check should return greeting, got: {health}"
+    );
+
+    // Authentication failures must not start an evaluator.
+    let unauthorized = curl_get(&format!("{base_url}/list"), &[]);
+    assert!(unauthorized.contains("Unauthorized"), "{unauthorized}");
+    let missing_org = curl_get(
+        &format!("{base_url}/list"),
+        &[("x-bt-auth-token", "test-key")],
+    );
+    assert!(
+        missing_org.contains("Missing x-bt-org-name"),
+        "{missing_org}"
     );
 
     // 4. List evaluators.
@@ -603,10 +551,10 @@ fn eval_dev_server_done_deferred_until_process_exit() {
     let fixtures_root = root.join("tests").join("evals");
     let fixture_dir = fixtures_root.join("py").join("atexit_flush");
 
-    if !fixture_dir.join("fixture.json").exists() {
-        eprintln!("Skipping (atexit_flush fixture missing).");
-        return;
-    }
+    assert!(
+        fixture_dir.join("fixture.json").is_file(),
+        "dev-server fixture is missing"
+    );
 
     let python = match ensure_python_env(&fixtures_root.join("py")) {
         Some(python) => python,
@@ -623,26 +571,28 @@ fn eval_dev_server_done_deferred_until_process_exit() {
     let marker_path = marker_dir.path().join("atexit_marker");
 
     let dev_port = free_port();
-    let mut child = Command::new(&bt_path)
-        .args([
-            "eval",
-            "--dev",
-            "--dev-port",
-            &dev_port.to_string(),
-            "eval_atexit.py",
-        ])
-        .current_dir(&fixture_dir)
-        .env(
-            "BRAINTRUST_APP_URL",
-            format!("http://127.0.0.1:{mock_api_port}"),
-        )
-        .env("BRAINTRUST_API_KEY", "test-key")
-        .env("BRAINTRUST_EVAL_PYTHON_RUNNER", &python)
-        .env("ATEXIT_MARKER_FILE", marker_path.to_string_lossy().as_ref())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .expect("spawn bt eval --dev");
+    let mut child = common::TestChild(
+        Command::new(&bt_path)
+            .args([
+                "eval",
+                "--dev",
+                "--dev-port",
+                &dev_port.to_string(),
+                "eval_atexit.py",
+            ])
+            .current_dir(&fixture_dir)
+            .env(
+                "BRAINTRUST_APP_URL",
+                format!("http://127.0.0.1:{mock_api_port}"),
+            )
+            .env("BRAINTRUST_API_KEY", "test-key")
+            .env("BRAINTRUST_EVAL_PYTHON_RUNNER", &python)
+            .env("ATEXIT_MARKER_FILE", marker_path.to_string_lossy().as_ref())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("spawn bt eval --dev"),
+    );
 
     let output = Arc::new(Mutex::new(String::new()));
     let mut threads = Vec::new();
@@ -691,7 +641,8 @@ fn eval_dev_server_done_deferred_until_process_exit() {
     let final_log_rows = log_row_count.load(Ordering::SeqCst);
     assert!(
         final_log_rows > 0,
-        "mock API should have received log rows, got 0"
+        "mock API should have received log rows, got 0; output: {}",
+        output.lock().unwrap()
     );
     assert_eq!(
         result.log_rows_at_done, final_log_rows,
@@ -733,10 +684,10 @@ fn eval_dev_server_parent_accepted() {
     let fixtures_root = root.join("tests").join("evals");
     let fixture_dir = fixtures_root.join("py").join("streaming");
 
-    if !fixture_dir.join("fixture.json").exists() {
-        eprintln!("Skipping eval_dev_server_parent_accepted (fixture missing).");
-        return;
-    }
+    assert!(
+        fixture_dir.join("fixture.json").is_file(),
+        "dev-server fixture is missing"
+    );
 
     let python = match ensure_python_env(&fixtures_root.join("py")) {
         Some(python) => python,
@@ -750,26 +701,28 @@ fn eval_dev_server_parent_accepted() {
     let (mock_auth_port, _mock_handle) = start_mock_auth_server();
 
     let dev_port = free_port();
-    let mut child = Command::new(&bt_path)
-        .args([
-            "eval",
-            "--dev",
-            "--dev-port",
-            &dev_port.to_string(),
-            "--no-send-logs",
-            "eval_streaming.py",
-        ])
-        .current_dir(&fixture_dir)
-        .env(
-            "BRAINTRUST_APP_URL",
-            format!("http://127.0.0.1:{mock_auth_port}"),
-        )
-        .env("BRAINTRUST_API_KEY", "test-key")
-        .env("BRAINTRUST_EVAL_PYTHON_RUNNER", &python)
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .expect("spawn bt eval --dev");
+    let mut child = common::TestChild(
+        Command::new(&bt_path)
+            .args([
+                "eval",
+                "--dev",
+                "--dev-port",
+                &dev_port.to_string(),
+                "--no-send-logs",
+                "eval_streaming.py",
+            ])
+            .current_dir(&fixture_dir)
+            .env(
+                "BRAINTRUST_APP_URL",
+                format!("http://127.0.0.1:{mock_auth_port}"),
+            )
+            .env("BRAINTRUST_API_KEY", "test-key")
+            .env("BRAINTRUST_EVAL_PYTHON_RUNNER", &python)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("spawn bt eval --dev"),
+    );
 
     let output = Arc::new(Mutex::new(String::new()));
     let mut threads = Vec::new();
@@ -845,10 +798,10 @@ fn eval_dev_server_parent_dict_accepted() {
     let fixtures_root = root.join("tests").join("evals");
     let fixture_dir = fixtures_root.join("py").join("streaming");
 
-    if !fixture_dir.join("fixture.json").exists() {
-        eprintln!("Skipping eval_dev_server_parent_dict_accepted (fixture missing).");
-        return;
-    }
+    assert!(
+        fixture_dir.join("fixture.json").is_file(),
+        "dev-server fixture is missing"
+    );
 
     let python = match ensure_python_env(&fixtures_root.join("py")) {
         Some(python) => python,
@@ -862,26 +815,28 @@ fn eval_dev_server_parent_dict_accepted() {
     let (mock_auth_port, _mock_handle) = start_mock_auth_server();
 
     let dev_port = free_port();
-    let mut child = Command::new(&bt_path)
-        .args([
-            "eval",
-            "--dev",
-            "--dev-port",
-            &dev_port.to_string(),
-            "--no-send-logs",
-            "eval_streaming.py",
-        ])
-        .current_dir(&fixture_dir)
-        .env(
-            "BRAINTRUST_APP_URL",
-            format!("http://127.0.0.1:{mock_auth_port}"),
-        )
-        .env("BRAINTRUST_API_KEY", "test-key")
-        .env("BRAINTRUST_EVAL_PYTHON_RUNNER", &python)
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .expect("spawn bt eval --dev");
+    let mut child = common::TestChild(
+        Command::new(&bt_path)
+            .args([
+                "eval",
+                "--dev",
+                "--dev-port",
+                &dev_port.to_string(),
+                "--no-send-logs",
+                "eval_streaming.py",
+            ])
+            .current_dir(&fixture_dir)
+            .env(
+                "BRAINTRUST_APP_URL",
+                format!("http://127.0.0.1:{mock_auth_port}"),
+            )
+            .env("BRAINTRUST_API_KEY", "test-key")
+            .env("BRAINTRUST_EVAL_PYTHON_RUNNER", &python)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("spawn bt eval --dev"),
+    );
 
     let output = Arc::new(Mutex::new(String::new()));
     let mut threads = Vec::new();

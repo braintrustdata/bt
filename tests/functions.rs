@@ -1,3 +1,5 @@
+mod common;
+use common::command_exists;
 use std::collections::BTreeMap;
 use std::fs;
 #[cfg(unix)]
@@ -43,30 +45,6 @@ fn repo_root() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
 }
 
-fn bt_binary_path() -> PathBuf {
-    if let Ok(path) = std::env::var("CARGO_BIN_EXE_bt") {
-        return PathBuf::from(path);
-    }
-
-    let root = repo_root();
-    let candidate = root.join("target").join("debug").join("bt");
-    if !candidate.is_file() {
-        build_bt_binary(&root);
-    }
-    candidate
-}
-
-fn build_bt_binary(root: &Path) {
-    let status = Command::new("cargo")
-        .args(["build", "--bin", "bt"])
-        .current_dir(root)
-        .status()
-        .expect("cargo build --bin bt");
-    if !status.success() {
-        panic!("cargo build --bin bt failed");
-    }
-}
-
 fn find_python() -> Option<String> {
     for candidate in ["python3", "python"] {
         let Ok(status) = Command::new(candidate).arg("--version").status() else {
@@ -76,32 +54,9 @@ fn find_python() -> Option<String> {
             return Some(candidate.to_string());
         }
     }
+    assert!(!common::in_ci(), "Python is required in CI");
+    assert!(!common::in_ci(), "Python is required in CI");
     None
-}
-
-fn command_exists(command: &str) -> bool {
-    let Some(paths) = std::env::var_os("PATH") else {
-        return false;
-    };
-
-    for dir in std::env::split_paths(&paths) {
-        let candidate = dir.join(command);
-        if candidate.is_file() {
-            return true;
-        }
-        if cfg!(windows) {
-            let exe = candidate.with_extension("exe");
-            if exe.is_file() {
-                return true;
-            }
-            let cmd = candidate.with_extension("cmd");
-            if cmd.is_file() {
-                return true;
-            }
-        }
-    }
-
-    false
 }
 
 fn run_git(cwd: &Path, args: &[&str]) {
@@ -130,6 +85,10 @@ fn find_tsc() -> Option<PathBuf> {
     } else {
         repo_root().join("node_modules").join(".bin").join("tsc")
     };
+    assert!(
+        local.is_file() || !common::in_ci(),
+        "run pnpm install before testing"
+    );
     local.is_file().then_some(local)
 }
 
@@ -471,12 +430,9 @@ fn parse_query(query: &str) -> BTreeMap<String, String> {
 fn functions_fixtures() {
     let root = repo_root();
     let fixtures_root = root.join("tests").join("functions-fixtures");
-    if !fixtures_root.exists() {
-        eprintln!("No functions fixtures found.");
-        return;
-    }
+    assert!(fixtures_root.is_dir(), "functions fixtures are missing");
 
-    let bt_path = bt_binary_path();
+    let bt_path = common::bt_binary_path(&repo_root());
     let run_live = env_flag("BT_FUNCTIONS_FIXTURE_LIVE");
 
     let mut fixture_dirs: Vec<PathBuf> = fs::read_dir(&fixtures_root)
@@ -578,14 +534,12 @@ fn functions_fixtures() {
         }
     }
 
-    if !ran_any {
-        eprintln!("No functions fixtures with fixture.json found.");
-    }
+    assert!(ran_any, "no functions fixtures executed");
 }
 
 #[test]
 fn functions_push_help_includes_expected_flags() {
-    let output = Command::new(bt_binary_path())
+    let output = Command::new(common::bt_binary_path(&repo_root()))
         .arg("functions")
         .arg("push")
         .arg("--help")
@@ -606,7 +560,7 @@ fn functions_push_help_includes_expected_flags() {
 
 #[test]
 fn functions_pull_help_includes_expected_flags() {
-    let output = Command::new(bt_binary_path())
+    let output = Command::new(common::bt_binary_path(&repo_root()))
         .arg("functions")
         .arg("pull")
         .arg("--help")
@@ -623,7 +577,7 @@ fn functions_pull_help_includes_expected_flags() {
 
 #[test]
 fn functions_view_help_includes_expected_flags() {
-    let output = Command::new(bt_binary_path())
+    let output = Command::new(common::bt_binary_path(&repo_root()))
         .arg("functions")
         .arg("view")
         .arg("--help")
@@ -639,7 +593,7 @@ fn functions_view_help_includes_expected_flags() {
 
 #[test]
 fn functions_pull_accepts_id_and_slug_together() {
-    let output = Command::new(bt_binary_path())
+    let output = Command::new(common::bt_binary_path(&repo_root()))
         .arg("functions")
         .arg("pull")
         .arg("--id")
@@ -658,7 +612,7 @@ fn functions_pull_accepts_id_and_slug_together() {
 
 #[test]
 fn functions_push_rejects_type_flag() {
-    let output = Command::new(bt_binary_path())
+    let output = Command::new(common::bt_binary_path(&repo_root()))
         .arg("functions")
         .arg("push")
         .arg("--type")
@@ -673,7 +627,7 @@ fn functions_push_rejects_type_flag() {
 
 #[test]
 fn functions_pull_rejects_invalid_language() {
-    let output = Command::new(bt_binary_path())
+    let output = Command::new(common::bt_binary_path(&repo_root()))
         .arg("functions")
         .arg("pull")
         .arg("--language")
@@ -688,7 +642,7 @@ fn functions_pull_rejects_invalid_language() {
 
 #[test]
 fn functions_push_rejects_invalid_language() {
-    let output = Command::new(bt_binary_path())
+    let output = Command::new(common::bt_binary_path(&repo_root()))
         .arg("functions")
         .arg("push")
         .arg("--language")
@@ -703,7 +657,7 @@ fn functions_push_rejects_invalid_language() {
 
 #[test]
 fn functions_push_requires_app_url_with_custom_api_url() {
-    let output = Command::new(bt_binary_path())
+    let output = Command::new(common::bt_binary_path(&repo_root()))
         .arg("functions")
         .arg("--json")
         .arg("push")
@@ -723,7 +677,7 @@ fn functions_push_requires_app_url_with_custom_api_url() {
 
 #[test]
 fn functions_help_lists_push_and_pull() {
-    let output = Command::new(bt_binary_path())
+    let output = Command::new(common::bt_binary_path(&repo_root()))
         .arg("functions")
         .arg("--help")
         .output()
@@ -752,7 +706,7 @@ fn root_login_refresh_uses_selected_profile() {
     let config_dir = tempdir().expect("create temp config dir");
     seed_api_key_profile(config_dir.path());
 
-    let mut cmd = Command::new(bt_binary_path());
+    let mut cmd = Command::new(common::bt_binary_path(&repo_root()));
     cmd.args(["login", "--refresh", "--profile", "test-profile", "--json"])
         .current_dir(cwd.path())
         .env("XDG_CONFIG_HOME", config_dir.path())
@@ -779,7 +733,7 @@ fn root_login_refresh_uses_selected_profile() {
 
 #[test]
 fn push_and_pull_help_are_machine_readable() {
-    let push_help = Command::new(bt_binary_path())
+    let push_help = Command::new(common::bt_binary_path(&repo_root()))
         .arg("functions")
         .arg("push")
         .arg("--help")
@@ -787,7 +741,7 @@ fn push_and_pull_help_are_machine_readable() {
         .expect("run push help");
     assert!(push_help.status.success());
 
-    let pull_help = Command::new(bt_binary_path())
+    let pull_help = Command::new(common::bt_binary_path(&repo_root()))
         .arg("functions")
         .arg("pull")
         .arg("--help")
@@ -1153,17 +1107,11 @@ fn functions_js_runner_converts_zod_v4_schema_to_json_schema() {
     };
 
     let root = repo_root();
-    let fixture_root = root
-        .join("tests")
-        .join("functions-fixtures")
-        .join("push-multiple-files-accepted");
-    let zod_module = fixture_root.join("node_modules").join("zod");
-    if !zod_module.join("package.json").is_file() {
-        eprintln!(
-            "Skipping functions_js_runner_converts_zod_v4_schema_to_json_schema (fixture zod package missing)."
-        );
-        return;
-    }
+    let zod_module = root.join("node_modules").join("zod");
+    assert!(
+        zod_module.join("package.json").is_file(),
+        "run pnpm install before testing Zod schemas"
+    );
 
     let zod_module_literal = serde_json::to_string(
         zod_module
@@ -1216,7 +1164,7 @@ globalThis._evals.functions.push({{
         .expect("write runner package.json");
 
     let output = Command::new("node")
-        .current_dir(&fixture_root)
+        .current_dir(&root)
         .arg(&runner_js)
         .arg(&sample_path)
         .output()
@@ -1819,7 +1767,7 @@ exit 24
     perms.set_mode(0o755);
     std::fs::set_permissions(&runner, perms).expect("runner permissions");
 
-    let output = Command::new(bt_binary_path())
+    let output = Command::new(common::bt_binary_path(&repo_root()))
         .current_dir(tmp.path())
         .args([
             "functions",
@@ -2009,7 +1957,7 @@ exit 24
     perms.set_mode(0o755);
     std::fs::set_permissions(&runner, perms).expect("runner permissions");
 
-    let output = Command::new(bt_binary_path())
+    let output = Command::new(common::bt_binary_path(&repo_root()))
         .current_dir(tmp.path())
         .args([
             "functions",
@@ -2145,7 +2093,7 @@ exit 24
     perms.set_mode(0o755);
     std::fs::set_permissions(&runner, perms).expect("runner permissions");
 
-    let output = Command::new(bt_binary_path())
+    let output = Command::new(common::bt_binary_path(&repo_root()))
         .current_dir(tmp.path())
         .args([
             "functions",
@@ -2287,7 +2235,7 @@ exit 24
     perms.set_mode(0o755);
     std::fs::set_permissions(&runner, perms).expect("runner permissions");
 
-    let output = Command::new(bt_binary_path())
+    let output = Command::new(common::bt_binary_path(&repo_root()))
         .current_dir(tmp.path())
         .args([
             "functions",
@@ -2366,7 +2314,7 @@ async fn functions_view_by_positional_id_does_not_require_project_context() {
     let tmp = tempdir().expect("tempdir");
     let config_dir = tempdir().expect("config dir");
 
-    let output = Command::new(bt_binary_path())
+    let output = Command::new(common::bt_binary_path(&repo_root()))
         .current_dir(tmp.path())
         .args(["functions", "--json", "view", "fn_123"])
         .env("XDG_CONFIG_HOME", config_dir.path())
@@ -2433,7 +2381,7 @@ async fn functions_view_by_id_passes_version() {
     let tmp = tempdir().expect("tempdir");
     let config_dir = tempdir().expect("config dir");
 
-    let output = Command::new(bt_binary_path())
+    let output = Command::new(common::bt_binary_path(&repo_root()))
         .current_dir(tmp.path())
         .args([
             "functions",
@@ -2517,7 +2465,7 @@ async fn functions_view_by_slug_passes_version() {
     let tmp = tempdir().expect("tempdir");
     let config_dir = tempdir().expect("config dir");
 
-    let output = Command::new(bt_binary_path())
+    let output = Command::new(common::bt_binary_path(&repo_root()))
         .current_dir(tmp.path())
         .args([
             "functions",
@@ -2604,7 +2552,7 @@ async fn functions_pull_works_against_mock_api() {
     let out_dir = tmp.path().join("pulled");
     std::fs::create_dir_all(&out_dir).expect("create output dir");
 
-    let output = Command::new(bt_binary_path())
+    let output = Command::new(common::bt_binary_path(&repo_root()))
         .current_dir(tmp.path())
         .args([
             "functions",
@@ -2724,7 +2672,7 @@ async fn functions_pull_skips_untracked_existing_file_without_force() {
 
     run_git(tmp.path(), &["init"]);
 
-    let output = Command::new(bt_binary_path())
+    let output = Command::new(common::bt_binary_path(&repo_root()))
         .current_dir(tmp.path())
         .args([
             "functions",
@@ -2802,7 +2750,7 @@ async fn functions_pull_selector_with_unsupported_only_rows_still_succeeds() {
     let out_dir = tmp.path().join("pulled");
     std::fs::create_dir_all(&out_dir).expect("create output dir");
 
-    let output = Command::new(bt_binary_path())
+    let output = Command::new(common::bt_binary_path(&repo_root()))
         .current_dir(tmp.path())
         .args([
             "functions",
