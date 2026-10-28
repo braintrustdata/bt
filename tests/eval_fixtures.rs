@@ -110,6 +110,14 @@ fn eval_fixtures() {
         let runners = collect_runners(&config);
         let mut ran_variant = false;
         for runner in runners {
+            if needs_deno(runtime, runner.as_deref())
+                && selected_runtimes
+                    .as_ref()
+                    .is_some_and(|selected| !selected.contains("deno"))
+            {
+                eprintln!("Skipping {fixture_name} [deno] (runtime filtered out).");
+                continue;
+            }
             if needs_bun(runtime, runner.as_deref()) && !command_exists("bun") {
                 if required_runtimes().contains("bun") {
                     panic!("Bun runtime is required but unavailable for fixture {fixture_name}");
@@ -290,6 +298,10 @@ fn eval_watch_bun_dependency_retriggers() {
 
 #[test]
 fn eval_watch_deno_dependency_retriggers() {
+    if selected_fixture_runtimes().is_some_and(|selected| !selected.contains("deno")) {
+        eprintln!("Skipping eval_watch_deno_dependency_retriggers (runtime filtered out).");
+        return;
+    }
     let _guard = test_lock();
     if !command_exists("deno") {
         if required_runtimes().contains("deno") {
