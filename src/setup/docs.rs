@@ -201,13 +201,13 @@ pub(super) async fn fetch_docs_pages(
         Regex::new(r"\[([^\]]+)\]\(([^)\s]+)\)").context("failed to build markdown link regex")?;
     let bare_url_re =
         Regex::new(r#"(?m)\b(https?://[^\s<>"')]+)"#).context("failed to build URL regex")?;
-    let llms_base = reqwest::Url::parse(&args.llms_url)
+    let llms_url = reqwest::Url::parse(&args.llms_url)
         .with_context(|| format!("invalid llms URL: {}", args.llms_url))?;
     let client = crate::http::build_http_client(crate::http::DEFAULT_HTTP_TIMEOUT)
         .context("failed to build HTTP client")?;
 
     let index_response = client
-        .get(&args.llms_url)
+        .get(llms_url)
         .send()
         .await
         .with_context(|| format!("failed to fetch llms index {}", args.llms_url))?;
@@ -216,6 +216,8 @@ pub(super) async fn fetch_docs_pages(
         let body = index_response.text().await.unwrap_or_default();
         bail!("failed to fetch llms index ({status}): {body}");
     }
+    // Resolve relative links against the final URL so redirects to another docs host work.
+    let llms_base = index_response.url().clone();
     let index_body = index_response
         .text()
         .await
@@ -237,19 +239,18 @@ pub(super) async fn fetch_docs_pages(
                 format!("failed to fetch fallback index {DEFAULT_DOCS_LLMS_FULL_URL}")
             })?;
         if fallback_response.status().is_success() {
+            let fallback_base = fallback_response.url().clone();
             let fallback_body = fallback_response
                 .text()
                 .await
                 .context("failed to read fallback llms-full response body")?;
-            if let Ok(fallback_base) = reqwest::Url::parse(DEFAULT_DOCS_LLMS_FULL_URL) {
-                discovered = collect_docs_links(
-                    &fallback_body,
-                    &workflow_set,
-                    &workflow_link_re,
-                    &bare_url_re,
-                    &fallback_base,
-                );
-            }
+            discovered = collect_docs_links(
+                &fallback_body,
+                &workflow_set,
+                &workflow_link_re,
+                &bare_url_re,
+                &fallback_base,
+            );
         }
     }
     append_core_reference_links(&mut discovered);
