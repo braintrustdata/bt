@@ -2,7 +2,7 @@
 name = "bt"
 version = "0.27.2"
 edition = "2021"
-rust-version = "1.88.0"
+rust-version = "1.97.0"
 authors = ["Braintrust engineering <eng@braintrust.dev>"]
 description = "The Braintrust command line interface"
 license = "Apache-2.0"
@@ -19,7 +19,7 @@ actix-web = "4.11.0"
 anyhow = "1.0.89"
 backoff = { version = "0.4.0", features = ["tokio"] }
 braintrust-sdk-rust = { git = "https://github.com/braintrustdata/braintrust-sdk-rust", rev = "45a2c88ca9d9ccc393ec0338ac438199fc3c5df2" }
-bt-daemon = { git = "https://github.com/braintrustdata/braintrust-coding-agent-plugins", rev = "531c25e65f465446a1570b85d7741744faf0cd04" }
+bt-daemon = { git = "https://github.com/braintrustdata/braintrust-coding-agent-plugins", rev = "1254d76f6ab05d10a1c6273685c9c99071b5dc21" }
 async-trait = "0.1"
 clap = { version = "4.5.20", features = ["derive", "env", "string"] }
 crossterm = "0.28.1"
