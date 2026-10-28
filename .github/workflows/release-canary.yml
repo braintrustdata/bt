@@ -39,6 +39,8 @@ jobs:
           persist-credentials: false
           submodules: recursive
 
+      - uses: ./.github/actions/setup-rust-toolchain
+
       - name: Configure git auth for private dependencies
         shell: bash
         run: |
@@ -144,6 +146,10 @@ jobs:
             curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
             echo "$HOME/.cargo/bin" >> $GITHUB_PATH
           fi
+
+      - uses: ./.github/actions/setup-rust-toolchain
+        with:
+          targets: ${{ join(matrix.targets, ',') }}
 
       - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:

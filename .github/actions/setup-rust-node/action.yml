@@ -35,6 +35,17 @@ runs:
         cache_key: "{{default}}-node{{env.MISE_NODE_VERSION}}"
         cache_save: ${{ github.ref == 'refs/heads/main' }}
 
+    - name: Verify Rust version matches the declared minimum
+      shell: bash
+      run: |
+        declared=$(sed -n 's/^rust-version = "\([^"]*\)"/\1/p' Cargo.toml)
+        configured=$(awk '$1 == "rust" { print $2 }' .tool-versions)
+        actual=$(rustc --version | awk '{print $2}')
+        if [[ -z "$declared" || "$declared" != "$configured" || "$actual" != "$configured" ]]; then
+          echo "Rust versions differ: declared=$declared configured=$configured installed=$actual" >&2
+          exit 1
+        fi
+
     # Runner rustup installs the minimal profile, which omits rustfmt/clippy.
     - name: Add Rust components
       if: inputs.rust-components != ''

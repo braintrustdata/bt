@@ -38,6 +38,8 @@ jobs:
           fetch-depth: 0
           ref: main
 
+      - uses: ./.github/actions/setup-rust-toolchain
+
       - name: Validate dependency selection
         shell: bash
         run: |
