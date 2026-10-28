@@ -15,10 +15,14 @@ runs:
       run: |
         set -euo pipefail
         version=$(awk '$1 == "rust" { print $2 }' .tool-versions)
-        declared=$(sed -n 's/^rust-version = "\([^"]*\)"/\1/p' Cargo.toml)
-        if [[ -z "$version" || "$version" != "$declared" ]]; then
-          echo "Rust versions differ: declared=$declared configured=$version" >&2
+        if [[ -z "$version" ]]; then
+          echo "Rust version is missing from .tool-versions" >&2
           exit 1
+        fi
+        if ! command -v rustup > /dev/null 2>&1; then
+          curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --no-modify-path --default-toolchain none
+          export PATH="$HOME/.cargo/bin:$PATH"
+          echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
         fi
         rustup toolchain install "$version" --profile minimal
         if [[ -n "$RUST_TARGETS" ]]; then

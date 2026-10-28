@@ -253,14 +253,6 @@ jobs:
           BT_GITHUB_TOKEN: ${{ secrets.BT_GITHUB_TOKEN }}
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Install Rust non-interactively if not already installed
-        if: ${{ matrix.container }}
-        run: |
-          if ! command -v cargo > /dev/null 2>&1; then
-            curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
-            echo "$HOME/.cargo/bin" >> $GITHUB_PATH
-          fi
-
       - uses: ./.github/actions/setup-rust-toolchain
         with:
           targets: ${{ join(matrix.targets, ',') }}
