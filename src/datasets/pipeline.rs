@@ -15,7 +15,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
 use crate::args::BaseArgs;
-use crate::auth::{login, resolved_runner_env, LoginContext};
+use crate::auth::{login, resolved_runner_env};
 use crate::http::ApiClient;
 use crate::js_runner::{build_js_runner_command, materialize_runner_script};
 use crate::projects::api::{create_project, get_project_by_name, Project};
@@ -267,7 +267,7 @@ pub async fn run(base: BaseArgs, args: PipelineArgs) -> Result<()> {
                 ),
             );
 
-            let (_, source_client, source_project) =
+            let (source_client, source_project) =
                 resolve_pipeline_source_context(&base, &inspect.source).await?;
             let source = source_with_resolved_project(
                 &inspect.source,
@@ -706,7 +706,7 @@ async fn pull_refs(
     args: PipelinePullArgs,
     mut inspect: PipelineInspect,
 ) -> Result<()> {
-    let (_, source_client, source_project) =
+    let (source_client, source_project) =
         resolve_pipeline_source_context(base, &inspect.source).await?;
     inspect.source =
         source_with_resolved_project(&inspect.source, &source_project, source_client.org_name());
@@ -1192,7 +1192,7 @@ async fn transform_refs(base: &BaseArgs, args: PipelineTransformArgs) -> Result<
         .unwrap_or(inspect.source);
     apply_source_overrides(&mut source, &args.source);
     let source_base = base_with_pipeline_artifact_context(base, pull_manifest.as_ref());
-    let (_, source_client, source_project) =
+    let (source_client, source_project) =
         resolve_pipeline_source_context(&source_base, &source).await?;
     source = source_with_resolved_project(&source, &source_project, source_client.org_name());
     let refs = read_jsonl_values(&input_path)?;
@@ -1857,7 +1857,7 @@ async fn discover_refs(
     options: &PipelinePullOptions,
     out: &Path,
 ) -> Result<ProjectLogRefDiscoveryResult> {
-    let (ctx, client, project) = resolve_pipeline_source_context(base, &inspect.source).await?;
+    let (client, project) = resolve_pipeline_source_context(base, &inspect.source).await?;
     let scope = PipelineScope::from_source(&inspect.source);
     let limit = options.limit;
     let filter = discovery_filter(&inspect.source, options)?;
@@ -1866,7 +1866,6 @@ async fn discover_refs(
 
     let result = discover_project_log_refs(
         &client,
-        &ctx,
         ProjectLogRefDiscoveryOptions {
             project_id: &project.id,
             filter: filter.as_ref(),
@@ -1896,7 +1895,7 @@ fn project_log_ref_scope(scope: PipelineScope) -> ProjectLogRefScope {
 async fn resolve_pipeline_source_context(
     base: &BaseArgs,
     source: &PipelineSourceInspect,
-) -> Result<(LoginContext, ApiClient, Project)> {
+) -> Result<(ApiClient, Project)> {
     let mut source_base = base.clone();
     if let Some(org_name) = source.org_name.as_deref() {
         source_base.org_name = Some(org_name.to_string());
@@ -1904,7 +1903,7 @@ async fn resolve_pipeline_source_context(
     let ctx = login(&source_base).await?;
     let client = ApiClient::new(&ctx)?;
     let project = resolve_source_project(base, &client, source).await?;
-    Ok((ctx, client, project))
+    Ok((client, project))
 }
 
 fn discovery_filter(

@@ -15,6 +15,8 @@ struct State {
     uploads: Mutex<Vec<Value>>,
     fail_next: Mutex<bool>,
     fail_query_at: Mutex<Option<usize>>,
+    transient_query_at: Mutex<Option<usize>>,
+    repeat_cursor: Mutex<bool>,
 }
 
 async fn login(req: HttpRequest) -> HttpResponse {
@@ -35,9 +37,14 @@ async fn query(state: web::Data<Arc<State>>, body: web::Json<Value>) -> HttpResp
     if *state.fail_query_at.lock().unwrap() == Some(queries.len()) {
         return HttpResponse::BadRequest().body("test query failure");
     }
+    if *state.transient_query_at.lock().unwrap() == Some(queries.len()) {
+        return HttpResponse::ServiceUnavailable()
+            .insert_header(("retry-after", "0"))
+            .body("test transient query error");
+    }
     let query = queries.last().unwrap()["query"].as_str().unwrap();
     if query.contains("test-cursor") {
-        HttpResponse::Ok().json(json!({"data": [{"id": "test-row-2", "span_id": "test-span-2", "root_span_id": "test-root-2"}]}))
+        HttpResponse::Ok().json(json!({"data": [{"id": "test-row-2", "span_id": "test-span-2", "root_span_id": "test-root-2"}], "cursor": if *state.repeat_cursor.lock().unwrap() { Some("test-cursor") } else { None }}))
     } else {
         HttpResponse::Ok().json(json!({"data": [{"id": "test-row-1", "span_id": "test-span-1", "root_span_id": "test-root-1"}], "cursor": "test-cursor"}))
     }
@@ -201,5 +208,51 @@ async fn push_failure_does_not_checkpoint_unacknowledged_rows() {
     assert_eq!(uploads[0]["rows"], uploads[1]["rows"]);
     success(&server.run(root.path(), &args).await);
     assert_eq!(server.state.uploads.lock().unwrap().len(), 2);
+    server.handle.stop(true).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn pull_retries_a_transient_query_without_losing_the_page() {
+    let server = Server::start().await;
+    *server.state.transient_query_at.lock().unwrap() = Some(1);
+    let root = tempfile::tempdir().unwrap();
+    let object = format!("project_logs:{PROJECT}");
+    let args = [
+        "pull",
+        &object,
+        "--spans",
+        "2",
+        "--page-size",
+        "1",
+        "--window",
+        "1h",
+    ];
+    success(&server.run(root.path(), &args).await);
+    let queries = server.state.queries.lock().unwrap().clone();
+    assert_eq!(queries.len(), 3);
+    assert_eq!(queries[0], queries[1]);
+    server.handle.stop(true).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn pull_rejects_repeated_cursors_before_fetching_duplicate_rows() {
+    let server = Server::start().await;
+    *server.state.repeat_cursor.lock().unwrap() = true;
+    let root = tempfile::tempdir().unwrap();
+    let object = format!("project_logs:{PROJECT}");
+    let args = [
+        "pull",
+        &object,
+        "--spans",
+        "3",
+        "--page-size",
+        "1",
+        "--window",
+        "1h",
+    ];
+    let result = server.run(root.path(), &args).await;
+    assert!(!result.status.success());
+    assert!(String::from_utf8_lossy(&result.stdout).contains("pagination loop detected"));
+    assert_eq!(server.state.queries.lock().unwrap().len(), 2);
     server.handle.stop(true).await;
 }

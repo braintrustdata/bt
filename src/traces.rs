@@ -35,7 +35,7 @@ use urlencoding::{decode, encode};
 use crate::args::BaseArgs;
 use crate::auth::login;
 use crate::experiments::api as experiments_api;
-use crate::http::ApiClient;
+use crate::http::{ApiClient, BtqlOptions, BtqlResponse};
 use crate::projects::api::Project;
 use crate::ui::{fuzzy_select, is_interactive, with_spinner};
 use crate::utils::parse_duration_to_seconds;
@@ -285,15 +285,6 @@ struct SpanArgs {
 struct ObjectRef {
     object_type: String,
     object_name: String,
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-struct BtqlResponse {
-    pub data: Vec<Map<String, Value>>,
-    #[serde(default)]
-    pub cursor: Option<String>,
-    #[serde(default)]
-    pub schema: Option<Value>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -1056,8 +1047,7 @@ async fn run_logs_command(base: BaseArgs, client: ApiClient, args: LogsArgs) -> 
         ),
     )
     .await?;
-    let next_cursor =
-        next_cursor_if_full_page(response.cursor.clone(), response.data.len(), args.limit);
+    let next_cursor = response.cursor.clone();
     let has_more = next_cursor.is_some();
     let rows = parse_summary_rows(response.data);
     let object_ref_arg = format_object_ref_arg(&object_ref);
@@ -1138,8 +1128,7 @@ async fn run_trace_command(base: BaseArgs, client: ApiClient, args: TraceArgs) -
         ),
     )
     .await?;
-    let next_cursor =
-        next_cursor_if_full_page(response.cursor.clone(), response.data.len(), selector.limit);
+    let next_cursor = response.cursor.clone();
     let has_more = next_cursor.is_some();
     let object_ref_arg = format_object_ref_arg(&target.object_ref);
     let profile_flag = base.profile.as_deref();
@@ -1265,8 +1254,7 @@ async fn run_waterfall_command(
         ),
     )
     .await?;
-    let next_cursor =
-        next_cursor_if_full_page(response.cursor.clone(), response.data.len(), selector.limit);
+    let next_cursor = response.cursor.clone();
     let has_more = next_cursor.is_some();
     let waterfall = waterfall::build_waterfall_view(response.data, &target.root_span_id);
 
@@ -1478,7 +1466,14 @@ async fn fetch_span_item(
     };
     maybe_print_query(print_queries, label, &query);
     let response = with_spinner("Loading span...", async {
-        execute_query(client, &query)
+        client
+            .btql_with_options::<BtqlResponse>(
+                &query,
+                BtqlOptions {
+                    source: Some("bt_traces"),
+                    ..Default::default()
+                },
+            )
             .await
             .with_context(|| format!("BTQL query failed: {query}"))
     })
@@ -6057,7 +6052,14 @@ async fn lookup_root_span_id_for_query(
     print_queries: bool,
 ) -> Result<Option<String>> {
     maybe_print_query(print_queries, label, query);
-    let response = execute_query(client, query)
+    let response = client
+        .btql_with_options::<BtqlResponse>(
+            query,
+            BtqlOptions {
+                source: Some("bt_traces"),
+                ..Default::default()
+            },
+        )
         .await
         .with_context(|| format!("BTQL query failed: {query}"))?;
 
@@ -6282,58 +6284,41 @@ fn sql_quote(value: &str) -> String {
     format!("'{}'", value.replace('\'', "''"))
 }
 
-fn next_cursor_if_full_page(
-    cursor: Option<String>,
-    returned_rows: usize,
-    requested_limit: usize,
-) -> Option<String> {
-    cursor
-        .filter(|c| !c.is_empty())
-        .filter(|_| requested_limit > 0 && returned_rows >= requested_limit)
-}
-
 async fn fetch_summary_rows(
     client: &ApiClient,
     query_ctx: &LogsQueryContext,
     total_limit: usize,
     search_query: Option<&str>,
 ) -> Result<Vec<Map<String, Value>>> {
-    let mut rows: Vec<Map<String, Value>> = Vec::new();
-    let mut cursor: Option<String> = None;
-
-    while rows.len() < total_limit {
-        let page_limit = (total_limit - rows.len()).min(MAX_BTQL_PAGE_LIMIT);
-        let query = build_summary_query(
-            &query_ctx.source_expr,
-            query_ctx.list_mode,
-            query_ctx.preview_length,
-            page_limit,
-            cursor.as_deref(),
-            search_query,
-            &query_ctx.base_filter,
-        );
-        maybe_print_query(query_ctx.print_queries, "summary", &query);
-
-        let response = execute_query(client, &query)
-            .await
-            .with_context(|| format!("BTQL query failed: {query}"))?;
-
-        if response.data.is_empty() {
-            break;
-        }
-
-        let returned_rows = response.data.len();
-        rows.extend(response.data);
-
-        let next_cursor = next_cursor_if_full_page(response.cursor, returned_rows, page_limit);
-        if next_cursor.is_none() {
-            break;
-        }
-        cursor = next_cursor;
-    }
-
-    rows.truncate(total_limit);
-    Ok(rows)
+    crate::http::Pagination::default()
+        .collect(
+            Some(total_limit),
+            MAX_BTQL_PAGE_LIMIT,
+            |limit, cursor| async move {
+                let query = build_summary_query(
+                    &query_ctx.source_expr,
+                    query_ctx.list_mode,
+                    query_ctx.preview_length,
+                    limit,
+                    cursor.as_deref(),
+                    search_query,
+                    &query_ctx.base_filter,
+                );
+                maybe_print_query(query_ctx.print_queries, "summary", &query);
+                client
+                    .btql_with_options::<BtqlResponse>(
+                        &query,
+                        BtqlOptions {
+                            source: Some("bt_traces"),
+                            ..Default::default()
+                        },
+                    )
+                    .await
+                    .with_context(|| format!("BTQL query failed: {query}"))
+            },
+        )
+        .await
+        .map(|(rows, _)| rows)
 }
 
 async fn fetch_logs_page(
@@ -6353,7 +6338,14 @@ async fn fetch_logs_page(
         &query_ctx.base_filter,
     );
     maybe_print_query(query_ctx.print_queries, "logs", &query);
-    execute_query(client, &query)
+    client
+        .btql_with_options::<BtqlResponse>(
+            &query,
+            BtqlOptions {
+                source: Some("bt_traces"),
+                ..Default::default()
+            },
+        )
         .await
         .with_context(|| format!("BTQL query failed: {query}"))
 }
@@ -6369,7 +6361,14 @@ async fn fetch_trace_spans_page(
 ) -> Result<BtqlResponse> {
     let query = build_trace_spans_query(source_expr, root_span_id, preview_length, limit, cursor);
     maybe_print_query(print_queries, "trace", &query);
-    execute_query(client, &query)
+    client
+        .btql_with_options::<BtqlResponse>(
+            &query,
+            BtqlOptions {
+                source: Some("bt_traces"),
+                ..Default::default()
+            },
+        )
         .await
         .with_context(|| format!("BTQL query failed: {query}"))
 }
@@ -6386,7 +6385,14 @@ async fn fetch_waterfall_spans_page(
     let query =
         build_waterfall_spans_query(source_expr, root_span_id, preview_length, limit, cursor);
     maybe_print_query(print_queries, "waterfall", &query);
-    execute_query(client, &query)
+    client
+        .btql_with_options::<BtqlResponse>(
+            &query,
+            BtqlOptions {
+                source: Some("bt_traces"),
+                ..Default::default()
+            },
+        )
         .await
         .with_context(|| format!("BTQL query failed: {query}"))
 }
@@ -6399,40 +6405,33 @@ async fn fetch_trace_span_rows_for_tree(
     total_limit: usize,
     print_queries: bool,
 ) -> Result<Vec<Map<String, Value>>> {
-    let mut rows: Vec<Map<String, Value>> = Vec::new();
-    let mut cursor: Option<String> = None;
-
-    while rows.len() < total_limit {
-        let page_limit = (total_limit - rows.len()).min(MAX_BTQL_PAGE_LIMIT);
-        let query = build_spans_query(
-            project_id,
-            root_span_id,
-            preview_length,
-            page_limit,
-            cursor.as_deref(),
-        );
-        maybe_print_query(print_queries, "spans-tree", &query);
-
-        let response = execute_query(client, &query)
-            .await
-            .with_context(|| format!("BTQL query failed: {query}"))?;
-
-        if response.data.is_empty() {
-            break;
-        }
-
-        let returned_rows = response.data.len();
-        rows.extend(response.data);
-
-        let next_cursor = next_cursor_if_full_page(response.cursor, returned_rows, page_limit);
-        if next_cursor.is_none() {
-            break;
-        }
-        cursor = next_cursor;
-    }
-
-    rows.truncate(total_limit);
-    Ok(rows)
+    crate::http::Pagination::default()
+        .collect(
+            Some(total_limit),
+            MAX_BTQL_PAGE_LIMIT,
+            |limit, cursor| async move {
+                let query = build_spans_query(
+                    project_id,
+                    root_span_id,
+                    preview_length,
+                    limit,
+                    cursor.as_deref(),
+                );
+                maybe_print_query(print_queries, "spans-tree", &query);
+                client
+                    .btql_with_options::<BtqlResponse>(
+                        &query,
+                        BtqlOptions {
+                            source: Some("bt_traces"),
+                            ..Default::default()
+                        },
+                    )
+                    .await
+                    .with_context(|| format!("BTQL query failed: {query}"))
+            },
+        )
+        .await
+        .map(|(rows, _)| rows)
 }
 
 async fn fetch_full_span_row(
@@ -6444,7 +6443,14 @@ async fn fetch_full_span_row(
     let query = build_full_span_query(project_id, span_row_id);
     maybe_print_query(print_queries, "span-full", &query);
 
-    let response = execute_query(client, &query)
+    let response = client
+        .btql_with_options::<BtqlResponse>(
+            &query,
+            BtqlOptions {
+                source: Some("bt_traces"),
+                ..Default::default()
+            },
+        )
         .await
         .with_context(|| format!("BTQL query failed: {query}"))?;
 
@@ -6747,34 +6753,13 @@ fn poll_pending_thread_load(app: &mut TraceViewerApp) {
     }
 }
 
-async fn execute_query(client: &ApiClient, query: &str) -> Result<BtqlResponse> {
-    let body = json!({
-        "query": query,
-        "fmt": "json",
-        "query_source": "bt_traces_9f4b1e6d7c2a4a7b8d4f9a6c2b1e7f3d",
-    });
-
-    let org_name = client.org_name();
-    let headers = if !org_name.is_empty() {
-        vec![("x-bt-org-name", org_name)]
-    } else {
-        Vec::new()
-    };
-
-    client.post_with_headers("/btql", &body, &headers).await
-}
-
 async fn execute_invoke(client: &ApiClient, request: &Value) -> Result<Value> {
-    let org_name = client.org_name();
-    let headers = if !org_name.is_empty() {
-        vec![("x-bt-org-name", org_name)]
+    let client = if client.org_name().is_empty() {
+        client.clone()
     } else {
-        Vec::new()
+        client.header("x-bt-org-name", client.org_name())
     };
-
-    client
-        .post_with_headers("/function/invoke", request, &headers)
-        .await
+    client.post("/function/invoke", request).await
 }
 
 #[cfg(test)]
@@ -6941,22 +6926,6 @@ mod tests {
             build_url_lookup_by_span_id_query("experiment('experiment-id')", "span-1", None);
         assert!(url_lookup.contains("from: experiment('experiment-id') spans"));
         assert!(url_lookup.contains("filter: span_id = 'span-1'"));
-    }
-
-    #[test]
-    fn next_cursor_requires_full_page() {
-        assert_eq!(
-            next_cursor_if_full_page(Some("cursor".to_string()), 34, 1000),
-            None
-        );
-        assert_eq!(
-            next_cursor_if_full_page(Some("cursor".to_string()), 100, 100),
-            Some("cursor".to_string())
-        );
-        assert_eq!(
-            next_cursor_if_full_page(Some(String::new()), 100, 100),
-            None
-        );
     }
 
     #[test]

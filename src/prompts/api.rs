@@ -3,7 +3,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use urlencoding::encode;
 
-use crate::http::ApiClient;
+use crate::http::{ApiClient, BtqlOptions, BtqlResponse};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Prompt {
@@ -37,12 +37,6 @@ pub struct EnvironmentObject {
 #[derive(Debug, Deserialize)]
 struct ListResponse<T> {
     objects: Vec<T>,
-}
-
-#[derive(Debug, Deserialize)]
-struct PromptVersionsResponse {
-    #[serde(default)]
-    data: Vec<Value>,
 }
 
 pub async fn list_prompts(
@@ -97,22 +91,24 @@ pub async fn list_prompt_versions(
     project_id: &str,
     prompt_id: &str,
 ) -> Result<Vec<String>> {
-    let body = prompt_versions_request(project_id, prompt_id);
-    let org_name = client.org_name();
-    let headers = if org_name.is_empty() {
-        Vec::new()
-    } else {
-        vec![("x-bt-org-name", org_name)]
-    };
-    let response: PromptVersionsResponse =
-        client.post_with_headers("/btql", &body, &headers).await?;
+    let query = prompt_versions_query(project_id, prompt_id);
+    let response: BtqlResponse<Value> = client
+        .btql_with_options(
+            &query,
+            BtqlOptions {
+                audit_log: Some(true),
+                use_columnstore: Some(false),
+                realtime: Some(true),
+                ..Default::default()
+            },
+        )
+        .await?;
 
     Ok(prompt_versions_from_rows(response.data))
 }
 
-fn prompt_versions_request(project_id: &str, prompt_id: &str) -> Value {
+fn prompt_versions_query(project_id: &str, prompt_id: &str) -> Value {
     json!({
-        "query": {
             "from": {
                 "op": "function",
                 "name": { "op": "ident", "name": ["project_prompts"] },
@@ -128,11 +124,6 @@ fn prompt_versions_request(project_id: &str, prompt_id: &str) -> Value {
                 "left": { "op": "ident", "name": ["id"] },
                 "right": { "op": "literal", "value": prompt_id }
             }
-        },
-        "audit_log": true,
-        "use_columnstore": false,
-        "brainstore_realtime": true,
-        "fmt": "json"
     })
 }
 
@@ -199,17 +190,11 @@ mod tests {
 
     #[test]
     fn prompt_versions_request_scopes_audit_log_to_prompt() {
-        let request = prompt_versions_request("proj_test", "prompt_test");
+        let request = prompt_versions_query("proj_test", "prompt_test");
 
-        assert_eq!(
-            request["query"]["from"]["name"]["name"],
-            json!(["project_prompts"])
-        );
-        assert_eq!(request["query"]["from"]["args"][0]["value"], "proj_test");
-        assert_eq!(request["query"]["filter"]["right"]["value"], "prompt_test");
-        assert_eq!(request["audit_log"], true);
-        assert_eq!(request["use_columnstore"], false);
-        assert_eq!(request["brainstore_realtime"], true);
+        assert_eq!(request["from"]["name"]["name"], json!(["project_prompts"]));
+        assert_eq!(request["from"]["args"][0]["value"], "proj_test");
+        assert_eq!(request["filter"]["right"]["value"], "prompt_test");
     }
 
     #[test]

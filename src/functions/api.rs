@@ -1,3 +1,4 @@
+use crate::http::HttpOptions;
 use std::collections::HashSet;
 
 use anyhow::{Context, Result};
@@ -7,7 +8,7 @@ use urlencoding::encode;
 
 use crate::{
     error::user_error,
-    http::{ApiClient, HttpError},
+    http::{ApiClient, BtqlResponse, HttpError},
 };
 
 fn escape_sql(s: &str) -> String {
@@ -169,7 +170,7 @@ pub async fn list_functions(
     function_type: Option<&str>,
 ) -> Result<Vec<Function>> {
     let query = list_functions_query(project_id, function_type);
-    let response = client.btql::<Function>(&query).await?;
+    let response: BtqlResponse<Function> = client.btql(&query).await?;
 
     Ok(response.data)
 }
@@ -243,15 +244,17 @@ pub async fn invoke_function(
     client: &ApiClient,
     body: &serde_json::Value,
 ) -> Result<serde_json::Value> {
-    let org_name = client.org_name();
-    let headers = if !org_name.is_empty() {
-        vec![("x-bt-org-name", org_name)]
+    let client = if client.org_name().is_empty() {
+        client.clone()
     } else {
-        Vec::new()
+        client.header("x-bt-org-name", client.org_name())
     };
-    let timeout = std::time::Duration::from_secs(300);
     let result = client
-        .post_with_headers_timeout("/function/invoke", body, &headers, Some(timeout))
+        .with_options(HttpOptions {
+            timeout: Some(std::time::Duration::from_secs(300)),
+            ..Default::default()
+        })
+        .post("/function/invoke", body)
         .await;
 
     match result {

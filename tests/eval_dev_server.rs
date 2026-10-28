@@ -585,6 +585,10 @@ fn eval_dev_server_done_deferred_until_process_exit() {
                 "BRAINTRUST_APP_URL",
                 format!("http://127.0.0.1:{mock_api_port}"),
             )
+            .env(
+                "BRAINTRUST_API_URL",
+                format!("http://127.0.0.1:{mock_api_port}"),
+            )
             .env("BRAINTRUST_API_KEY", "test-key")
             .env("BRAINTRUST_EVAL_PYTHON_RUNNER", &python)
             .env("ATEXIT_MARKER_FILE", marker_path.to_string_lossy().as_ref())
@@ -675,9 +679,8 @@ fn eval_dev_server_done_deferred_until_process_exit() {
 }
 
 /// Verify that when a `parent` is included in the eval request, the eval
-/// completes successfully and no error events are emitted. With --no-send-logs
-/// we avoid needing a mock API server; the important thing is that the parent
-/// reaches the SDK's parent_context() without crashing.
+/// completes successfully and no error events are emitted. Parented spans can
+/// cause SDK traffic even in local mode, so both API and login use a mock server.
 #[test]
 fn eval_dev_server_parent_accepted() {
     let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
@@ -698,7 +701,7 @@ fn eval_dev_server_parent_accepted() {
     };
 
     let bt_path = bt_binary_path(&root);
-    let (mock_auth_port, _mock_handle) = start_mock_auth_server();
+    let (mock_api_port, _log_row_count, _mock_handle) = start_mock_api_server();
 
     let dev_port = free_port();
     let mut child = common::TestChild(
@@ -714,7 +717,11 @@ fn eval_dev_server_parent_accepted() {
             .current_dir(&fixture_dir)
             .env(
                 "BRAINTRUST_APP_URL",
-                format!("http://127.0.0.1:{mock_auth_port}"),
+                format!("http://127.0.0.1:{mock_api_port}"),
+            )
+            .env(
+                "BRAINTRUST_API_URL",
+                format!("http://127.0.0.1:{mock_api_port}"),
             )
             .env("BRAINTRUST_API_KEY", "test-key")
             .env("BRAINTRUST_EVAL_PYTHON_RUNNER", &python)
@@ -770,7 +777,7 @@ fn eval_dev_server_parent_accepted() {
 
     assert!(
         !events.iter().any(|e| e.event == "error"),
-        "expected no error events when parent is provided, got: {event_names:?}"
+        "expected no error events when parent is provided, got: {events:?}"
     );
     assert!(
         events.iter().any(|e| e.event == "summary"),
@@ -812,7 +819,7 @@ fn eval_dev_server_parent_dict_accepted() {
     };
 
     let bt_path = bt_binary_path(&root);
-    let (mock_auth_port, _mock_handle) = start_mock_auth_server();
+    let (mock_api_port, _log_row_count, _mock_handle) = start_mock_api_server();
 
     let dev_port = free_port();
     let mut child = common::TestChild(
@@ -828,7 +835,11 @@ fn eval_dev_server_parent_dict_accepted() {
             .current_dir(&fixture_dir)
             .env(
                 "BRAINTRUST_APP_URL",
-                format!("http://127.0.0.1:{mock_auth_port}"),
+                format!("http://127.0.0.1:{mock_api_port}"),
+            )
+            .env(
+                "BRAINTRUST_API_URL",
+                format!("http://127.0.0.1:{mock_api_port}"),
             )
             .env("BRAINTRUST_API_KEY", "test-key")
             .env("BRAINTRUST_EVAL_PYTHON_RUNNER", &python)
@@ -890,7 +901,7 @@ fn eval_dev_server_parent_dict_accepted() {
 
     assert!(
         !events.iter().any(|e| e.event == "error"),
-        "expected no error events when dict parent is provided, got: {event_names:?}"
+        "expected no error events when dict parent is provided, got: {events:?}"
     );
     assert!(
         events.iter().any(|e| e.event == "summary"),

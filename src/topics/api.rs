@@ -1,3 +1,4 @@
+use crate::http::BtqlOptions;
 use std::collections::{BTreeMap, HashMap};
 
 use anyhow::{bail, Result};
@@ -397,13 +398,6 @@ struct ResetObjectCursorRequest {
     automation_id: String,
     object_id: String,
     start_xact_id: String,
-}
-
-#[derive(Debug, Clone, Serialize)]
-struct BtqlValueRequest<'a> {
-    query: &'a str,
-    fmt: &'static str,
-    brainstore_realtime: bool,
 }
 
 pub async fn fetch_topics_status(
@@ -1990,7 +1984,15 @@ async fn fetch_topic_automation_progress(
     let total_query = format!(
         "from: project_logs('{escaped_project_id}') spans | measures: count_distinct(root_span_id) as total_traces | filter: {time_filter_clause}"
     );
-    let total_response = execute_btql_value(client, &total_query).await?;
+    let total_response = client
+        .btql_with_options::<Value>(
+            &total_query,
+            BtqlOptions {
+                realtime: Some(true),
+                ..Default::default()
+            },
+        )
+        .await?;
     let total_row = first_btql_row(&total_response);
     let aggregate_row = if measure_expressions.is_empty() {
         None
@@ -1999,7 +2001,15 @@ async fn fetch_topic_automation_progress(
             "from: project_logs('{escaped_project_id}') spans | measures: {} | filter: {time_filter_clause}",
             measure_expressions.join(", ")
         );
-        let aggregate_response = execute_btql_value(client, &aggregate_query).await?;
+        let aggregate_response = client
+            .btql_with_options::<Value>(
+                &aggregate_query,
+                BtqlOptions {
+                    realtime: Some(true),
+                    ..Default::default()
+                },
+            )
+            .await?;
         first_btql_row(&aggregate_response).cloned()
     };
 
@@ -2072,21 +2082,6 @@ async fn fetch_topic_automation_progress(
             })
             .collect(),
     })
-}
-
-async fn execute_btql_value(client: &ApiClient, query: &str) -> Result<Value> {
-    let body = BtqlValueRequest {
-        query,
-        fmt: "json",
-        brainstore_realtime: true,
-    };
-    let org_name = client.org_name();
-    let headers = if !org_name.is_empty() {
-        vec![("x-bt-org-name", org_name)]
-    } else {
-        Vec::new()
-    };
-    client.post_with_headers("/btql", &body, &headers).await
 }
 
 fn first_btql_row(response: &Value) -> Option<&serde_json::Map<String, Value>> {
