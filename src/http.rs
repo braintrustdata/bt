@@ -1,11 +1,37 @@
+//! Authenticated API access. Headers, errors, decoding, and retries live here.
+//! Use `with_options(HttpOptions { .. })` before any HTTP or BTQL call.
+//!
+//! ```ignore
+//! let project: Project = client.get("/v1/project/test-id").await?;
+//! let created: Project = client.with_options(HttpOptions {
+//!     timeout: Some(Duration::from_secs(60)), ..Default::default()
+//! }).post("/v1/project", &body).await?;
+//! let page: BtqlResponse<Row> = client.header("x-request-tag", "test-query").btql(&query).await?;
+//! let options = BtqlOptions { lint_mode: Some("strict"), ..Default::default() };
+//! let result: SqlResponse = client.btql_with_options(&sql, options).await?;
+//! let response: WithHeaders<Project> = client.post("/v1/project", &body).await?;
+//! let Text(body) = client.get("/text-endpoint").await?;
+//! let NoContent = client.post("/action", &body).await?;
+//! client.delete("/v1/project/test-id").await?;
+//! // Pages preserve cursors/schema; use TryStreamExt to fold or flatten them.
+//! let pages = Pagination::default().pages(None, 100, |limit, cursor| async move {
+//!     client.btql(&build_query(limit, cursor)).await
+//! });
+//! ```
+pub mod btql;
+pub use btql::{BtqlOptions, Pagination};
+
+use backoff::{backoff::Backoff, ExponentialBackoffBuilder};
 use std::collections::HashMap;
+use std::future::Future;
+use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
 use reqwest::header::{HeaderValue, CONTENT_TYPE};
 use reqwest::{Client, ClientBuilder, Method, StatusCode};
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
-use serde_json::json;
 
 use crate::auth::LoginContext;
 
@@ -34,6 +60,7 @@ pub struct ApiClient {
     api_key: String,
     org_id: String,
     org_name: String,
+    options: HttpOptions,
 }
 
 #[derive(Debug)]
@@ -166,11 +193,13 @@ fn parse_response_error<T>(
     ResponseParseError { message }.into()
 }
 
-#[derive(Debug, Deserialize)]
-pub struct BtqlResponse<T> {
+#[derive(Debug, Serialize, Deserialize)]
+pub struct BtqlResponse<T = serde_json::Map<String, serde_json::Value>> {
     pub data: Vec<T>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "btql::deserialize_cursor")]
     pub cursor: Option<String>,
+    #[serde(default)]
+    pub schema: Option<serde_json::Value>,
 }
 
 impl ApiClient {
@@ -183,6 +212,7 @@ impl ApiClient {
             api_key: ctx.login.api_key().context("login state missing API key")?,
             org_id: ctx.login.org_id().unwrap_or_default(),
             org_name: ctx.login.org_name().unwrap_or_default(),
+            options: HttpOptions::default(),
         })
     }
 
@@ -207,182 +237,255 @@ impl ApiClient {
         &self.org_name
     }
 
-    pub async fn get<T: DeserializeOwned>(&self, path: &str) -> Result<T> {
-        self.get_with_headers(path, &[]).await
+    /// Return a configured copy, leaving the original client unchanged.
+    /// Unset scalar options inherit existing settings; headers and query params
+    /// are appended. Settings apply to both HTTP and BTQL calls.
+    pub fn with_options(&self, options: HttpOptions) -> Self {
+        let mut configured = self.clone();
+        configured.options.timeout = options.timeout.or(configured.options.timeout);
+        configured.options.retry = options.retry.or(configured.options.retry);
+        configured.options.on_retry = options.on_retry.or(configured.options.on_retry);
+        configured.options.trace = options.trace.or(configured.options.trace);
+        configured.options.headers.extend(options.headers);
+        configured.options.query.extend(options.query);
+        configured
     }
 
-    pub async fn get_with_headers<T: DeserializeOwned>(
+    /// Append a header on a configured copy before an HTTP or BTQL call.
+    pub fn header(&self, name: &str, value: &str) -> Self {
+        self.with_options(HttpOptions {
+            headers: vec![(name.to_owned(), value.to_owned())],
+            ..Default::default()
+        })
+    }
+
+    fn prepare(&self, method: Method, path: &str) -> reqwest::RequestBuilder {
+        let mut inner = self
+            .http
+            .request(method.clone(), self.url(path))
+            .bearer_auth(&self.api_key);
+        for (name, value) in &self.options.headers {
+            inner = inner.header(name, value);
+        }
+        if let Some(timeout) = self.options.timeout {
+            inner = inner.timeout(timeout);
+        }
+        inner.query(&self.options.query)
+    }
+
+    async fn send_empty<T: FromResponse>(&self, method: Method, path: &str) -> Result<T> {
+        let request = self.prepare(method.clone(), path);
+        self.execute(method, path, request).await
+    }
+    pub async fn get<T: FromResponse>(&self, path: &str) -> Result<T> {
+        self.send_empty(Method::GET, path).await
+    }
+    pub async fn post<T: FromResponse>(
         &self,
         path: &str,
-        headers: &[(&str, &str)],
+        body: &(impl Serialize + ?Sized),
     ) -> Result<T> {
-        let url = self.url(path);
-        let mut request = self.http.get(&url).bearer_auth(&self.api_key);
-
-        for (key, value) in headers {
-            request = request.header(*key, *value);
-        }
-
-        let response = request.send().await.context("request failed")?;
-
-        if !response.status().is_success() {
-            return Err(response_error(response).await.into());
-        }
-
-        parse_json_response(response, "GET", path).await
+        self.send_body(Method::POST, path, body).await
     }
-
-    async fn send_json<T: DeserializeOwned, B: Serialize>(
+    pub async fn put<T: FromResponse>(
+        &self,
+        path: &str,
+        body: &(impl Serialize + ?Sized),
+    ) -> Result<T> {
+        self.send_body(Method::PUT, path, body).await
+    }
+    pub async fn patch<T: FromResponse>(
+        &self,
+        path: &str,
+        body: &(impl Serialize + ?Sized),
+    ) -> Result<T> {
+        self.send_body(Method::PATCH, path, body).await
+    }
+    async fn send_body<T: FromResponse>(
         &self,
         method: Method,
         path: &str,
-        body: &B,
+        body: &(impl Serialize + ?Sized),
     ) -> Result<T> {
-        let response = self
-            .http
-            .request(method.clone(), self.url(path))
-            .bearer_auth(&self.api_key)
-            .json(body)
-            .send()
-            .await
-            .context("request failed")?;
-        if !response.status().is_success() {
-            return Err(response_error(response).await.into());
-        }
-        parse_json_response(response, method.as_str(), path).await
+        let request = self.prepare(method.clone(), path).json(body);
+        self.execute(method, path, request).await
     }
 
-    pub async fn post<T: DeserializeOwned, B: Serialize>(&self, path: &str, body: &B) -> Result<T> {
-        self.send_json(Method::POST, path, body).await
-    }
-
-    pub async fn put<T: DeserializeOwned, B: Serialize>(&self, path: &str, body: &B) -> Result<T> {
-        self.send_json(Method::PUT, path, body).await
-    }
-
-    pub async fn patch<T: DeserializeOwned, B: Serialize>(
-        &self,
-        path: &str,
-        body: &B,
-    ) -> Result<T> {
-        self.send_json(Method::PATCH, path, body).await
-    }
-
-    pub async fn post_with_headers<T, B>(
-        &self,
-        path: &str,
-        body: &B,
-        headers: &[(&str, &str)],
-    ) -> Result<T>
-    where
-        T: DeserializeOwned,
-        B: Serialize,
-    {
-        self.post_with_headers_timeout(path, body, headers, None)
-            .await
-    }
-
-    pub async fn post_with_headers_timeout<T, B>(
-        &self,
-        path: &str,
-        body: &B,
-        headers: &[(&str, &str)],
-        timeout: Option<std::time::Duration>,
-    ) -> Result<T>
-    where
-        T: DeserializeOwned,
-        B: Serialize,
-    {
-        let url = self.url(path);
-        let mut request = self.http.post(&url).bearer_auth(&self.api_key).json(body);
-
-        for (key, value) in headers {
-            request = request.header(*key, *value);
-        }
-        if let Some(t) = timeout {
-            request = request.timeout(t);
-        }
-
-        let response = request.send().await.context("request failed")?;
-
-        if !response.status().is_success() {
-            return Err(response_error(response).await.into());
-        }
-
-        parse_json_response(response, "POST", path).await
-    }
-
-    pub async fn post_with_headers_raw<B>(
-        &self,
-        path: &str,
-        body: &B,
-        headers: &[(&str, &str)],
-    ) -> Result<reqwest::Response>
-    where
-        B: Serialize,
-    {
-        let url = self.url(path);
-        let mut request = self.http.post(&url).bearer_auth(&self.api_key).json(body);
-
-        for (key, value) in headers {
-            request = request.header(*key, *value);
-        }
-
-        request.send().await.context("request failed")
-    }
-
-    async fn send_delete(&self, path: &str) -> Result<reqwest::Response> {
-        let response = self
-            .http
-            .delete(self.url(path))
-            .bearer_auth(&self.api_key)
-            .send()
-            .await
-            .context("request failed")?;
-        if !response.status().is_success() {
-            return Err(response_error(response).await.into());
-        }
-        Ok(response)
-    }
-
+    /// Delete an object, ignoring a successful response body.
     pub async fn delete(&self, path: &str) -> Result<()> {
-        self.send_delete(path).await.map(|_| ())
+        self.delete_with_response::<NoContent>(path)
+            .await
+            .map(|_| ())
     }
 
-    pub async fn delete_with_response<T: DeserializeOwned>(&self, path: &str) -> Result<T> {
-        parse_json_response(self.send_delete(path).await?, "DELETE", path).await
+    /// Delete an object and decode the response body.
+    pub async fn delete_with_response<T: FromResponse>(&self, path: &str) -> Result<T> {
+        self.send_empty(Method::DELETE, path).await
     }
+}
 
-    pub async fn btql<T: DeserializeOwned>(&self, query: &str) -> Result<BtqlResponse<T>> {
-        self.btql_with_query(query).await
+/// Transport settings shared by HTTP and BTQL. Unset fields use client defaults.
+#[derive(Clone, Default)]
+pub struct HttpOptions {
+    pub timeout: Option<Duration>,
+    pub headers: Vec<(String, String)>,
+    pub query: Vec<(String, String)>,
+    /// HTTP defaults to one attempt; BTQL defaults to retrying transient failures.
+    /// Opt into retries only when an operation is safe to repeat.
+    pub retry: Option<bool>,
+    pub on_retry: Option<Arc<dyn Fn(RetryReason) + Send + Sync>>,
+    pub trace: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RetryReason {
+    Status(u16),
+    Network,
+}
+
+const MAX_ATTEMPTS: usize = 5;
+const MAX_DELAY: Duration = Duration::from_secs(8);
+
+fn retry_reason(error: &anyhow::Error) -> Option<RetryReason> {
+    if let Some(error) = error.downcast_ref::<HttpError>() {
+        let status = error.status;
+        return (status.is_server_error()
+            || status == StatusCode::PAYLOAD_TOO_LARGE
+            || status == StatusCode::TOO_MANY_REQUESTS)
+            .then_some(RetryReason::Status(status.as_u16()));
     }
+    error.downcast_ref::<reqwest::Error>().and_then(|error| {
+        (!error.is_builder()
+            && (error.is_connect() || error.is_timeout() || error.is_request() || error.is_body()))
+        .then_some(RetryReason::Network)
+    })
+}
 
-    pub async fn btql_structured<T, Q>(&self, query: &Q) -> Result<BtqlResponse<T>>
-    where
-        T: DeserializeOwned,
-        Q: Serialize + ?Sized,
-    {
-        self.btql_with_query(query).await
-    }
+fn retry_delay(retry_after: Option<Duration>, backoff: &mut impl Backoff) -> Duration {
+    // Server rate-limit windows take precedence over the local backoff cap.
+    retry_after.unwrap_or_else(|| backoff.next_backoff().unwrap_or(MAX_DELAY).min(MAX_DELAY))
+}
 
-    async fn btql_with_query<T, Q>(&self, query: &Q) -> Result<BtqlResponse<T>>
-    where
-        T: DeserializeOwned,
-        Q: Serialize + ?Sized,
-    {
-        let body = json!({
-            "query": query,
-            "fmt": "json",
-        });
-
-        let org_name = self.org_name();
-        let headers = if !org_name.is_empty() {
-            vec![("x-bt-org-name", org_name)]
+impl ApiClient {
+    async fn execute<T: FromResponse>(
+        &self,
+        method: Method,
+        path: &str,
+        request: reqwest::RequestBuilder,
+    ) -> Result<T> {
+        let started = Instant::now();
+        let mut backoff = ExponentialBackoffBuilder::new()
+            .with_initial_interval(Duration::from_millis(300))
+            .with_multiplier(2.0)
+            .with_randomization_factor(0.2)
+            .with_max_interval(MAX_DELAY)
+            .with_max_elapsed_time(None)
+            .build();
+        let attempts = if self.options.retry.unwrap_or(false) {
+            MAX_ATTEMPTS
         } else {
-            Vec::new()
+            1
         };
+        let (client, request) = request.build_split();
+        let request = request.context("failed to build API request")?;
+        let mut attempt = 0;
+        loop {
+            attempt += 1;
+            let request = request
+                .try_clone()
+                .context("request body cannot be replayed for retry")?;
+            let mut retry_after = None;
+            let result = async {
+                let response = client.execute(request).await?;
+                retry_after = response
+                    .headers()
+                    .get(reqwest::header::RETRY_AFTER)
+                    .and_then(|value| value.to_str().ok())
+                    .and_then(|value| value.parse::<u64>().ok())
+                    .map(Duration::from_secs);
+                if !response.status().is_success() {
+                    return Err(response_error(response).await.into());
+                }
+                T::decode(response, method.as_str(), path).await
+            }
+            .await;
+            if let Err(error) = &result {
+                if attempt < attempts {
+                    if let Some(reason) = retry_reason(error) {
+                        if let Some(observer) = &self.options.on_retry {
+                            observer(reason);
+                        }
+                        tokio::time::sleep(retry_delay(retry_after, &mut backoff)).await;
+                        continue;
+                    }
+                }
+            }
+            if let Some(label) = &self.options.trace {
+                eprintln!(
+                    "{label}: {} {} {}ms {}",
+                    method,
+                    path,
+                    started.elapsed().as_millis(),
+                    if result.is_ok() { "ok" } else { "failed" }
+                );
+            }
+            return result.map_err(|error| {
+                let message = format!(
+                    "{} {} failed after {attempt} attempt(s): {error}",
+                    method, path
+                );
+                error.context(message)
+            });
+        }
+    }
+}
 
-        self.post_with_headers("/btql", &body, &headers).await
+/// The response type selects decoding. Ordinary deserializable types use JSON.
+/// Decoding stays inside the shared retry/error boundary, including body reads.
+pub trait FromResponse: Sized {
+    fn decode(
+        response: reqwest::Response,
+        method: &str,
+        path: &str,
+    ) -> impl Future<Output = Result<Self>> + Send;
+}
+impl<T: DeserializeOwned> FromResponse for T {
+    async fn decode(response: reqwest::Response, method: &str, path: &str) -> Result<Self> {
+        parse_json_response(response, method, path).await
+    }
+}
+
+/// A successful response whose body is irrelevant (including an empty 204).
+pub struct NoContent;
+impl FromResponse for NoContent {
+    async fn decode(_: reqwest::Response, _: &str, _: &str) -> Result<Self> {
+        Ok(Self)
+    }
+}
+
+/// A text response, without JSON decoding.
+#[derive(Debug)]
+pub struct Text(pub String);
+impl FromResponse for Text {
+    async fn decode(response: reqwest::Response, _: &str, _: &str) -> Result<Self> {
+        response
+            .text()
+            .await
+            .map(Self)
+            .context("failed to read response body")
+    }
+}
+
+/// Retain response headers alongside a decoded JSON or text body.
+pub struct WithHeaders<T> {
+    pub headers: reqwest::header::HeaderMap,
+    pub body: T,
+}
+impl<T: FromResponse> FromResponse for WithHeaders<T> {
+    async fn decode(response: reqwest::Response, method: &str, path: &str) -> Result<Self> {
+        let headers = response.headers().clone();
+        let body = T::decode(response, method, path).await?;
+        Ok(Self { headers, body })
     }
 }
 

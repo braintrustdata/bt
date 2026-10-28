@@ -2,7 +2,7 @@ use anyhow::Result;
 use serde::{Deserialize, Serialize};
 use urlencoding::encode;
 
-use crate::http::ApiClient;
+use crate::http::{ApiClient, HttpOptions};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Project {
@@ -19,8 +19,13 @@ struct ListResponse {
 }
 
 pub async fn list_projects(client: &ApiClient) -> Result<Vec<Project>> {
-    let path = format!("/v1/project?org_name={}", encode(client.org_name()));
-    let list: ListResponse = client.get(&path).await?;
+    let list: ListResponse = client
+        .with_options(HttpOptions {
+            query: vec![("org_name".into(), client.org_name().into())],
+            ..Default::default()
+        })
+        .get("/v1/project")
+        .await?;
     Ok(list.objects)
 }
 
@@ -42,11 +47,15 @@ pub async fn delete_project(client: &ApiClient, project_id: &str) -> Result<()> 
 }
 
 pub async fn get_project_by_name(client: &ApiClient, name: &str) -> Result<Option<Project>> {
-    let path = format!(
-        "/v1/project?org_name={}&project_name={}",
-        encode(client.org_name()),
-        encode(name)
-    );
-    let list: ListResponse = client.get(&path).await?;
+    let list: ListResponse = client
+        .with_options(HttpOptions {
+            query: vec![
+                ("org_name".into(), client.org_name().into()),
+                ("project_name".into(), name.into()),
+            ],
+            ..Default::default()
+        })
+        .get("/v1/project")
+        .await?;
     Ok(list.objects.into_iter().next())
 }

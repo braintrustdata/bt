@@ -1,12 +1,9 @@
 use std::collections::{HashMap, HashSet};
 
 use anyhow::Result;
-use serde::Deserialize;
 use serde_json::{json, Map, Value};
 
-use crate::auth::LoginContext;
-use crate::http::ApiClient;
-use crate::sync::execute_btql_json_query;
+use crate::http::{ApiClient, BtqlOptions, BtqlResponse, Pagination};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum ProjectLogRefScope {
@@ -54,16 +51,8 @@ pub(crate) struct ProjectLogRefDiscoveryOptions<'a> {
     pub(crate) page_size: usize,
 }
 
-#[derive(Debug, Deserialize)]
-struct DiscoveryBtqlResponse {
-    data: Vec<Map<String, Value>>,
-    #[serde(default)]
-    cursor: Option<String>,
-}
-
 pub(crate) async fn discover_project_log_refs<F>(
     client: &ApiClient,
-    ctx: &LoginContext,
     options: ProjectLogRefDiscoveryOptions<'_>,
     mut on_ref: F,
 ) -> Result<ProjectLogRefDiscoveryResult>
@@ -82,12 +71,22 @@ where
     let mut trace_refs_by_root_span_id = HashMap::new();
     let mut cursor: Option<String> = None;
     let mut pages = 0usize;
+    let mut pagination = Pagination::default();
     while discovered_ref_count(scope, seen.len(), trace_roots.len()) < target {
+        pagination.check(cursor.as_deref())?;
         let remaining = target - discovered_ref_count(scope, seen.len(), trace_roots.len());
         let limit = discovery_page_limit(scope, remaining, page_size);
         let query =
             build_project_log_ref_query(project_id, filter, limit, cursor.as_deref(), scope);
-        let response = execute_discovery_btql(client, ctx, &query).await?;
+        let response: BtqlResponse = client
+            .btql_with_options(
+                &query,
+                BtqlOptions {
+                    source: Some("bt_sync_discovery"),
+                    ..Default::default()
+                },
+            )
+            .await?;
         let row_count = response.data.len();
 
         for row in response.data {
@@ -124,7 +123,7 @@ where
         }
 
         pages += 1;
-        cursor = response.cursor.filter(|c| !c.is_empty());
+        cursor = response.cursor;
         if row_count == 0 || cursor.is_none() {
             break;
         }
@@ -155,14 +154,6 @@ fn discovery_page_limit(scope: ProjectLogRefScope, remaining: usize, page_size: 
         ProjectLogRefScope::Trace => page_size.min(1000),
         ProjectLogRefScope::Span => remaining.min(page_size).min(1000),
     }
-}
-
-async fn execute_discovery_btql(
-    client: &ApiClient,
-    ctx: &LoginContext,
-    query: &Value,
-) -> Result<DiscoveryBtqlResponse> {
-    execute_btql_json_query(client, ctx, query, "bt_sync_discovery").await
 }
 
 fn build_project_log_ref_query(
