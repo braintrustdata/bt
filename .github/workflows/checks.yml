@@ -81,6 +81,27 @@ jobs:
           cargo test --locked --test cli --test datasets --test setup_cli --test self_update --test sync
           node --test scripts/custom-views-preview.test.mjs
 
+  minimum-rust-version:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    permissions:
+      contents: read
+    env:
+      CARGO_NET_GIT_FETCH_WITH_CLI: true
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - uses: ./.github/actions/setup-rust-node
+        with:
+          rust-cache-key: minimum-rust-version
+      - name: Install JS dependencies
+        run: pnpm install --frozen-lockfile --ignore-scripts
+      - name: Check the declared minimum Rust version
+        shell: bash
+        run: |
+          rust_version=$(python3 -c 'import tomllib; print(tomllib.load(open("Cargo.toml", "rb"))["package"]["rust-version"])')
+          rustup toolchain install "$rust_version" --profile minimal
+          cargo +"$rust_version" check --locked --bin bt
+
   windows-auth-tests:
     runs-on: windows-latest
     timeout-minutes: 60
@@ -196,6 +217,7 @@ jobs:
       - pre-commit
       - npm-tests
       - core-tests
+      - minimum-rust-version
       - windows-auth-tests
       - eval-tests-go
       - eval-tests-node
