@@ -574,7 +574,7 @@ dependencies = [
 [[package]]
 name = "braintrust-sdk-rust"
 version = "0.1.0-alpha.2"
-source = "git+https://github.com/braintrustdata/braintrust-sdk-rust?rev=821bf4d331193e2c40abce5c22eefca794c91f25#821bf4d331193e2c40abce5c22eefca794c91f25"
+source = "git+https://github.com/braintrustdata/braintrust-sdk-rust?rev=d8ada65116de28ea4300cc934b45495e268b622d#d8ada65116de28ea4300cc934b45495e268b622d"
 dependencies = [
  "anyhow",
  "arc-swap",
@@ -704,7 +704,7 @@ dependencies = [
 [[package]]
 name = "bt-daemon"
 version = "0.1.0"
-source = "git+https://github.com/braintrustdata/braintrust-coding-agent-plugins?rev=6232ffa9cef0a8d518a9b0d27543a851e3ad64d6#6232ffa9cef0a8d518a9b0d27543a851e3ad64d6"
+source = "git+https://github.com/braintrustdata/braintrust-coding-agent-plugins?rev=f4f58fdbffefc31c830dbf24622ae0f5e0cb7f3e#f4f58fdbffefc31c830dbf24622ae0f5e0cb7f3e"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -1421,7 +1421,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "39cab71617ae0d63f51a36d69f866391735b51691dbda63cf6f96d042b63efeb"
 dependencies = [
  "libc",
- "windows-sys 0.59.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -1946,7 +1946,7 @@ dependencies = [
  "libc",
  "percent-encoding",
  "pin-project-lite",
- "socket2 0.5.10",
+ "socket2 0.6.5",
  "tokio",
  "tower-service",
  "tracing",
@@ -2646,7 +2646,7 @@ version = "0.50.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7957b9740744892f114936ab4a57b3f487491bbeafaf8083688b16841a4240e5"
 dependencies = [
- "windows-sys 0.59.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -3181,7 +3181,7 @@ dependencies = [
  "quinn-udp",
  "rustc-hash",
  "rustls",
- "socket2 0.5.10",
+ "socket2 0.6.5",
  "thiserror 2.0.19",
  "tokio",
  "tracing",
@@ -3220,9 +3220,9 @@ dependencies = [
  "cfg_aliases 0.2.2",
  "libc",
  "once_cell",
- "socket2 0.5.10",
+ "socket2 0.6.5",
  "tracing",
- "windows-sys 0.59.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -3685,7 +3685,7 @@ dependencies = [
  "errno",
  "libc",
  "linux-raw-sys 0.12.1",
- "windows-sys 0.59.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -3743,7 +3743,7 @@ dependencies = [
  "security-framework",
  "security-framework-sys",
  "webpki-root-certs",
- "windows-sys 0.52.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -4713,10 +4713,10 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "32497e9a4c7b38532efcdebeef879707aa9f794296a4f0244f6f69e9bc8574bd"
 dependencies = [
  "fastrand",
- "getrandom 0.3.4",
+ "getrandom 0.4.3",
  "once_cell",
  "rustix 1.1.4",
- "windows-sys 0.59.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -5560,7 +5560,7 @@ version = "0.1.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c2a7b1c03c876122aa43f3020e6c3c3ee5c05081c9a00739faf7503aeba10d22"
 dependencies = [
- "windows-sys 0.48.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
