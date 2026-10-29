@@ -574,7 +574,7 @@ dependencies = [
 [[package]]
 name = "braintrust-sdk-rust"
 version = "0.1.0-alpha.2"
-source = "git+https://github.com/braintrustdata/braintrust-sdk-rust?rev=5655b087a3991b5d278366d1a45aaaceafcfe303#5655b087a3991b5d278366d1a45aaaceafcfe303"
+source = "git+https://github.com/braintrustdata/braintrust-sdk-rust?rev=019b888019939e2a4ccb87e039a2d676da641d64#019b888019939e2a4ccb87e039a2d676da641d64"
 dependencies = [
  "anyhow",
  "arc-swap",
@@ -704,7 +704,7 @@ dependencies = [
 [[package]]
 name = "bt-daemon"
 version = "0.1.0"
-source = "git+https://github.com/braintrustdata/braintrust-coding-agent-plugins?rev=079ea92c7cd88ac3a06fc7a7c5e4d74b5338c563#079ea92c7cd88ac3a06fc7a7c5e4d74b5338c563"
+source = "git+https://github.com/braintrustdata/braintrust-coding-agent-plugins?rev=84a340ad1bbc683fe1371bb4d6dc5128cf150490#84a340ad1bbc683fe1371bb4d6dc5128cf150490"
 dependencies = [
  "anyhow",
  "async-trait",
