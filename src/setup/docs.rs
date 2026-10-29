@@ -17,6 +17,16 @@ const DEFAULT_DOCS_LLMS_FULL_URL: &str = "https://www.braintrust.dev/docs/llms-f
 const CORE_REFERENCE_WORKFLOW: &str = "reference";
 const SQL_REFERENCE_DOC_TITLE: &str = "SQL queries";
 const SQL_REFERENCE_DOC_URL: &str = "https://www.braintrust.dev/docs/reference/sql.md";
+const DOCS_HOST: &str = "docs.braintrust.dev";
+const CANONICAL_DOCS_URL_PREFIXES: [(&str, &str); 4] = [
+    ("https://www.braintrust.dev/", "https://braintrust.dev/"),
+    ("http://www.braintrust.dev/", "http://braintrust.dev/"),
+    (
+        "https://docs.braintrust.dev/",
+        "https://braintrust.dev/docs/",
+    ),
+    ("http://docs.braintrust.dev/", "http://braintrust.dev/docs/"),
+];
 
 #[derive(Debug, Clone, Args)]
 #[command(after_help = "\
@@ -191,13 +201,13 @@ pub(super) async fn fetch_docs_pages(
         Regex::new(r"\[([^\]]+)\]\(([^)\s]+)\)").context("failed to build markdown link regex")?;
     let bare_url_re =
         Regex::new(r#"(?m)\b(https?://[^\s<>"')]+)"#).context("failed to build URL regex")?;
-    let llms_base = reqwest::Url::parse(&args.llms_url)
+    let llms_url = reqwest::Url::parse(&args.llms_url)
         .with_context(|| format!("invalid llms URL: {}", args.llms_url))?;
     let client = crate::http::build_http_client(crate::http::DEFAULT_HTTP_TIMEOUT)
         .context("failed to build HTTP client")?;
 
     let index_response = client
-        .get(&args.llms_url)
+        .get(llms_url)
         .send()
         .await
         .with_context(|| format!("failed to fetch llms index {}", args.llms_url))?;
@@ -206,6 +216,8 @@ pub(super) async fn fetch_docs_pages(
         let body = index_response.text().await.unwrap_or_default();
         bail!("failed to fetch llms index ({status}): {body}");
     }
+    // Resolve relative links against the final URL so redirects to another docs host work.
+    let llms_base = index_response.url().clone();
     let index_body = index_response
         .text()
         .await
@@ -227,19 +239,18 @@ pub(super) async fn fetch_docs_pages(
                 format!("failed to fetch fallback index {DEFAULT_DOCS_LLMS_FULL_URL}")
             })?;
         if fallback_response.status().is_success() {
+            let fallback_base = fallback_response.url().clone();
             let fallback_body = fallback_response
                 .text()
                 .await
                 .context("failed to read fallback llms-full response body")?;
-            if let Ok(fallback_base) = reqwest::Url::parse(DEFAULT_DOCS_LLMS_FULL_URL) {
-                discovered = collect_docs_links(
-                    &fallback_body,
-                    &workflow_set,
-                    &workflow_link_re,
-                    &bare_url_re,
-                    &fallback_base,
-                );
-            }
+            discovered = collect_docs_links(
+                &fallback_body,
+                &workflow_set,
+                &workflow_link_re,
+                &bare_url_re,
+                &fallback_base,
+            );
         }
     }
     append_core_reference_links(&mut discovered);
@@ -442,21 +453,27 @@ pub(super) async fn fetch_docs_pages(
     })
 }
 
-fn workflow_from_url(url: &str) -> Option<&'static str> {
-    let canonical = url
-        .split(['?', '#'])
-        .next()
-        .unwrap_or(url)
-        .to_ascii_lowercase();
-    for workflow in ["instrument", "observe", "annotate", "evaluate", "deploy"] {
-        if canonical.contains(&format!("/docs/{workflow}/"))
-            || canonical.ends_with(&format!("/docs/{workflow}.md"))
-            || canonical.ends_with(&format!("/docs/{workflow}"))
-        {
-            return Some(workflow);
-        }
+fn docs_page_path(url: &str) -> Option<&str> {
+    let url = url.split(['?', '#']).next().unwrap_or(url);
+    let (_, rest) = url.split_once("://")?;
+    let (host, path) = rest.split_once('/').unwrap_or((rest, ""));
+    if let Some(page) = path.strip_prefix("docs/") {
+        return Some(page);
     }
-    None
+    if let Some(idx) = path.find("/docs/") {
+        return Some(&path[idx + "/docs/".len()..]);
+    }
+    host.eq_ignore_ascii_case(DOCS_HOST).then_some(path)
+}
+
+fn workflow_from_url(url: &str) -> Option<&'static str> {
+    let page = docs_page_path(url)?.to_ascii_lowercase();
+    ["instrument", "observe", "annotate", "evaluate", "deploy"]
+        .into_iter()
+        .find(|workflow| match page.strip_prefix(workflow) {
+            Some(rest) => rest.is_empty() || rest == ".md" || rest.starts_with('/'),
+            None => false,
+        })
 }
 
 fn slug_for_url(url: &str) -> String {
@@ -580,10 +597,11 @@ fn canonical_docs_url(url: &str) -> String {
         .unwrap_or(url)
         .trim_end_matches('/')
         .to_ascii_lowercase();
-    if let Some(stripped) = canonical.strip_prefix("https://www.braintrust.dev/") {
-        canonical = format!("https://braintrust.dev/{stripped}");
-    } else if let Some(stripped) = canonical.strip_prefix("http://www.braintrust.dev/") {
-        canonical = format!("http://braintrust.dev/{stripped}");
+    if let Some((to, stripped)) = CANONICAL_DOCS_URL_PREFIXES
+        .iter()
+        .find_map(|(from, to)| canonical.strip_prefix(from).map(|stripped| (to, stripped)))
+    {
+        canonical = format!("{to}{stripped}");
     }
     if canonical.ends_with(".md") {
         canonical.truncate(canonical.len() - 3);
@@ -652,15 +670,10 @@ fn workflow_relative_path(url: &str, workflow: &str) -> PathBuf {
         .next()
         .unwrap_or(url)
         .trim_end_matches('/');
-    let marker = format!("/docs/{workflow}/");
-    let tail = if let Some(idx) = canonical.find(&marker) {
-        canonical[idx + marker.len()..].to_string()
-    } else if canonical.ends_with(&format!("/docs/{workflow}"))
-        || canonical.ends_with(&format!("/docs/{workflow}.md"))
-    {
-        "index.md".to_string()
-    } else {
-        format!("{}.md", slug_for_url(url))
+    let tail = match docs_page_path(canonical).and_then(|page| page.strip_prefix(workflow)) {
+        Some("" | ".md") => "index.md".to_string(),
+        Some(rest) if rest.starts_with('/') => rest[1..].to_string(),
+        _ => format!("{}.md", slug_for_url(url)),
     };
 
     let mut clean_segments = Vec::new();
@@ -882,6 +895,96 @@ mod tests {
         assert_eq!(
             canonical_docs_url("https://www.braintrust.dev/docs/deploy/ai-proxy"),
             "https://braintrust.dev/docs/deploy/ai-proxy"
+        );
+    }
+
+    #[test]
+    fn workflow_from_url_detects_docs_subdomain_sections() {
+        assert_eq!(
+            workflow_from_url("https://docs.braintrust.dev/evaluate/overview.md"),
+            Some("evaluate")
+        );
+        assert_eq!(
+            workflow_from_url("https://docs.braintrust.dev/observe.md"),
+            Some("observe")
+        );
+        assert_eq!(
+            workflow_from_url("https://docs.braintrust.dev/instrument"),
+            Some("instrument")
+        );
+        assert_eq!(
+            workflow_from_url("https://docs.braintrust.dev/changelog.md"),
+            None
+        );
+        assert_eq!(
+            workflow_from_url("https://docs.braintrust.dev/evaluate-old/overview.md"),
+            None
+        );
+        assert_eq!(
+            workflow_from_url("https://example.com/evaluate/overview.md"),
+            None
+        );
+    }
+
+    #[test]
+    fn workflow_relative_path_handles_docs_subdomain() {
+        assert_eq!(
+            workflow_relative_path(
+                "https://docs.braintrust.dev/evaluate/models/custom-scorers.md",
+                "evaluate",
+            ),
+            PathBuf::from("models/custom-scorers.md")
+        );
+        assert_eq!(
+            workflow_relative_path("https://docs.braintrust.dev/observe", "observe"),
+            PathBuf::from("index.md")
+        );
+        assert_eq!(
+            workflow_relative_path("https://docs.braintrust.dev/reference/sql", "reference"),
+            PathBuf::from("sql.md")
+        );
+    }
+
+    #[test]
+    fn canonical_docs_url_matches_across_docs_domains() {
+        assert_eq!(
+            canonical_docs_url("https://docs.braintrust.dev/evaluate/index.md"),
+            canonical_docs_url("https://www.braintrust.dev/docs/evaluate")
+        );
+        assert_eq!(
+            canonical_docs_url("https://docs.braintrust.dev/reference/sql.md"),
+            canonical_docs_url(SQL_REFERENCE_DOC_URL)
+        );
+    }
+
+    #[test]
+    fn collect_docs_links_reads_docs_subdomain_index() {
+        let body = r#"
+- [Evaluate](https://docs.braintrust.dev/evaluate/index.md)
+- [Custom scorers](https://docs.braintrust.dev/evaluate/custom-scorers.md)
+- [AI proxy](/deploy/ai-proxy.md)
+- [Changelog](https://docs.braintrust.dev/changelog.md)
+"#;
+        let workflow_set = ["evaluate", "deploy"].into_iter().collect::<BTreeSet<_>>();
+        let link_re = Regex::new(r"\[([^\]]+)\]\(([^)\s]+)\)").expect("link regex");
+        let bare_re = Regex::new(r#"(?m)\b(https?://[^\s<>"')]+)"#).expect("url regex");
+        let base = reqwest::Url::parse("https://docs.braintrust.dev/llms.txt").expect("base");
+        let links = collect_docs_links(body, &workflow_set, &link_re, &bare_re, &base);
+
+        let urls = links
+            .iter()
+            .map(|(_, workflow, url)| (workflow.as_str(), url.as_str()))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            urls,
+            vec![
+                ("evaluate", "https://docs.braintrust.dev/evaluate/index.md"),
+                (
+                    "evaluate",
+                    "https://docs.braintrust.dev/evaluate/custom-scorers.md"
+                ),
+                ("deploy", "https://docs.braintrust.dev/deploy/ai-proxy.md"),
+            ]
         );
     }
 
