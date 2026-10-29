@@ -24,8 +24,14 @@ impl Config {
         let mut extra = self.extra.clone();
         extra.extend(other.extra.clone());
         let project = other.project.clone().or_else(|| self.project.clone());
+        let org_changed = trimmed_option(other.org.as_deref())
+            .zip(trimmed_option(self.org.as_deref()))
+            .is_some_and(|(other_org, self_org)| other_org != self_org);
         let project_id = if other.project.is_some() {
             other.project_id.clone()
+        } else if org_changed {
+            // A saved project ID belongs to the organization it was saved under.
+            None
         } else {
             self.project_id.clone()
         };
@@ -120,7 +126,7 @@ pub(crate) fn project_from_config_for_context(
         .flatten()
 }
 
-fn config_matches_context(cfg: &Config, resolved_org: Option<&str>) -> bool {
+pub(crate) fn config_matches_context(cfg: &Config, resolved_org: Option<&str>) -> bool {
     let cfg_org = trimmed_option(cfg.org.as_deref());
     let resolved_org = trimmed_option(resolved_org);
 
@@ -323,6 +329,30 @@ mod tests {
         let merged = base.merge(&other);
         assert_eq!(merged.org, Some("base-org".into()));
         assert_eq!(merged.project, Some("other-proj".into()));
+    }
+
+    #[test]
+    fn merge_keeps_inherited_project_id_only_for_the_same_org() {
+        let base = Config {
+            org: Some("base-org".into()),
+            project: Some("base-proj".into()),
+            project_id: Some("base-proj-id".into()),
+            ..Default::default()
+        };
+        let same_org = Config {
+            org: Some("base-org".into()),
+            ..Default::default()
+        };
+        let other_org = Config {
+            org: Some("other-org".into()),
+            ..Default::default()
+        };
+
+        assert_eq!(
+            base.merge(&same_org).project_id,
+            Some("base-proj-id".into())
+        );
+        assert_eq!(base.merge(&other_org).project_id, None);
     }
 
     fn config(profile: Option<&str>, org: Option<&str>, project: Option<&str>) -> Config {

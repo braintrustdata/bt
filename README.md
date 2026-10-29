@@ -575,7 +575,7 @@ Show current org and project context:
 
 - `bt status` — display current org, project, and config source
 - `bt status --verbose` — show detailed config resolution
-- `bt status -j` — JSON output
+- `bt status --json` — JSON output
 
 ## Application SDK setup
 
