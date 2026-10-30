@@ -8,19 +8,19 @@ Use these product workflow categories when deciding how to help users:
 
 Primary docs index:
 
-- `https://www.braintrust.dev/docs`
+- `https://docs.braintrust.dev`
 
 Category entry pages:
 
-- `https://www.braintrust.dev/docs/instrument`
-- `https://www.braintrust.dev/docs/observe`
-- `https://www.braintrust.dev/docs/annotate`
-- `https://www.braintrust.dev/docs/evaluate`
-- `https://www.braintrust.dev/docs/deploy`
+- `https://docs.braintrust.dev/instrument`
+- `https://docs.braintrust.dev/observe`
+- `https://docs.braintrust.dev/annotate`
+- `https://docs.braintrust.dev/evaluate`
+- `https://docs.braintrust.dev/deploy`
 
 When uncertain, prefer precise `bt` CLI commands for local operations, and use docs context to
 explain product concepts and recommended patterns.
 
 Core reference docs are also prefetched, including SQL reference:
 
-- `https://www.braintrust.dev/docs/reference/sql`
+- `https://docs.braintrust.dev/reference/sql`

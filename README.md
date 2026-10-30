@@ -449,7 +449,7 @@ Useful flags:
   - Prefer filtering with `WHERE`; use `HAVING` only after aggregation.
   - Unsupported SQL features include joins, subqueries, unions/intersections, and window functions.
   - Use explicit aliases for computed fields and cast timestamps/JSON values when needed.
-  - Full reference: `https://www.braintrust.dev/docs/reference/sql`
+  - Full reference: `https://docs.braintrust.dev/reference/sql`
 
 ## `bt view`
 
