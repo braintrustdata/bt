@@ -1,6 +1,6 @@
 # Ruby SDK Install
 
-**Read https://www.braintrust.dev/docs/sdks/ruby/install-and-instrument and follow it.**
+**Read https://docs.braintrust.dev/sdks/ruby/install-and-instrument and follow it.**
 
 That page is the source of truth for installing and instrumenting the Braintrust Ruby SDK -- the available setup approaches, auto-instrumented gems, and per-framework setup. Do not install or instrument from remembered snippets; they go stale.
 

@@ -12,11 +12,11 @@ use crate::sync::default_workers;
 
 use super::{resolve_workflow_selection, write_text_file, WorkflowArg};
 
-pub(super) const DEFAULT_DOCS_LLMS_URL: &str = "https://www.braintrust.dev/docs/llms.txt";
-const DEFAULT_DOCS_LLMS_FULL_URL: &str = "https://www.braintrust.dev/docs/llms-full.txt";
+pub(super) const DEFAULT_DOCS_LLMS_URL: &str = "https://docs.braintrust.dev/llms.txt";
+const DEFAULT_DOCS_LLMS_FULL_URL: &str = "https://docs.braintrust.dev/llms-full.txt";
 const CORE_REFERENCE_WORKFLOW: &str = "reference";
 const SQL_REFERENCE_DOC_TITLE: &str = "SQL queries";
-const SQL_REFERENCE_DOC_URL: &str = "https://www.braintrust.dev/docs/reference/sql.md";
+const SQL_REFERENCE_DOC_URL: &str = "https://docs.braintrust.dev/reference/sql.md";
 const DOCS_HOST: &str = "docs.braintrust.dev";
 const CANONICAL_DOCS_URL_PREFIXES: [(&str, &str); 4] = [
     ("https://www.braintrust.dev/", "https://braintrust.dev/"),

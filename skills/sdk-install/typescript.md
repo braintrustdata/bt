@@ -1,6 +1,6 @@
 # TypeScript SDK Install
 
-**Read https://www.braintrust.dev/docs/sdks/typescript/install-and-instrument and follow it.**
+**Read https://docs.braintrust.dev/sdks/typescript/install-and-instrument and follow it.**
 
 That page is the source of truth for installing and instrumenting the Braintrust TypeScript SDK -- supported clients and frameworks, automatic instrumentation (launch hook and bundler plugins), and per-runtime setup. Do not install or instrument from remembered snippets; they go stale.
 

@@ -119,7 +119,7 @@ Flags
 
 LEARN MORE
 Use `bt <command> <subcommand> --help` for more information about a command.
-Read the manual at https://braintrust.dev/docs/reference/cli
+Read the manual at https://docs.braintrust.dev/reference/cli/quickstart
 
 ";
 
@@ -130,7 +130,7 @@ Read the manual at https://braintrust.dev/docs/reference/cli
     version = CLI_VERSION,
     before_help = BANNER,
     help_template = HELP_TEMPLATE,
-    after_help = "Docs: https://braintrust.dev/docs",
+    after_help = "Docs: https://docs.braintrust.dev",
 )]
 struct Cli {
     #[command(subcommand)]

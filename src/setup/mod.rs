@@ -2778,8 +2778,8 @@ fn print_post_agent_followups(base: &BaseArgs) {
     if let Some(logs_url) = setup_project_logs_url(base) {
         eprintln!("  • Project logs: {logs_url}");
     }
-    eprintln!("  • Tracing docs: https://www.braintrust.dev/docs/instrument");
-    eprintln!("  • Eval docs: https://www.braintrust.dev/docs/evaluation");
+    eprintln!("  • Tracing docs: https://docs.braintrust.dev/instrument");
+    eprintln!("  • Eval docs: https://docs.braintrust.dev/evaluation-quickstart");
 }
 
 fn setup_project_logs_url(base: &BaseArgs) -> Option<String> {
