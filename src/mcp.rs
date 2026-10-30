@@ -138,6 +138,20 @@ struct Tool {
     input_schema: Value,
 }
 
+impl Tool {
+    fn required_arguments(&self) -> impl Iterator<Item = &str> {
+        self.input_schema
+            .get("required")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .filter_map(Value::as_str)
+            // The server accepts omitted telemetry even when its schema marks
+            // it required. Leave it absent rather than fabricating intent data.
+            .filter(|name| *name != "telemetry")
+    }
+}
+
 type ToolArgumentMap = BTreeMap<String, (String, Value)>;
 
 #[derive(Debug, Deserialize)]
@@ -353,15 +367,7 @@ fn tool_command(tool: &Tool, tool_index: usize) -> Result<(Command, ToolArgument
         .and_then(Value::as_object)
         .cloned()
         .unwrap_or_default();
-    let required: Vec<String> = tool
-        .input_schema
-        .get("required")
-        .and_then(Value::as_array)
-        .into_iter()
-        .flatten()
-        .filter_map(Value::as_str)
-        .map(str::to_owned)
-        .collect();
+    let required: Vec<&str> = tool.required_arguments().collect();
     let mut arg_map = BTreeMap::new();
     let mut flags = BTreeSet::new();
     for (field_index, (name, schema)) in properties.iter().enumerate() {
@@ -471,14 +477,7 @@ fn validate_json_arguments(arguments: &Value, tool: &Tool) -> Result<()> {
         .input_schema
         .get("properties")
         .and_then(Value::as_object);
-    let required = tool
-        .input_schema
-        .get("required")
-        .and_then(Value::as_array)
-        .into_iter()
-        .flatten()
-        .filter_map(Value::as_str);
-    for name in required {
+    for name in tool.required_arguments() {
         if !arguments.contains_key(name) {
             bail!(
                 "missing required MCP argument `{name}` for tool `{}`",
@@ -898,6 +897,59 @@ fn parse_rpc_body(body: &str) -> Result<Value> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn telemetry_is_optional_without_fabricating_intent() {
+        let tool = Tool {
+            name: "test_tool".to_owned(),
+            description: None,
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "query": { "type": "string" },
+                    "telemetry": {
+                        "type": "object",
+                        "properties": { "intent": { "type": "string" } },
+                        "required": ["intent"]
+                    }
+                },
+                "required": ["query", "telemetry"],
+                "additionalProperties": false
+            }),
+        };
+        let (mut command, arg_map) = tool_command(&tool, 0).unwrap();
+        command = command.arg(Arg::new("mcp_json_args").long("args"));
+        let help = command.render_long_help().to_string();
+        assert!(help.contains("Required fields: query."));
+        assert!(help.contains("--telemetry"));
+        let matches = command
+            .try_get_matches_from(["test_tool", "--query", "synthetic query"])
+            .unwrap();
+        let arguments = arguments_from_matches(&matches, &arg_map).unwrap();
+        validate_json_arguments(&arguments, &tool).unwrap();
+        assert_eq!(arguments, json!({"query": "synthetic query"}));
+
+        // JSON arguments (including file/stdin inputs) use the same validation.
+        for raw in [
+            r#"{"query":"synthetic query"}"#,
+            r#"{"query":"synthetic query","telemetry":{}}"#,
+            r#"{"query":"synthetic query","telemetry":{"intent":"user supplied intent"}}"#,
+        ] {
+            let arguments = parse_json_arguments(raw).unwrap();
+            let original = arguments.clone();
+            validate_json_arguments(&arguments, &tool).unwrap();
+            assert_eq!(arguments, original);
+        }
+        assert!(validate_json_arguments(&json!({}), &tool)
+            .unwrap_err()
+            .to_string()
+            .contains("`query`"));
+        assert!(validate_json_arguments(
+            &json!({"query": "synthetic query", "telemetry": "invalid"}),
+            &tool
+        )
+        .is_err());
+    }
 
     #[test]
     fn detects_mcp_after_global_options() {
