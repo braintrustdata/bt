@@ -2528,7 +2528,8 @@ export default customDatasetView(
                     "/v1/experiment",
                     web::get().to(|| async {
                         HttpResponse::Ok().json(json!({"objects": [{
-                            "id": "exp_test",
+                            "id": "00000000-0000-4000-8000-000000000002",
+                            "public": false,
                             "name": "test-experiment",
                             "project_id": "00000000-0000-4000-8000-000000000001",
                         }]}))
@@ -2538,7 +2539,8 @@ export default customDatasetView(
                     "/btql",
                     web::post().to(|body: web::Json<Value>| async move {
                         let query = body["query"].as_str().unwrap();
-                        if !query.contains("from: experiment('exp_test')")
+                        if !query
+                            .contains("from: experiment('00000000-0000-4000-8000-000000000002')")
                             || query.contains("created >=")
                         {
                             return HttpResponse::BadRequest()

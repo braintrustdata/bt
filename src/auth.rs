@@ -28,12 +28,10 @@ use oauth2::{
     AuthUrl, ClientId, CsrfToken, PkceCodeChallenge, PkceCodeVerifier, RedirectUrl, Scope, TokenUrl,
 };
 use serde::{Deserialize, Serialize};
-use serde_json::json;
 use tokio::sync::oneshot;
 
 use crate::{
     args::{BaseArgs, DEFAULT_API_URL, DEFAULT_APP_URL},
-    http::build_auth_transport_from_builder,
     ui,
 };
 
@@ -514,22 +512,7 @@ struct LoginOrgInfo {
     api_url: Option<String>,
 }
 
-#[derive(Debug, Clone, Deserialize)]
-struct OAuthTokenResponse {
-    access_token: String,
-    #[serde(default)]
-    refresh_token: Option<String>,
-    #[serde(default)]
-    expires_in: Option<u64>,
-}
-
-#[derive(Debug, Clone, Deserialize)]
-struct OAuthErrorResponse {
-    #[serde(default)]
-    error: Option<String>,
-    #[serde(default)]
-    error_description: Option<String>,
-}
+use braintrust_api_client::backend::auth::{OAuthClient, OAuthFailure, OAuthTokenResponse};
 
 #[derive(Debug, Clone, Args)]
 pub struct LoginArgs {
@@ -837,9 +820,6 @@ async fn maybe_warn_ai_provider_key_staleness(base: &BaseArgs, ctx: &LoginContex
 }
 
 async fn warn_ai_provider_key_staleness(ctx: &LoginContext) -> Result<()> {
-    let app_url = ctx.app_url.trim_end_matches('/');
-    let url = format!("{app_url}/api/ai_secret/get");
-    let api_key = ctx.login.api_key().context("login state missing API key")?;
     let org_id = ctx
         .login
         .org_id()
@@ -852,30 +832,14 @@ async fn warn_ai_provider_key_staleness(ctx: &LoginContext) -> Result<()> {
     record_ai_provider_key_staleness_check(&mut state, &org_id, now);
     let _ = save_ai_provider_warning_state(&state);
 
-    let client = crate::http::build_api_client(
-        &ctx.api_url,
-        &ctx.app_url,
-        &api_key,
-        crate::http::DEFAULT_HTTP_TIMEOUT,
-    )?;
-    let response = client
-        .app_request(reqwest::Method::POST, "api/ai_secret/get")
-        .json(&json!({ "org_id": org_id }))
-        .send()
-        .await;
-    let response = match response {
-        Ok(response) => response,
-        Err(error) if error.is_api_error() => return Ok(()),
-        Err(error) => {
-            return Err(crate::http::api_error(error))
-                .with_context(|| format!("failed to call AI provider secrets endpoint {url}"))
+    let client = crate::http::ApiClient::new(ctx)?;
+    let secrets: Vec<AiProviderSecret> = match client.ai_provider_secrets().await {
+        Ok(secrets) => crate::http::from_api(secrets)?,
+        Err(error) if braintrust_api_client::backend::is_response_rejection(&error) => {
+            return Ok(());
         }
+        Err(error) => return Err(error).context("failed to fetch AI provider secrets"),
     };
-
-    let secrets = response
-        .json::<Vec<AiProviderSecret>>()
-        .await
-        .context("failed to parse AI provider secrets response")?;
     let stale = stale_ai_provider_secrets(&org_id, &secrets, now);
     if stale.is_empty() {
         return Ok(());
@@ -3172,37 +3136,26 @@ async fn exchange_oauth_authorization_code(
     code: &str,
     code_verifier: PkceCodeVerifier,
 ) -> Result<OAuthTokenResponse> {
-    let http_client = build_auth_transport_from_builder(
-        reqwest::Client::builder()
-            .timeout(crate::http::DEFAULT_HTTP_TIMEOUT)
-            .redirect(reqwest::redirect::Policy::none()),
-    )
-    .context("failed to initialize oauth HTTP client")?;
-    request_oauth_token(
-        &http_client,
-        api_url,
-        &[
-            ("grant_type", "authorization_code"),
-            ("client_id", client_id),
-            ("code", code),
-            ("redirect_uri", redirect_uri),
-            ("code_verifier", code_verifier.secret()),
-        ],
-    )
-    .await
+    OAuthClient::new(api_url)?
+        .exchange_code(client_id, redirect_uri, code, code_verifier.secret())
+        .await
+        .map_err(Into::into)
 }
 
 fn map_refresh_oauth_error(
     api_url: &str,
     profile_name: &str,
-    status: reqwest::StatusCode,
-    body: &str,
+    error: OAuthFailure,
 ) -> anyhow::Error {
-    if let Ok(server_err) = serde_json::from_str::<OAuthErrorResponse>(body) {
-        if matches!(server_err.error.as_deref(), Some("invalid_grant")) {
+    if let OAuthFailure::Rejected {
+        error: code,
+        description,
+    } = &error
+    {
+        if code == "invalid_grant" {
             let mut message =
                 format!("oauth refresh token expired or was rejected for profile '{profile_name}'");
-            if let Some(description) = server_err.error_description.as_deref() {
+            if let Some(description) = description {
                 message.push_str(&format!(" ({description})"));
             }
             message.push_str(&format!(
@@ -3212,11 +3165,7 @@ fn map_refresh_oauth_error(
             return recoverable_auth_error(RecoverableAuthErrorKind::OauthRefreshToken, message);
         }
     }
-
-    anyhow::anyhow!("oauth token request failed ({status}): {body}").context(format!(
-        "failed to call oauth token endpoint {}/oauth/token",
-        api_url.trim_end_matches('/')
-    ))
+    anyhow::Error::new(error).context(format!("failed to call oauth token endpoint at {api_url}"))
 }
 
 async fn refresh_oauth_access_token(
@@ -3225,62 +3174,10 @@ async fn refresh_oauth_access_token(
     client_id: &str,
     profile_name: &str,
 ) -> Result<OAuthTokenResponse> {
-    let http_client = build_auth_transport_from_builder(
-        reqwest::Client::builder()
-            .timeout(crate::http::DEFAULT_HTTP_TIMEOUT)
-            .redirect(reqwest::redirect::Policy::none()),
-    )
-    .context("failed to initialize oauth HTTP client")?;
-    let token_url = format!("{}/oauth/token", api_url.trim_end_matches('/'));
-    let response = http_client
-        .post(&token_url)
-        .form(&[
-            ("grant_type", "refresh_token"),
-            ("client_id", client_id),
-            ("refresh_token", refresh_token),
-        ])
-        .send_unchecked()
+    OAuthClient::new(api_url)?
+        .refresh(client_id, refresh_token)
         .await
-        .with_context(|| format!("failed to call oauth token endpoint {token_url}"))?;
-    if !response.status().is_success() {
-        let status = response.status();
-        let body = response.text().await.unwrap_or_default();
-        return Err(map_refresh_oauth_error(
-            api_url,
-            profile_name,
-            status,
-            &body,
-        ));
-    }
-
-    response
-        .json()
-        .await
-        .context("failed to parse oauth token response")
-}
-
-async fn request_oauth_token(
-    http_client: &braintrust_api_client::Transport,
-    api_url: &str,
-    params: &[(&str, &str)],
-) -> Result<OAuthTokenResponse> {
-    let token_url = format!("{}/oauth/token", api_url.trim_end_matches('/'));
-    let response = http_client
-        .post(&token_url)
-        .form(params)
-        .send_unchecked()
-        .await
-        .with_context(|| format!("failed to call oauth token endpoint {token_url}"))?;
-    if !response.status().is_success() {
-        let status = response.status();
-        let body = response.text().await.unwrap_or_default();
-        bail!("oauth token request failed ({status}): {body}");
-    }
-
-    response
-        .json()
-        .await
-        .context("failed to parse oauth token response")
+        .map_err(|error| map_refresh_oauth_error(api_url, profile_name, error))
 }
 
 fn build_oauth_client(
@@ -3288,10 +3185,10 @@ fn build_oauth_client(
     client_id: &str,
     redirect_uri: Option<&str>,
 ) -> Result<BasicClient> {
-    let api_url = api_url.trim_end_matches('/');
-    let auth_url = AuthUrl::new(format!("{api_url}/oauth/authorize"))
+    let endpoints = OAuthClient::endpoints(api_url)?;
+    let auth_url = AuthUrl::new(endpoints.authorize_url.to_string())
         .context("failed to construct oauth authorize URL")?;
-    let token_url = TokenUrl::new(format!("{api_url}/oauth/token"))
+    let token_url = TokenUrl::new(endpoints.token_url.to_string())
         .context("failed to construct oauth token URL")?;
     let client = BasicClient::new(
         ClientId::new(client_id.to_string()),
@@ -4331,8 +4228,10 @@ mod tests {
         let err = map_refresh_oauth_error(
             "https://api.example.com",
             "test profile",
-            reqwest::StatusCode::BAD_REQUEST,
-            r#"{"error":"invalid_grant","error_description":"refresh token expired"}"#,
+            OAuthFailure::Rejected {
+                error: "invalid_grant".into(),
+                description: Some("refresh token expired".into()),
+            },
         );
 
         assert!(is_missing_credential_error(&err));
@@ -4352,8 +4251,7 @@ mod tests {
         let err = map_refresh_oauth_error(
             "https://api.example.com",
             "work",
-            reqwest::StatusCode::BAD_REQUEST,
-            "unexpected response",
+            OAuthFailure::Other(anyhow::anyhow!("unexpected response")),
         );
 
         assert!(!is_missing_credential_error(&err));

@@ -1,6 +1,5 @@
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
-use urlencoding::encode;
 
 use crate::http::ApiClient;
 
@@ -16,11 +15,6 @@ pub struct Environment {
     pub created: Option<String>,
     #[serde(default)]
     pub deleted_at: Option<String>,
-}
-
-#[derive(Deserialize)]
-struct ListResponse {
-    objects: Vec<Environment>,
 }
 
 #[derive(Serialize)]
@@ -43,13 +37,16 @@ pub struct UpdateEnvironment<'a> {
 }
 
 pub async fn list(client: &ApiClient) -> Result<Vec<Environment>> {
-    let response: ListResponse = client
-        .get(&format!(
-            "/environment?org_name={}",
-            encode(client.org_name())
-        ))
+    let response = client
+        .run(|| {
+            client
+                .generated()
+                .list_environments_builder()
+                .org_name(client.org_name())
+                .send()
+        })
         .await?;
-    Ok(response.objects)
+    crate::http::from_api(response.objects)
 }
 
 pub async fn get_by_slug(client: &ApiClient, slug: &str) -> Result<Option<Environment>> {
@@ -60,7 +57,12 @@ pub async fn get_by_slug(client: &ApiClient, slug: &str) -> Result<Option<Enviro
 }
 
 pub async fn create(client: &ApiClient, body: &CreateEnvironment<'_>) -> Result<Environment> {
-    client.post("/environment", body).await
+    let request: braintrust_api_client::types::CreateEnvironment = crate::http::into_api(body)?;
+    crate::http::from_api(
+        client
+            .run(|| client.generated().create_environment(Some(request.clone())))
+            .await?,
+    )
 }
 
 pub async fn update(
@@ -68,13 +70,22 @@ pub async fn update(
     id: &str,
     body: &UpdateEnvironment<'_>,
 ) -> Result<Environment> {
-    client
-        .patch(&format!("/environment/{}", encode(id)), body)
-        .await
+    let request: braintrust_api_client::types::PatchEnvironment = crate::http::into_api(body)?;
+    crate::http::from_api(
+        client
+            .run(|| {
+                client
+                    .generated()
+                    .update_environment(id, Some(request.clone()))
+            })
+            .await?,
+    )
 }
 
 pub async fn delete(client: &ApiClient, id: &str) -> Result<Environment> {
-    client
-        .delete_with_response(&format!("/environment/{}", encode(id)))
-        .await
+    crate::http::from_api(
+        client
+            .run(|| client.generated().delete_environment(id))
+            .await?,
+    )
 }

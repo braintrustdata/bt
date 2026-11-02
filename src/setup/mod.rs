@@ -11,7 +11,7 @@ use chrono::{DateTime, Utc};
 use clap::{Args, Subcommand, ValueEnum};
 use dialoguer::console::style;
 use dialoguer::{theme::ColorfulTheme, Confirm, FuzzySelect, MultiSelect, Select};
-use serde::{Deserialize, Serialize};
+use serde::Serialize;
 use serde_json::{Map, Value};
 use tokio::process::Command;
 use toml::Value as TomlValue;
@@ -52,7 +52,9 @@ const SHARED_WORKFLOW_GUIDE: &str = include_str!("../../skills/shared/workflows.
 const SHARED_SKILL_TEMPLATE: &str = include_str!("../../skills/shared/skill_template.md");
 const SKILL_FRONTMATTER: &str = include_str!("../../skills/shared/skill_frontmatter.md");
 const BT_README: &str = include_str!("../../README.md");
+#[cfg(test)]
 const SETUP_WIZARD_CREATE_PATH: &str = "/api/cli/wizard-session/create";
+#[cfg(test)]
 const SETUP_WIZARD_POLL_PATH: &str = "/api/cli/wizard-session/poll";
 const SETUP_WIZARD_POLL_INTERVAL: Duration = Duration::from_secs(2);
 const SETUP_WIZARD_MAX_CONSECUTIVE_POLL_FAILURES: usize = 30;
@@ -541,15 +543,7 @@ struct SetupAuthLogin {
     selected_project: Option<crate::projects::api::Project>,
 }
 
-#[derive(Debug, Deserialize)]
-struct SetupWizardSession {
-    session_token: String,
-    poll_token: String,
-    login_path: String,
-    #[serde(default, alias = "verificationCode")]
-    verification_code: Option<String>,
-    expires_at: String,
-}
+use braintrust_api_client::backend::auth::{SetupWizardPollResult, SetupWizardSession};
 
 #[derive(Debug, Clone)]
 struct SetupWizardCompletion {
@@ -558,24 +552,6 @@ struct SetupWizardCompletion {
     org_name: String,
     project_id: String,
     project_name: String,
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(tag = "status", rename_all = "snake_case")]
-enum SetupWizardPollResult {
-    Pending {
-        #[serde(rename = "expires_at")]
-        _expires_at: String,
-    },
-    Expired,
-    Claimed,
-    Complete {
-        api_key: String,
-        org_id: String,
-        org_name: String,
-        project_id: String,
-        project_name: String,
-    },
 }
 
 struct SkillsSetupOutcome {
@@ -1271,121 +1247,38 @@ fn format_setup_wizard_expiry(expires_at: &str, now: DateTime<Utc>) -> String {
     format!("The browser setup link expires in {minutes} {unit}.")
 }
 
-async fn setup_wizard_response_json<T: serde::de::DeserializeOwned>(
-    response: reqwest::Response,
-    action: &str,
-) -> Result<T> {
-    if !response.status().is_success() {
-        let status = response.status();
-        let body = response.text().await.unwrap_or_default();
-        bail!("setup browser {action} failed ({status}): {body}");
-    }
-
-    response
-        .json()
-        .await
-        .with_context(|| format!("failed to parse setup browser {action} response"))
-}
-
 async fn create_setup_wizard_session(
-    http: &braintrust_api_client::Transport,
-    app_url: &reqwest::Url,
+    http: &braintrust_api_client::backend::auth::BrowserSetupClient,
+    _app_url: &reqwest::Url,
 ) -> Result<SetupWizardSession> {
-    let url = app_url
-        .join(SETUP_WIZARD_CREATE_PATH)
-        .context("failed to build setup browser session URL")?;
-    let response = http
-        .post(url.clone())
-        .send_unchecked()
-        .await
-        .with_context(|| format!("failed to create setup browser session at {url}"))?;
-
-    setup_wizard_response_json(response, "session creation").await
+    http.create_session().await
 }
 
 async fn poll_setup_wizard_completion_with_interval(
-    http: &braintrust_api_client::Transport,
-    app_url: &reqwest::Url,
+    http: &braintrust_api_client::backend::auth::BrowserSetupClient,
+    _app_url: &reqwest::Url,
     session_token: &str,
     poll_token: &str,
     interval: Duration,
 ) -> Result<SetupWizardCompletion> {
     let mut consecutive_failures = 0usize;
-    let mut last_failure = String::new();
 
     loop {
-        let mut url = app_url
-            .join(SETUP_WIZARD_POLL_PATH)
-            .context("failed to build setup browser polling URL")?;
-        url.query_pairs_mut()
-            .append_pair("session_token", session_token);
-
-        let response = http
-            .get(url.clone())
-            .bearer_auth(poll_token)
-            .send_unchecked()
-            .await;
-        let response = match response {
-            Ok(response) => response,
-            Err(err) => {
-                consecutive_failures += 1;
-                last_failure = format!("failed to poll setup browser session at {url}: {err}");
-                if consecutive_failures >= SETUP_WIZARD_MAX_CONSECUTIVE_POLL_FAILURES {
-                    bail!(
-                        "setup browser session polling failed {} consecutive times; last error: {}",
-                        consecutive_failures,
-                        last_failure
-                    );
-                }
-                tokio::time::sleep(interval).await;
-                continue;
-            }
-        };
-
-        let status = response.status();
-        if !status.is_success() {
-            let body = response.text().await.unwrap_or_default();
-            if status.is_server_error()
-                || matches!(
-                    status,
-                    reqwest::StatusCode::REQUEST_TIMEOUT | reqwest::StatusCode::TOO_MANY_REQUESTS
-                )
-            {
-                consecutive_failures += 1;
-                last_failure = format!("setup browser session polling failed ({status}): {body}");
-                if consecutive_failures >= SETUP_WIZARD_MAX_CONSECUTIVE_POLL_FAILURES {
-                    bail!(
-                        "setup browser session polling failed {} consecutive times; last error: {}",
-                        consecutive_failures,
-                        last_failure
-                    );
-                }
-                tokio::time::sleep(interval).await;
-                continue;
-            }
-
-            bail!("setup browser session polling failed ({status}): {body}");
-        }
-
-        let poll_result = match response.json::<SetupWizardPollResult>().await {
+        let poll_result = match http.poll(session_token, poll_token).await {
             Ok(result) => result,
-            Err(err) => {
+            Err(error) => {
+                if !braintrust_api_client::backend::auth::BrowserSetupClient::is_retryable(&error) {
+                    return Err(error);
+                }
                 consecutive_failures += 1;
-                last_failure =
-                    format!("failed to parse setup browser session polling response: {err}");
                 if consecutive_failures >= SETUP_WIZARD_MAX_CONSECUTIVE_POLL_FAILURES {
-                    bail!(
-                        "setup browser session polling failed {} consecutive times; last error: {}",
-                        consecutive_failures,
-                        last_failure
-                    );
+                    bail!("setup browser session polling failed {consecutive_failures} consecutive times; last error: {error}");
                 }
                 tokio::time::sleep(interval).await;
                 continue;
             }
         };
         consecutive_failures = 0;
-        last_failure.clear();
 
         match poll_result {
             SetupWizardPollResult::Pending { .. } => {
@@ -1417,7 +1310,7 @@ async fn poll_setup_wizard_completion_with_interval(
 }
 
 async fn poll_setup_wizard_completion(
-    http: &braintrust_api_client::Transport,
+    http: &braintrust_api_client::backend::auth::BrowserSetupClient,
     app_url: &reqwest::Url,
     session_token: &str,
     poll_token: &str,
@@ -1440,7 +1333,7 @@ async fn run_setup_browser_auth(
     _requested_org: Option<&str>,
 ) -> Result<SetupAuthLogin> {
     let app_url = setup_wizard_app_url(base)?;
-    let http = crate::http::build_auth_transport(crate::http::DEFAULT_HTTP_TIMEOUT)?;
+    let http = braintrust_api_client::backend::auth::BrowserSetupClient::new(app_url.as_str())?;
     let session = create_setup_wizard_session(&http, &app_url).await?;
     let login_url = setup_wizard_login_url(&app_url, &session.login_path)?;
     let explicitly_quiet = base.quiet && base.quiet_source.is_some();
@@ -1578,11 +1471,6 @@ fn resolve_profile_name_for_setup(
     Ok(None)
 }
 
-fn find_http_error(err: &anyhow::Error) -> Option<&crate::http::HttpError> {
-    err.chain()
-        .find_map(|source| source.downcast_ref::<crate::http::HttpError>())
-}
-
 async fn list_available_orgs_for_setup(
     api_key: &str,
     app_url: &str,
@@ -1590,10 +1478,10 @@ async fn list_available_orgs_for_setup(
     match auth::list_available_orgs_for_api_key(api_key, app_url).await {
         Ok(orgs) => Ok(orgs),
         Err(err) => {
-            if let Some(http_err) = find_http_error(&err) {
-                if matches!(http_err.status.as_u16(), 401 | 403) {
-                    return Ok(Vec::new());
-                }
+            if braintrust_api_client::backend::failure_kind(&err)
+                == Some(braintrust_api_client::backend::FailureKind::Authentication)
+            {
+                return Ok(Vec::new());
             }
             if err
                 .to_string()
@@ -2218,14 +2106,6 @@ async fn maybe_create_api_key_for_oauth(base: &BaseArgs, client: &ApiClient) -> 
     let base_name = format!("{username}-created-by-bt-setup");
 
     #[derive(serde::Deserialize)]
-    struct ApiKeyEntry {
-        name: String,
-    }
-    #[derive(serde::Deserialize)]
-    struct ApiKeyList {
-        objects: Vec<ApiKeyEntry>,
-    }
-    #[derive(serde::Deserialize)]
     struct CreatedKey {
         key: String,
     }
@@ -2238,7 +2118,7 @@ async fn maybe_create_api_key_for_oauth(base: &BaseArgs, client: &ApiClient) -> 
     }
 
     let existing: Vec<String> = client
-        .get::<ApiKeyList>("/v1/api_key")
+        .run(|| client.generated().get_api_key_builder().send())
         .await
         .context("failed to list existing Braintrust API keys before creating one")?
         .objects
@@ -2256,7 +2136,11 @@ async fn maybe_create_api_key_for_oauth(base: &BaseArgs, client: &ApiClient) -> 
     };
 
     let body = serde_json::json!({ "name": name, "org_id": org_id });
-    let created: CreatedKey = client.post("/v1/api_key", &body).await?;
+    let created: CreatedKey = crate::http::from_api(
+        client
+            .create_api_key(&crate::http::into_api(&body)?)
+            .await?,
+    )?;
 
     let explicitly_quiet = base.quiet && base.quiet_source.is_some();
     if std::io::stderr().is_terminal() && !explicitly_quiet {
@@ -4895,7 +4779,7 @@ fn install_mcp_for_http_cli_agent(
 }
 
 fn mcp_url_from_api_url(api_url: &str) -> String {
-    format!("{}/mcp", api_url.trim_end_matches('/'))
+    braintrust_api_client::backend::mcp::endpoint(api_url)
 }
 
 fn install_mcp_for_opencode(
@@ -5550,8 +5434,8 @@ mod tests {
         let handle = server.handle();
         tokio::spawn(server);
 
-        let http = crate::http::build_auth_transport(crate::http::DEFAULT_HTTP_TIMEOUT)
-            .expect("http client");
+        let http = braintrust_api_client::backend::auth::BrowserSetupClient::new(app_url.as_str())
+            .expect("setup client");
         let session = create_setup_wizard_session(&http, &app_url)
             .await
             .expect("create session");

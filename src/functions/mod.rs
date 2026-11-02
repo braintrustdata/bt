@@ -488,7 +488,7 @@ impl ViewArgs {
 }
 
 fn is_likely_function_id(value: &str) -> bool {
-    value.starts_with("fn_") || value.starts_with("func_")
+    value.starts_with("fn_") || value.starts_with("func_") || uuid::Uuid::parse_str(value).is_ok()
 }
 
 #[derive(Debug)]
@@ -1115,7 +1115,7 @@ mod tests {
     #[test]
     fn view_auto_detects_positional_function_id() {
         let _guard = test_lock();
-        for value in ["fn_123", "func_123"] {
+        for value in ["fn_123", "func_123", "00000000-0000-4000-8000-000000000003"] {
             let parsed = parse(&["functions", "view", value]).expect("parse view");
             let FunctionsCommands::View(view) = parsed.command.expect("subcommand") else {
                 panic!("expected view command");

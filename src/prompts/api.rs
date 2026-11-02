@@ -1,7 +1,6 @@
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
-use urlencoding::encode;
 
 use crate::http::{ApiClient, BtqlOptions, BtqlResponse};
 
@@ -34,26 +33,25 @@ pub struct EnvironmentObject {
     pub created: Option<String>,
 }
 
-#[derive(Debug, Deserialize)]
-struct ListResponse<T> {
-    objects: Vec<T>,
-}
-
 pub async fn list_prompts(
     client: &ApiClient,
     project: &str,
     environment: Option<&str>,
 ) -> Result<Vec<Prompt>> {
-    let mut path = format!(
-        "/v1/prompt?org_name={}&project_name={}",
-        encode(client.org_name()),
-        encode(project)
-    );
-    if let Some(environment) = environment {
-        path.push_str(&format!("&environment={}", encode(environment)));
-    }
-    let list: ListResponse<Prompt> = client.get(&path).await?;
-    Ok(list.objects)
+    let response = client
+        .run(|| {
+            let mut request = client
+                .generated()
+                .get_prompt_builder()
+                .org_name(client.org_name())
+                .project_name(project);
+            if let Some(environment) = environment {
+                request = request.environment(environment);
+            }
+            request.send()
+        })
+        .await?;
+    crate::http::from_api(response.objects)
 }
 
 pub async fn get_prompt_by_slug(
@@ -63,27 +61,27 @@ pub async fn get_prompt_by_slug(
     version: Option<&str>,
     environment: Option<&str>,
 ) -> Result<Option<Prompt>> {
-    let normalized_version = version
+    let version = version
         .map(crate::util_cmd::normalize_xact_id)
         .transpose()?;
-    let mut params = vec![
-        ("org_name", client.org_name()),
-        ("project_name", project),
-        ("slug", slug),
-    ];
-    if let Some(version) = normalized_version.as_deref() {
-        params.push(("version", version));
-    }
-    if let Some(environment) = environment {
-        params.push(("environment", environment));
-    }
-    let query = params
-        .into_iter()
-        .map(|(key, value)| format!("{}={}", encode(key), encode(value)))
-        .collect::<Vec<_>>()
-        .join("&");
-    let list: ListResponse<Prompt> = client.get(&format!("/v1/prompt?{query}")).await?;
-    Ok(list.objects.into_iter().next())
+    let response = client
+        .run(|| {
+            let mut request = client
+                .generated()
+                .get_prompt_builder()
+                .org_name(client.org_name())
+                .project_name(project)
+                .slug(slug);
+            if let Some(version) = version.as_deref() {
+                request = request.version(version);
+            }
+            if let Some(environment) = environment {
+                request = request.environment(environment);
+            }
+            request.send()
+        })
+        .await?;
+    crate::http::from_api(response.objects.into_iter().next())
 }
 
 pub async fn list_prompt_versions(
@@ -153,16 +151,18 @@ pub async fn assign_prompt(
     environment: &str,
     object_version: &str,
 ) -> Result<EnvironmentObject> {
-    let path = format!(
-        "/environment-object/prompt/{}/{}",
-        encode(prompt_id),
-        encode(environment)
-    );
-    let body = serde_json::json!({
-        "object_version": object_version,
-        "org_name": client.org_name(),
-    });
-    client.put(&path, &body).await
+    crate::http::from_api(
+        client
+            .assign_prompt(
+                prompt_id,
+                environment,
+                &braintrust_api_client::backend::extensions::EnvironmentAssignment {
+                    object_version: object_version.to_owned(),
+                    org_name: client.org_name().to_owned(),
+                },
+            )
+            .await?,
+    )
 }
 
 pub async fn unassign_prompt(
@@ -170,18 +170,14 @@ pub async fn unassign_prompt(
     prompt_id: &str,
     environment: &str,
 ) -> Result<EnvironmentObject> {
-    let path = format!(
-        "/environment-object/prompt/{}/{}?org_name={}",
-        encode(prompt_id),
-        encode(environment),
-        encode(client.org_name())
-    );
-    client.delete_with_response(&path).await
+    crate::http::from_api(client.unassign_prompt(prompt_id, environment).await?)
 }
 
 pub async fn delete_prompt(client: &ApiClient, prompt_id: &str) -> Result<()> {
-    let path = format!("/v1/prompt/{}", encode(prompt_id));
-    client.delete(&path).await
+    client
+        .run(|| client.generated().delete_prompt_id(prompt_id))
+        .await?;
+    Ok(())
 }
 
 #[cfg(test)]

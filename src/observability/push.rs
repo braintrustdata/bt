@@ -1201,15 +1201,21 @@ mod tests {
                     ));
                     match (request.method().as_str(), request.path()) {
                         ("PUT", "/v1/function") => {
+                            response["_xact_id"] = json!("1000000000000000000");
+                            response["log_id"] = json!("p");
+                            response["org_id"] = json!("00000000-0000-4000-8000-000000000010");
                             response["id"] = if response["function_type"] == "facet" {
-                                json!("fn-test-facet")
+                                json!("00000000-0000-4000-8000-000000000021")
                             } else {
-                                json!("fn-test-map")
+                                json!("00000000-0000-4000-8000-000000000022")
                             };
                         }
-                        ("PATCH", "/v1/project_automation/test-existing-automation") => {
-                            response["id"] = json!("test-existing-automation");
-                            response["project_id"] = json!("test-project-id");
+                        (
+                            "PATCH",
+                            "/v1/project_automation/00000000-0000-4000-8000-000000000023",
+                        ) => {
+                            response["id"] = json!("00000000-0000-4000-8000-000000000023");
+                            response["project_id"] = json!("00000000-0000-4000-8000-000000000024");
                         }
                         _ => return HttpResponse::NotFound().finish(),
                     }
@@ -1242,13 +1248,20 @@ mod tests {
         let mut source = scoped_template();
         source.topics_automations[0].description = None;
         let mut facet = existing_function("test-facet", "facet", "facet");
-        facet.id = "fn-test-facet".to_string();
+        facet.project_id = "00000000-0000-4000-8000-000000000024".into();
+        facet.id = "00000000-0000-4000-8000-000000000021".to_string();
         let mut map = existing_function("test-facet-topic-map", "classifier", "topic_map");
-        map.id = "fn-test-map".to_string();
+        map.project_id = "00000000-0000-4000-8000-000000000024".into();
+        map.id = "00000000-0000-4000-8000-000000000022".to_string();
         map.function_data = Some(
-            json!({"type": "topic_map", "source_facet_function": {"type": "function", "id": facet.id}}),
+            json!({"type": "topic_map", "source_facet":"test-facet", "embedding_model":"test-embedding-model", "source_facet_function": {"type": "function", "id": facet.id}}),
         );
-        let mut automation = automation("test-existing-automation", "Test scoped Topics", "topic");
+        let mut automation = automation(
+            "00000000-0000-4000-8000-000000000023",
+            "Test scoped Topics",
+            "topic",
+        );
+        automation.project_id = "00000000-0000-4000-8000-000000000024".into();
         automation.description = Some("Test old description".to_string());
         automation.config =
             add_topics_functions(&automation.config, &[(facet.id.clone(), map.id.clone())])
@@ -1263,9 +1276,12 @@ mod tests {
             true,
         )
         .unwrap();
-        let result = execute(&client, "test-project-id", planned).await;
+        let result = execute(&client, "00000000-0000-4000-8000-000000000024", planned).await;
         handle.stop(true).await;
-        assert_eq!(result.unwrap().facets[0].id, "fn-test-facet");
+        assert_eq!(
+            result.unwrap().facets[0].id,
+            "00000000-0000-4000-8000-000000000021"
+        );
         let requests = requests.lock().unwrap();
         assert_eq!(requests.len(), 3);
         assert_eq!(requests[0].0, "PUT");
@@ -1279,10 +1295,13 @@ mod tests {
             body["config"]["btql_filter"],
             "metadata.test_enabled = true"
         );
-        assert_eq!(body["config"]["facet_functions"][0]["id"], "fn-test-facet");
+        assert_eq!(
+            body["config"]["facet_functions"][0]["id"],
+            "00000000-0000-4000-8000-000000000021"
+        );
         assert_eq!(
             body["config"]["topic_map_functions"][0]["function"]["id"],
-            "fn-test-map"
+            "00000000-0000-4000-8000-000000000022"
         );
     }
 }

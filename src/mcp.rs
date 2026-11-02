@@ -9,8 +9,9 @@ use clap::{Arg, ArgAction, ArgMatches, Command, CommandFactory, FromArgMatches};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Map, Value};
 
-use crate::{args::BaseArgs, auth, http::build_api_client, Cli};
+use crate::{args::BaseArgs, auth, Cli};
 
+#[cfg(test)]
 const PROTOCOL_VERSION: &str = "2025-03-26";
 
 fn global_args() -> Result<Vec<Arg>> {
@@ -154,41 +155,7 @@ impl Tool {
 
 type ToolArgumentMap = BTreeMap<String, (String, Value)>;
 
-#[derive(Debug, Deserialize)]
-struct ToolsResult {
-    tools: Vec<Tool>,
-    #[serde(default, rename = "nextCursor")]
-    next_cursor: Option<String>,
-}
-
-#[derive(Debug, Deserialize)]
-struct RpcResponse {
-    #[serde(default)]
-    result: Option<Value>,
-    #[serde(default)]
-    error: Option<RpcError>,
-}
-
-#[derive(Debug, Deserialize)]
-struct RpcError {
-    code: i64,
-    message: String,
-}
-
-#[derive(Debug, Serialize)]
-struct RpcRequest<'a> {
-    jsonrpc: &'static str,
-    id: u64,
-    method: &'a str,
-    params: Value,
-}
-
-struct McpClient {
-    http: braintrust_api_client::Client,
-    session_id: Option<String>,
-    protocol_version: Option<String>,
-    next_id: u64,
-}
+struct McpClient(braintrust_api_client::backend::mcp::McpSession);
 
 pub fn try_main(argv: &[std::ffi::OsString]) -> Result<()> {
     let runtime = tokio::runtime::Builder::new_multi_thread()
@@ -230,12 +197,11 @@ async fn run(argv: &[std::ffi::OsString]) -> Result<()> {
     crate::configure_output(&base.login);
     crate::apply_runtime_env_overrides(&base.login);
     let auth = auth::fast_login(&base).await?;
-    let endpoint = format!("{}/mcp", auth.api_url.trim_end_matches('/'));
     let api_key = auth
         .login
         .api_key()
         .context("login state missing API key")?;
-    let mut client = McpClient::new(&endpoint, &api_key)?;
+    let mut client = McpClient::new(&auth.api_url, &api_key)?;
     client.initialize().await?;
     let tools = client.list_tools().await?;
 
@@ -726,164 +692,22 @@ fn format_tool_result(result: &Value, json_output: bool) -> Result<String> {
 
 impl McpClient {
     fn new(endpoint: &str, api_key: &str) -> Result<Self> {
-        Ok(Self {
-            http: build_api_client(
-                endpoint,
-                endpoint,
-                api_key,
-                std::time::Duration::from_secs(60),
-            )?,
-            session_id: None,
-            protocol_version: None,
-            next_id: 1,
-        })
+        Ok(Self(braintrust_api_client::backend::mcp::McpSession::new(
+            endpoint,
+            api_key,
+            "bt",
+            env!("CARGO_PKG_VERSION"),
+        )?))
     }
-
     async fn initialize(&mut self) -> Result<()> {
-        let response = self
-            .request(
-                "initialize",
-                json!({
-                    "protocolVersion": PROTOCOL_VERSION,
-                    "capabilities": {},
-                    "clientInfo": { "name": "bt", "version": env!("CARGO_PKG_VERSION") }
-                }),
-            )
-            .await?;
-        self.protocol_version = response
-            .get("protocolVersion")
-            .and_then(Value::as_str)
-            .map(str::to_owned);
-        if self.protocol_version.is_none() {
-            bail!("MCP server returned an invalid initialize response");
-        }
-        self.notify("notifications/initialized", json!({})).await?;
-        Ok(())
+        self.0.initialize().await
     }
-
     async fn list_tools(&mut self) -> Result<Vec<Tool>> {
-        let mut tools = Vec::new();
-        let mut cursor: Option<String> = None;
-        loop {
-            let mut params = Map::new();
-            if let Some(value) = cursor.take() {
-                params.insert("cursor".to_string(), Value::String(value));
-            }
-            let value = self.request("tools/list", Value::Object(params)).await?;
-            let page: ToolsResult =
-                serde_json::from_value(value).context("invalid tools/list response")?;
-            tools.extend(page.tools);
-            cursor = page.next_cursor;
-            if cursor.is_none() {
-                break;
-            }
-        }
-        Ok(tools)
+        crate::http::from_api(self.0.list_tools().await?)
     }
-
     async fn call_tool(&mut self, name: &str, arguments: Value) -> Result<Value> {
-        let result = self
-            .request(
-                "tools/call",
-                json!({ "name": name, "arguments": arguments }),
-            )
-            .await?;
-        if result.get("isError").and_then(Value::as_bool) == Some(true) {
-            bail!(
-                "MCP tool `{name}` failed: {}",
-                result
-                    .get("content")
-                    .map(|v| v.to_string())
-                    .unwrap_or_default()
-            );
-        }
-        Ok(result)
+        crate::http::from_api(self.0.call_tool(name, arguments).await?)
     }
-
-    async fn request(&mut self, method: &str, params: Value) -> Result<Value> {
-        let id = self.next_id;
-        self.next_id += 1;
-        let request = RpcRequest {
-            jsonrpc: "2.0",
-            id,
-            method,
-            params,
-        };
-        let response = self.post(serde_json::to_value(request)?).await?;
-        let rpc: RpcResponse =
-            serde_json::from_value(response).context("invalid MCP JSON-RPC response")?;
-        if let Some(error) = rpc.error {
-            bail!("MCP server error {}: {}", error.code, error.message);
-        }
-        rpc.result.context("MCP server response had no result")
-    }
-
-    async fn notify(&mut self, method: &str, params: Value) -> Result<()> {
-        let value = json!({ "jsonrpc": "2.0", "method": method, "params": params });
-        let request = self.request_builder(value).await?;
-        let response = request.send().await.context("MCP notification failed")?;
-        self.capture_session(&response);
-        Ok(())
-    }
-
-    async fn post(&mut self, value: Value) -> Result<Value> {
-        let response = self
-            .request_builder(value)
-            .await?
-            .send()
-            .await
-            .context("MCP request failed")?;
-        self.capture_session(&response);
-        let body = response
-            .text()
-            .await
-            .context("failed reading MCP response")?;
-        parse_rpc_body(&body)
-    }
-
-    async fn request_builder(&self, value: Value) -> Result<braintrust_api_client::Request> {
-        let mut request = self
-            .http
-            .api_request(reqwest::Method::POST, "")
-            .header(
-                reqwest::header::ACCEPT,
-                "application/json, text/event-stream",
-            )
-            .json(&value);
-        if let Some(session_id) = &self.session_id {
-            request = request.header("Mcp-Session-Id", session_id);
-        }
-        if let Some(protocol_version) = &self.protocol_version {
-            request = request.header("MCP-Protocol-Version", protocol_version);
-        }
-        Ok(request)
-    }
-
-    fn capture_session(&mut self, response: &reqwest::Response) {
-        if let Some(value) = response
-            .headers()
-            .get("Mcp-Session-Id")
-            .and_then(|v| v.to_str().ok())
-        {
-            self.session_id = Some(value.to_owned());
-        }
-    }
-}
-
-fn parse_rpc_body(body: &str) -> Result<Value> {
-    if let Ok(value) = serde_json::from_str(body) {
-        return Ok(value);
-    }
-    for line in body.lines() {
-        if let Some(data) = line.strip_prefix("data:").map(str::trim) {
-            if !data.is_empty() && data != "[DONE]" {
-                return serde_json::from_str(data).context("invalid MCP event stream response");
-            }
-        }
-    }
-    Err(anyhow!(
-        "MCP server returned an empty or unsupported response"
-    ))
 }
 
 #[cfg(test)]
@@ -900,7 +724,7 @@ mod tests {
         let calls = Arc::new(AtomicUsize::new(0));
         let count = calls.clone();
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-        let endpoint = format!("http://{}/mcp", listener.local_addr().unwrap());
+        let endpoint = format!("http://{}", listener.local_addr().unwrap());
         let server = HttpServer::new(move || {
             let count = count.clone();
             App::new().route("/mcp", web::post().to(move |req: HttpRequest, body: web::Json<Value>| {

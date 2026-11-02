@@ -30,7 +30,7 @@ use reqwest::Url;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Map, Value};
 use unicode_width::UnicodeWidthStr;
-use urlencoding::{decode, encode};
+use urlencoding::decode;
 
 use crate::args::BaseArgs;
 use crate::auth::login;
@@ -320,11 +320,6 @@ struct ResolvedTraceCommandTarget {
     root_span_id: String,
     span_id: Option<String>,
     detail_view: DetailView,
-}
-
-#[derive(Debug, Deserialize)]
-struct ProjectsListResponse {
-    objects: Vec<ProjectInfo>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -1855,19 +1850,11 @@ fn select_project_selector<'a>(
 }
 
 async fn list_projects(client: &ApiClient) -> Result<Vec<ProjectInfo>> {
-    let path = format!("/v1/project?org_name={}", encode(client.org_name()));
-    let response: ProjectsListResponse = client.get(&path).await?;
-    Ok(response.objects)
+    crate::http::from_api(crate::projects::api::list_projects(client).await?)
 }
 
 async fn get_project_by_name(client: &ApiClient, name: &str) -> Result<Option<ProjectInfo>> {
-    let path = format!(
-        "/v1/project?org_name={}&name={}",
-        encode(client.org_name()),
-        encode(name)
-    );
-    let response: ProjectsListResponse = client.get(&path).await?;
-    Ok(response.objects.into_iter().next())
+    crate::http::from_api(crate::projects::api::get_project_by_name(client, name).await?)
 }
 
 async fn run_interactive(args: InteractiveRunArgs, client: ApiClient) -> Result<()> {
@@ -6754,12 +6741,7 @@ fn poll_pending_thread_load(app: &mut TraceViewerApp) {
 }
 
 async fn execute_invoke(client: &ApiClient, request: &Value) -> Result<Value> {
-    let client = if client.org_name().is_empty() {
-        client.clone()
-    } else {
-        client.header("x-bt-org-name", client.org_name())
-    };
-    client.post("/function/invoke", request).await
+    client.invoke(&crate::http::into_api(request)?).await
 }
 
 #[cfg(test)]

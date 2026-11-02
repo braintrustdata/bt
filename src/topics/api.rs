@@ -5,7 +5,6 @@ use anyhow::{bail, Result};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use urlencoding::encode;
 
 use crate::{http::ApiClient, project_context::ProjectContext, utils::app_project_url};
 
@@ -19,32 +18,37 @@ pub(crate) struct ProjectAutomation {
     pub config: Value,
 }
 
-#[derive(Debug, Deserialize)]
-struct ListResponse<T> {
-    objects: Vec<T>,
-}
-
 pub(crate) async fn list_project_automations(
     client: &ApiClient,
     project_id: &str,
 ) -> Result<Vec<ProjectAutomation>> {
-    let path = format!("/v1/project_automation?project_id={}", encode(project_id));
-    let response: ListResponse<ProjectAutomation> = client.get(&path).await?;
-    Ok(response.objects)
+    crate::http::from_api(client.project_automations(project_id).await?.objects)
 }
 
 pub(crate) async fn create_project_automation(
     client: &ApiClient,
     body: &Value,
 ) -> Result<ProjectAutomation> {
-    client.post("/v1/project_automation", body).await
+    let request: braintrust_api_client::types::CreateProjectAutomation =
+        crate::http::into_api(body)?;
+    crate::http::from_api(
+        client
+            .run(|| client.generated().post_project_automation(request.clone()))
+            .await?,
+    )
 }
 
 pub(crate) async fn replace_project_automation(
     client: &ApiClient,
     body: &Value,
 ) -> Result<ProjectAutomation> {
-    client.put("/v1/project_automation", body).await
+    let request: braintrust_api_client::types::CreateProjectAutomation =
+        crate::http::into_api(body)?;
+    crate::http::from_api(
+        client
+            .run(|| client.generated().put_project_automation(request.clone()))
+            .await?,
+    )
 }
 
 pub(crate) async fn patch_project_automation(
@@ -52,8 +56,17 @@ pub(crate) async fn patch_project_automation(
     automation_id: &str,
     body: &Value,
 ) -> Result<ProjectAutomation> {
-    let path = format!("/v1/project_automation/{}", encode(automation_id));
-    client.patch(&path, body).await
+    let request: braintrust_api_client::types::PatchProjectAutomation =
+        crate::http::into_api(body)?;
+    crate::http::from_api(
+        client
+            .run(|| {
+                client
+                    .generated()
+                    .patch_project_automation_id(automation_id, Some(request.clone()))
+            })
+            .await?,
+    )
 }
 
 const DEFAULT_TOPIC_AUTOMATION_NAME: &str = "Topics";
@@ -457,9 +470,8 @@ pub async fn poke_topic_automations(ctx: &ProjectContext) -> Result<TopicsPokeRe
             automation_id: automation_id.clone(),
             object_id: object_id.clone(),
         };
-        let _: Value = ctx
-            .client
-            .post("/brainstore/automation/upsert-object-cursor", &body)
+        ctx.client
+            .upsert_automation_object_cursor(&crate::http::into_api(&body)?)
             .await?;
 
         queued.push(TopicAutomationPokeResult {
@@ -593,10 +605,11 @@ pub async fn enable_topics_config(
         update: true,
     };
 
-    let response: Value = ctx
-        .client
-        .post("/api/project_automation/register", &request)
-        .await?;
+    let response: Value = crate::http::from_api(
+        ctx.client
+            .register_topic_automation(&crate::http::into_api(&request)?)
+            .await?,
+    )?;
     let automation_row = project_automation_row_from_response(&response)?;
     seed_topic_automation_cursors(
         &ctx.client,
@@ -737,10 +750,11 @@ pub async fn update_topics_config(
         bail!("no topic automation updates were requested");
     }
 
-    let response: Value = ctx
-        .client
-        .post("/api/project_automation/patch_id", &Value::Object(payload))
-        .await?;
+    let response: Value = crate::http::from_api(
+        ctx.client
+            .patch_topic_automation(&crate::http::into_api(Value::Object(payload))?)
+            .await?,
+    )?;
     let updated_row = project_automation_row_from_response(&response)?;
     let mut function_cache = HashMap::new();
     build_topic_automation_config(&ctx.client, &updated_row, &mut function_cache).await
@@ -869,8 +883,15 @@ pub async fn update_topic_map_config(
     function_data.insert("type".to_string(), Value::String("topic_map".to_string()));
     payload.insert("function_data".to_string(), Value::Object(function_data));
 
-    let path = format!("/v1/function/{}", encode(&resolved.function_id));
-    let _: Value = ctx.client.patch(&path, &Value::Object(payload)).await?;
+    let request: braintrust_api_client::types::PatchFunction =
+        crate::http::into_api(Value::Object(payload))?;
+    ctx.client
+        .run(|| {
+            ctx.client
+                .generated()
+                .patch_function_id(&resolved.function_id, Some(request.clone()))
+        })
+        .await?;
 
     let mut updated_function_cache = HashMap::new();
     let automation = build_topic_automation_config(
@@ -899,7 +920,11 @@ pub async fn fetch_topic_map_report_url(
         function_id,
         version,
     };
-    client.post("/topic-map-report-url", &request).await
+    crate::http::from_api(
+        client
+            .topic_map_report(&crate::http::into_api(&request)?)
+            .await?,
+    )
 }
 
 pub async fn fetch_topic_map_btmap_url(
@@ -911,7 +936,11 @@ pub async fn fetch_topic_map_btmap_url(
         function_id,
         version,
     };
-    client.post("/topic-map-btmap-url", &request).await
+    crate::http::from_api(
+        client
+            .topic_map_bundle(&crate::http::into_api(&request)?)
+            .await?,
+    )
 }
 
 fn topic_automation_object_id(project_id: &str, data_scope: Option<&Value>) -> Result<String> {
@@ -982,16 +1011,16 @@ async fn seed_topic_automation_cursors(
         object_id: object_id.clone(),
         start_xact_id: start_xact_id.clone(),
     };
-    let _: Value = client
-        .post("/brainstore/automation/reset-cursors", &reset_body)
+    client
+        .reset_automation_cursors(&crate::http::into_api(&reset_body)?)
         .await?;
 
     let upsert_body = UpsertObjectCursorRequest {
         automation_id,
         object_id: object_id.clone(),
     };
-    let _: Value = client
-        .post("/brainstore/automation/upsert-object-cursor", &upsert_body)
+    client
+        .upsert_automation_object_cursor(&crate::http::into_api(&upsert_body)?)
         .await?;
 
     Ok(SeededTopicAutomationCursors {
@@ -1129,8 +1158,7 @@ async fn resolve_topic_map_target(
 }
 
 async fn list_topic_automation_rows(client: &ApiClient, project_id: &str) -> Result<Vec<Value>> {
-    let path = format!("/v1/project_automation?project_id={}", encode(project_id));
-    let response: Value = client.get(&path).await?;
+    let response = serde_json::to_value(client.project_automations(project_id).await?)?;
     Ok(extract_objects(&response)
         .iter()
         .filter(|row| {
@@ -1204,7 +1232,11 @@ async fn create_topic_map_function_refs(
             })
             .collect(),
     };
-    let response: Value = client.post("/insert-functions", &request).await?;
+    let response: Value = crate::http::from_api(
+        client
+            .insert_functions(&crate::http::into_api(&request)?)
+            .await?,
+    )?;
     let created = response
         .get("functions")
         .and_then(Value::as_array)
@@ -1424,9 +1456,11 @@ async fn fetch_cursor_snapshot(
         automation_id: automation_id.to_string(),
         project_id: project_id.to_string(),
     };
-    let response: Value = client
-        .post("/brainstore/automation/get-cursors", &body)
-        .await?;
+    let response: Value = crate::http::from_api(
+        client
+            .automation_cursors(&crate::http::into_api(&body)?)
+            .await?,
+    )?;
     let map = response.as_object();
 
     Ok(AutomationCursorSnapshot {
@@ -1454,9 +1488,11 @@ async fn fetch_object_cursor_snapshot(
         automation_id: automation_id.to_string(),
         project_id: project_id.to_string(),
     };
-    let response: Value = client
-        .post("/brainstore/automation/get-object-cursors", &body)
-        .await?;
+    let response: Value = crate::http::from_api(
+        client
+            .automation_object_cursors(&crate::http::into_api(&body)?)
+            .await?,
+    )?;
     let map = response.as_object();
 
     Ok(ObjectAutomationCursorSnapshot {
@@ -1714,15 +1750,29 @@ async fn load_function_row(
     if let Some(value) = function_cache.get(function_id) {
         return Ok(value.clone());
     }
-    let path = format!("/v1/function/{}", encode(function_id));
-    let value: Value = client.get(&path).await?;
+    let value = serde_json::to_value(
+        client
+            .run(|| {
+                client
+                    .generated()
+                    .get_function_id_builder(function_id)
+                    .send()
+            })
+            .await?,
+    )?;
     function_cache.insert(function_id.to_string(), value.clone());
     Ok(value)
 }
 
 async fn delete_topic_automation(client: &ApiClient, automation_id: &str) -> Result<()> {
-    let path = format!("/v1/project_automation/{}", encode(automation_id));
-    client.delete(&path).await
+    client
+        .run(|| {
+            client
+                .generated()
+                .delete_project_automation_id(automation_id)
+        })
+        .await
+        .map(|_| ())
 }
 
 async fn build_topic_status_bars(

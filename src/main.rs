@@ -519,17 +519,13 @@ fn classify_error(err: &anyhow::Error, missing_credential: bool) -> ExitCode {
         return ExitCode::User;
     }
 
-    if let Some(http_error) = find_http_error(err) {
-        let status = http_error.status.as_u16();
-        if status == 401 || status == 403 {
-            return ExitCode::Auth;
-        }
-        if (400..=499).contains(&status) {
-            return ExitCode::User;
-        }
-        if (500..=599).contains(&status) {
-            return ExitCode::Network;
-        }
+    if let Some(kind) = braintrust_api_client::backend::failure_kind(err) {
+        use braintrust_api_client::backend::FailureKind;
+        return match kind {
+            FailureKind::Authentication => ExitCode::Auth,
+            FailureKind::InvalidInput => ExitCode::User,
+            FailureKind::Unavailable => ExitCode::Network,
+        };
     }
 
     if let Some(code) = classify_sdk_error(err) {
@@ -551,26 +547,18 @@ fn classify_error(err: &anyhow::Error, missing_credential: bool) -> ExitCode {
     ExitCode::Error
 }
 
-fn find_http_error(err: &anyhow::Error) -> Option<&crate::http::HttpError> {
-    err.chain()
-        .find_map(|source| source.downcast_ref::<crate::http::HttpError>())
-}
-
 fn classify_sdk_error(err: &anyhow::Error) -> Option<ExitCode> {
     let sdk_err = err
         .chain()
         .find_map(|source| source.downcast_ref::<braintrust_sdk_rust::BraintrustError>())?;
     match sdk_err {
         braintrust_sdk_rust::BraintrustError::Api { status, .. } => {
-            if *status == 401 || *status == 403 {
-                Some(ExitCode::Auth)
-            } else if (400..=499).contains(status) {
-                Some(ExitCode::User)
-            } else if (500..=599).contains(status) {
-                Some(ExitCode::Network)
-            } else {
-                None
-            }
+            use braintrust_api_client::backend::FailureKind;
+            FailureKind::from_status(*status).map(|kind| match kind {
+                FailureKind::Authentication => ExitCode::Auth,
+                FailureKind::InvalidInput => ExitCode::User,
+                FailureKind::Unavailable => ExitCode::Network,
+            })
         }
         braintrust_sdk_rust::BraintrustError::Http(_)
         | braintrust_sdk_rust::BraintrustError::Network(_) => Some(ExitCode::Network),
@@ -612,8 +600,7 @@ fn looks_like_user_error(err: &anyhow::Error) -> bool {
 }
 
 fn json_error_payload(err: &anyhow::Error) -> serde_json::Value {
-    let details = find_http_error(err)
-        .and_then(|error| serde_json::from_str::<serde_json::Value>(&error.body).ok());
+    let details = braintrust_api_client::backend::error_details(err);
     let message = details
         .as_ref()
         .and_then(json_error_message)

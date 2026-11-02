@@ -1,8 +1,7 @@
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
-use urlencoding::encode;
 
-use crate::http::{ApiClient, HttpOptions};
+use crate::http::ApiClient;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Project {
@@ -13,20 +12,17 @@ pub struct Project {
     pub description: Option<String>,
 }
 
-#[derive(Debug, Deserialize)]
-struct ListResponse {
-    objects: Vec<Project>,
-}
-
 pub async fn list_projects(client: &ApiClient) -> Result<Vec<Project>> {
-    let list: ListResponse = client
-        .with_options(HttpOptions {
-            query: vec![("org_name".into(), client.org_name().into())],
-            ..Default::default()
+    let response = client
+        .run(|| {
+            client
+                .generated()
+                .get_project_builder()
+                .org_name(client.org_name())
+                .send()
         })
-        .get("/v1/project")
         .await?;
-    Ok(list.objects)
+    crate::http::from_api(response.objects)
 }
 
 pub async fn create_project(
@@ -34,28 +30,33 @@ pub async fn create_project(
     name: &str,
     project_group_name: Option<&str>,
 ) -> Result<Project> {
-    let mut body = serde_json::json!({ "name": name, "org_name": client.org_name() });
-    if let Some(project_group_name) = project_group_name {
-        body["project_group_name"] = project_group_name.into();
-    }
-    client.post("/v1/project", &body).await
+    let mut request = braintrust_api_client::types::CreateProject::new(name.to_owned());
+    request.org_name = Some(Some(client.org_name().to_owned()));
+    request.project_group_name = project_group_name.map(|value| Some(value.to_owned()));
+    crate::http::from_api(
+        client
+            .run(|| client.generated().post_project(request.clone()))
+            .await?,
+    )
 }
 
 pub async fn delete_project(client: &ApiClient, project_id: &str) -> Result<()> {
-    let path = format!("/v1/project/{}", encode(project_id));
-    client.delete(&path).await
+    client
+        .run(|| client.generated().delete_project_id(project_id))
+        .await?;
+    Ok(())
 }
 
 pub async fn get_project_by_name(client: &ApiClient, name: &str) -> Result<Option<Project>> {
-    let list: ListResponse = client
-        .with_options(HttpOptions {
-            query: vec![
-                ("org_name".into(), client.org_name().into()),
-                ("project_name".into(), name.into()),
-            ],
-            ..Default::default()
+    let response = client
+        .run(|| {
+            client
+                .generated()
+                .get_project_builder()
+                .org_name(client.org_name())
+                .project_name(name)
+                .send()
         })
-        .get("/v1/project")
         .await?;
-    Ok(list.objects.into_iter().next())
+    crate::http::from_api(response.objects.into_iter().next())
 }

@@ -574,8 +574,10 @@ dependencies = [
 [[package]]
 name = "braintrust-api-client"
 version = "0.1.0-alpha.2"
-source = "git+https://github.com/braintrustdata/braintrust-sdk-rust?rev=7d7f1274b0fec9634607ddb4d67b5e927baae770#7d7f1274b0fec9634607ddb4d67b5e927baae770"
+source = "git+https://github.com/braintrustdata/braintrust-sdk-rust?rev=d9d351a040ebe3c85cdf965ca1849792e85d34cb#d9d351a040ebe3c85cdf965ca1849792e85d34cb"
 dependencies = [
+ "anyhow",
+ "backoff",
  "bytes",
  "chrono",
  "futures-timer",
@@ -583,12 +585,15 @@ dependencies = [
  "http 1.5.0",
  "reqwest 0.13.5",
  "reqwest-middleware",
+ "rustls-native-certs",
  "serde",
  "serde_json 1.0.151",
+ "serde_path_to_error",
  "serde_urlencoded",
  "thiserror 2.0.19",
  "tracing",
  "url",
+ "urlencoding",
  "uuid",
 ]
 
@@ -623,7 +628,7 @@ dependencies = [
 [[package]]
 name = "braintrust-sdk-rust"
 version = "0.1.0-alpha.2"
-source = "git+https://github.com/braintrustdata/braintrust-sdk-rust?rev=7d7f1274b0fec9634607ddb4d67b5e927baae770#7d7f1274b0fec9634607ddb4d67b5e927baae770"
+source = "git+https://github.com/braintrustdata/braintrust-sdk-rust?rev=d9d351a040ebe3c85cdf965ca1849792e85d34cb#d9d351a040ebe3c85cdf965ca1849792e85d34cb"
 dependencies = [
  "anyhow",
  "arc-swap",
@@ -699,10 +704,9 @@ dependencies = [
  "anyhow",
  "assert_cmd",
  "async-trait",
- "backoff",
  "base64 0.22.1",
  "braintrust-api-client",
- "braintrust-sdk-rust 0.1.0-alpha.2 (git+https://github.com/braintrustdata/braintrust-sdk-rust?rev=7d7f1274b0fec9634607ddb4d67b5e927baae770)",
+ "braintrust-sdk-rust 0.1.0-alpha.2 (git+https://github.com/braintrustdata/braintrust-sdk-rust?rev=d9d351a040ebe3c85cdf965ca1849792e85d34cb)",
  "bt-daemon",
  "chrono",
  "clap",
@@ -730,7 +734,6 @@ dependencies = [
  "rustls-native-certs",
  "serde",
  "serde_json 1.0.151",
- "serde_path_to_error",
  "sha2",
  "strip-ansi-escapes",
  "swc_bundler",

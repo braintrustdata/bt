@@ -1,16 +1,13 @@
-use anyhow::{bail, Context, Result};
-use reqwest::header::HeaderMap;
+use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Map, Value};
-use urlencoding::encode;
 
-use crate::http::{ApiClient, BtqlResponse, Pagination, Text, WithHeaders};
+use crate::http::{ApiClient, BtqlResponse, Pagination};
 
 use super::records::DATASET_RECORD_FIELDS;
 
 const MAX_DATASET_ROWS_PAGE_LIMIT: usize = 1000;
 const DATASET_ROWS_SINCE: &str = "1970-01-01T00:00:00Z";
-const MAX_ERROR_RESPONSE_BODY_CHARS: usize = 4000;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum DatasetRowsPreviewLength {
@@ -101,36 +98,23 @@ pub struct DatasetRestoreResult {
 }
 
 #[derive(Debug, Deserialize)]
-struct DatasetRestoreResultResponse {
-    xact_id: Option<String>,
-    rows_restored: usize,
-    rows_deleted: usize,
-}
-
-#[derive(Debug, Deserialize)]
-struct ListResponse {
-    objects: Vec<Dataset>,
-}
-
-#[derive(Debug, Deserialize)]
-struct ListResponseGeneric<T> {
-    objects: Vec<T>,
-}
-
-#[derive(Debug, Deserialize)]
 struct DatasetHeadXactRow {
     #[serde(rename = "_xact_id", default)]
     xact_id: Option<String>,
 }
 
 pub async fn list_datasets(client: &ApiClient, project_id: &str) -> Result<Vec<Dataset>> {
-    let path = format!(
-        "/v1/dataset?org_name={}&project_id={}",
-        encode(client.org_name()),
-        encode(project_id)
-    );
-    let list: ListResponse = client.get(&path).await?;
-    Ok(list.objects)
+    let response = client
+        .run(|| {
+            client
+                .generated()
+                .get_dataset_builder()
+                .org_name(client.org_name())
+                .project_id(project_id)
+                .send()
+        })
+        .await?;
+    crate::http::from_api(response.objects)
 }
 
 pub async fn get_dataset_by_name(
@@ -193,32 +177,31 @@ pub async fn create_dataset_with_metadata(
     description: Option<&str>,
     metadata: Option<&Value>,
 ) -> Result<Dataset> {
-    let mut body = serde_json::json!({
-        "name": name,
-        "project_id": project_id,
-        "org_name": client.org_name(),
-    });
-    if let Some(description) = description.filter(|description| !description.is_empty()) {
-        body["description"] = serde_json::Value::String(description.to_string());
-    }
-    if let Some(metadata) = metadata {
-        body["metadata"] = metadata.clone();
-    }
-    client.post("/v1/dataset", &body).await
+    let mut request =
+        braintrust_api_client::types::CreateDataset::new(name.to_owned(), project_id.parse()?);
+    request.description = description
+        .filter(|v| !v.is_empty())
+        .map(|v| Some(v.to_owned()));
+    request.metadata = metadata.map(crate::http::into_api).transpose()?.map(Some);
+    crate::http::from_api(
+        client
+            .run(|| client.generated().post_dataset(request.clone()))
+            .await?,
+    )
 }
 
 pub async fn delete_dataset(client: &ApiClient, dataset_id: &str) -> Result<()> {
-    let path = format!("/v1/dataset/{}", encode(dataset_id));
-    client.delete(&path).await
+    client
+        .run(|| client.generated().delete_dataset_id(dataset_id))
+        .await?;
+    Ok(())
 }
 
 pub async fn list_dataset_snapshots(
     client: &ApiClient,
     dataset_id: &str,
 ) -> Result<Vec<DatasetSnapshot>> {
-    let path = format!("/v1/dataset_snapshot?dataset_id={}", encode(dataset_id));
-    let list: ListResponseGeneric<DatasetSnapshot> = client.get(&path).await?;
-    Ok(list.objects)
+    crate::http::from_api(client.dataset_snapshots(dataset_id).await?.objects)
 }
 
 pub async fn create_dataset_snapshot(
@@ -228,27 +211,20 @@ pub async fn create_dataset_snapshot(
     description: Option<&str>,
     xact_id: &str,
 ) -> Result<CreateDatasetSnapshotResult> {
-    let mut body = serde_json::json!({
-        "dataset_id": dataset_id,
-        "name": name,
-        "xact_id": xact_id,
-    });
-    if let Some(description) = description {
-        body["description"] = Value::String(description.to_string());
-    }
-    let response: WithHeaders<DatasetSnapshot> = client.post("/v1/dataset_snapshot", &body).await?;
-
-    let found_existing = found_existing_snapshot_header(&response.headers);
-    let dataset_snapshot = response.body;
-    Ok(CreateDatasetSnapshotResult {
-        dataset_snapshot,
-        found_existing,
-    })
+    let mut request = braintrust_api_client::types::CreateDatasetSnapshot::new(
+        dataset_id.parse()?,
+        name.to_owned(),
+        xact_id.to_owned(),
+    );
+    request.description = description.map(|v| Some(v.to_owned()));
+    crate::http::from_api(client.create_dataset_snapshot(&request).await?)
 }
 
 pub async fn delete_dataset_snapshot(client: &ApiClient, snapshot_id: &str) -> Result<()> {
-    let path = format!("/v1/dataset_snapshot/{}", encode(snapshot_id));
-    client.delete(&path).await
+    client
+        .run(|| client.generated().delete_dataset_snapshot_id(snapshot_id))
+        .await?;
+    Ok(())
 }
 
 pub async fn preview_dataset_restore(
@@ -256,10 +232,18 @@ pub async fn preview_dataset_restore(
     dataset_id: &str,
     xact_id: &str,
 ) -> Result<DatasetRestorePreview> {
-    let path = format!("/v1/dataset/{}/restore/preview", encode(dataset_id));
-    client
-        .post(&path, &serde_json::json!({ "version": xact_id }))
-        .await
+    let request = braintrust_api_client::types::DatasetRestoreRequest {
+        version: xact_id.to_owned(),
+    };
+    crate::http::from_api(
+        client
+            .run(|| {
+                client
+                    .generated()
+                    .post_dataset_id_restore_preview(dataset_id, request.clone())
+            })
+            .await?,
+    )
 }
 
 pub async fn restore_dataset(
@@ -267,13 +251,7 @@ pub async fn restore_dataset(
     dataset_id: &str,
     xact_id: &str,
 ) -> Result<DatasetRestoreResult> {
-    let path = format!("/v1/dataset/{}/restore", encode(dataset_id));
-    let response: Text = client
-        .post(&path, &serde_json::json!({ "version": xact_id }))
-        .await?;
-
-    let body = response.0;
-    parse_dataset_restore_result_response(&body, xact_id)
+    crate::http::from_api(client.restore_dataset(dataset_id, xact_id).await?)
 }
 
 pub async fn get_dataset_head_xact_id(
@@ -383,65 +361,6 @@ fn build_dataset_head_xact_query(dataset_id: &str) -> Value {
         }],
         "limit": 1
     })
-}
-
-fn found_existing_snapshot_header(headers: &HeaderMap) -> bool {
-    headers
-        .get("x-bt-found-existing")
-        .and_then(|value| value.to_str().ok())
-        .is_some_and(|value| value.eq_ignore_ascii_case("true") || value == "1")
-}
-
-fn parse_dataset_restore_result_response(
-    body: &str,
-    requested_xact_id: &str,
-) -> Result<DatasetRestoreResult> {
-    let response: DatasetRestoreResultResponse = serde_json::from_str(body).with_context(|| {
-        format!(
-            "failed to parse dataset restore response body: {}",
-            format_response_body_for_error(body)
-        )
-    })?;
-    let xact_id = response
-        .xact_id
-        .map(|value| value.trim().to_string())
-        .filter(|value| !value.is_empty());
-    if xact_id.is_none() && (response.rows_restored > 0 || response.rows_deleted > 0) {
-        bail!(
-            "restore to xact '{}' changed rows ({} restored, {} deleted) but the response did not include a result xact",
-            requested_xact_id,
-            response.rows_restored,
-            response.rows_deleted
-        );
-    }
-
-    Ok(DatasetRestoreResult {
-        xact_id,
-        rows_restored: response.rows_restored,
-        rows_deleted: response.rows_deleted,
-    })
-}
-
-fn format_response_body_for_error(body: &str) -> String {
-    let trimmed = body.trim();
-    if trimmed.is_empty() {
-        return "<empty>".to_string();
-    }
-
-    let formatted = serde_json::from_str::<Value>(trimmed)
-        .map(|value| value.to_string())
-        .unwrap_or_else(|_| trimmed.to_string());
-    truncate_error_response_body(&formatted)
-}
-
-fn truncate_error_response_body(body: &str) -> String {
-    let mut chars = body.chars();
-    let truncated: String = chars.by_ref().take(MAX_ERROR_RESPONSE_BODY_CHARS).collect();
-    if chars.next().is_some() {
-        format!("{truncated}... [truncated]")
-    } else {
-        truncated
-    }
 }
 
 #[cfg(test)]
@@ -592,87 +511,5 @@ mod tests {
         .expect("deserialize preview");
         assert_eq!(preview.rows_to_restore, 7);
         assert_eq!(preview.rows_to_delete, 2);
-    }
-
-    #[test]
-    fn dataset_restore_result_deserializes_count_fields() {
-        let result: DatasetRestoreResult = serde_json::from_value(serde_json::json!({
-            "xact_id": "1000192656880881099",
-            "rows_restored": 7,
-            "rows_deleted": 2
-        }))
-        .expect("deserialize result");
-        assert_eq!(result.xact_id.as_deref(), Some("1000192656880881099"));
-        assert_eq!(result.rows_restored, 7);
-        assert_eq!(result.rows_deleted, 2);
-    }
-
-    #[test]
-    fn dataset_restore_result_parse_error_includes_response_body() {
-        let error = parse_dataset_restore_result_response(
-            r#"{"xact_id":"1000192656880881099"}"#,
-            "1000192656880881099",
-        )
-        .expect_err("missing count fields should fail");
-        let message = error.to_string();
-        assert!(
-            message.contains(
-                r#"failed to parse dataset restore response body: {"xact_id":"1000192656880881099"}"#
-            ),
-            "unexpected error message: {message}"
-        );
-    }
-
-    #[test]
-    fn empty_restore_result_parse_error_is_labeled_empty() {
-        let error = parse_dataset_restore_result_response("", "1000192656880881099")
-            .expect_err("empty body should fail");
-        assert!(error
-            .to_string()
-            .contains("failed to parse dataset restore response body: <empty>"));
-    }
-
-    #[test]
-    fn null_restore_result_xact_id_with_no_changes_is_noop_success() {
-        let result = parse_dataset_restore_result_response(
-            r#"{"rows_deleted":0,"rows_restored":0,"xact_id":null}"#,
-            "1000192656880881099",
-        )
-        .expect("null xact id should be ok for no-op restore");
-        assert!(result.xact_id.is_none());
-        assert_eq!(result.rows_restored, 0);
-        assert_eq!(result.rows_deleted, 0);
-    }
-
-    #[test]
-    fn null_restore_result_xact_id_with_changes_is_error() {
-        let error = parse_dataset_restore_result_response(
-            r#"{"rows_deleted":0,"rows_restored":1,"xact_id":null}"#,
-            "1000192656880881099",
-        )
-        .expect_err("changed restore should include a result xact id");
-        assert_eq!(
-            error.to_string(),
-            "restore to xact '1000192656880881099' changed rows (1 restored, 0 deleted) but the response did not include a result xact"
-        );
-    }
-
-    #[test]
-    fn found_existing_snapshot_header_accepts_true_and_one() {
-        let mut headers = HeaderMap::new();
-        headers.insert("x-bt-found-existing", "true".parse().expect("header"));
-        assert!(found_existing_snapshot_header(&headers));
-
-        headers.insert("x-bt-found-existing", "1".parse().expect("header"));
-        assert!(found_existing_snapshot_header(&headers));
-    }
-
-    #[test]
-    fn found_existing_snapshot_header_rejects_missing_or_false() {
-        assert!(!found_existing_snapshot_header(&HeaderMap::new()));
-
-        let mut headers = HeaderMap::new();
-        headers.insert("x-bt-found-existing", "false".parse().expect("header"));
-        assert!(!found_existing_snapshot_header(&headers));
     }
 }

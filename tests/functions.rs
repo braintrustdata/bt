@@ -290,6 +290,7 @@ async fn mock_create_project(
     req: HttpRequest,
     body: web::Json<CreateProjectRequest>,
 ) -> HttpResponse {
+    assert_eq!(body.org_name, "test-org");
     log_request(&state, &req);
     let mut projects = state.projects.lock().expect("projects lock");
     if let Some(existing) = projects.iter().find(|project| project.name == body.name) {
@@ -301,9 +302,9 @@ async fn mock_create_project(
     }
 
     let created = MockProject {
-        id: format!("proj_created_{}", projects.len() + 1),
+        id: format!("00000000-0000-4000-8000-{:012}", projects.len() + 101),
         name: body.name.clone(),
-        org_id: body.org_name.clone(),
+        org_id: "00000000-0000-4000-8000-000000000002".into(),
     };
     projects.push(created.clone());
     HttpResponse::Ok().json(serde_json::json!({
@@ -392,6 +393,11 @@ async fn mock_list_functions(
             project_id
                 .as_deref()
                 .is_none_or(|needle| row.get("project_id").and_then(Value::as_str) == Some(needle))
+        })
+        .map(|mut row| {
+            row["org_id"] = serde_json::json!("00000000-0000-4000-8000-000000000002");
+            row["log_id"] = serde_json::json!("p");
+            row
         })
         .collect::<Vec<_>>();
 
@@ -1705,9 +1711,9 @@ async fn functions_push_works_against_mock_api() {
         .lock()
         .expect("projects lock")
         .push(MockProject {
-            id: "proj_mock".to_string(),
+            id: "00000000-0000-4000-8000-000000000001".to_string(),
             name: "mock-project".to_string(),
-            org_id: "org_mock".to_string(),
+            org_id: "00000000-0000-4000-8000-000000000002".to_string(),
         });
     let server = MockServer::start(state.clone()).await;
 
@@ -1739,7 +1745,7 @@ const manifest = {
     entries: [
       {
         kind: "code",
-        project_id: "proj_mock",
+        project_id: "00000000-0000-4000-8000-000000000001",
         name: index === 0 ? "mock-tool" : `mock-tool-${index}`,
         slug: index === 0 ? "mock-tool" : `mock-tool-${index}`,
         function_type: "tool",
@@ -1805,7 +1811,11 @@ exit 24
     server.stop().await;
 
     if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
+        let stderr = format!(
+            "{}\n{}",
+            String::from_utf8_lossy(&output.stderr),
+            String::from_utf8_lossy(&output.stdout)
+        );
         panic!("mock push failed:\n{stderr}");
     }
 
@@ -1833,7 +1843,7 @@ exit 24
     let first = inserted[0].as_object().expect("inserted function object");
     assert_eq!(
         first.get("project_id").and_then(Value::as_str),
-        Some("proj_mock")
+        Some("00000000-0000-4000-8000-000000000001")
     );
     assert_eq!(first.get("slug").and_then(Value::as_str), Some("mock-tool"));
     assert_eq!(
@@ -1889,9 +1899,9 @@ async fn functions_push_external_packages_bundles_with_runner() {
         .lock()
         .expect("projects lock")
         .push(MockProject {
-            id: "proj_mock".to_string(),
+            id: "00000000-0000-4000-8000-000000000001".to_string(),
             name: "mock-project".to_string(),
-            org_id: "org_mock".to_string(),
+            org_id: "00000000-0000-4000-8000-000000000002".to_string(),
         });
     let server = MockServer::start(state.clone()).await;
 
@@ -1923,7 +1933,7 @@ const manifest = {
     entries: [
       {
         kind: "code",
-        project_id: "proj_mock",
+        project_id: "00000000-0000-4000-8000-000000000001",
         name: index === 0 ? "mock-tool" : `mock-tool-${index}`,
         slug: index === 0 ? "mock-tool" : `mock-tool-${index}`,
         function_type: "tool",
@@ -1994,7 +2004,11 @@ exit 24
     server.stop().await;
 
     if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
+        let stderr = format!(
+            "{}\n{}",
+            String::from_utf8_lossy(&output.stderr),
+            String::from_utf8_lossy(&output.stdout)
+        );
         panic!("mock push failed:\n{stderr}");
     }
 
@@ -2031,9 +2045,9 @@ async fn functions_push_js_bundles_by_default() {
         .lock()
         .expect("projects lock")
         .push(MockProject {
-            id: "proj_mock".to_string(),
+            id: "00000000-0000-4000-8000-000000000001".to_string(),
             name: "mock-project".to_string(),
-            org_id: "org_mock".to_string(),
+            org_id: "00000000-0000-4000-8000-000000000002".to_string(),
         });
     let server = MockServer::start(state.clone()).await;
 
@@ -2065,7 +2079,7 @@ const manifest = {
     entries: [
       {
         kind: "code",
-        project_id: "proj_mock",
+        project_id: "00000000-0000-4000-8000-000000000001",
         name: index === 0 ? "mock-tool" : `mock-tool-${index}`,
         slug: index === 0 ? "mock-tool" : `mock-tool-${index}`,
         function_type: "tool",
@@ -2128,7 +2142,11 @@ exit 24
     server.stop().await;
 
     if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
+        let stderr = format!(
+            "{}\n{}",
+            String::from_utf8_lossy(&output.stderr),
+            String::from_utf8_lossy(&output.stdout)
+        );
         panic!("mock push failed:\n{stderr}");
     }
 
@@ -2159,9 +2177,9 @@ async fn functions_push_tsconfig_is_forwarded_to_bundler() {
         .lock()
         .expect("projects lock")
         .push(MockProject {
-            id: "proj_mock".to_string(),
+            id: "00000000-0000-4000-8000-000000000001".to_string(),
             name: "mock-project".to_string(),
-            org_id: "org_mock".to_string(),
+            org_id: "00000000-0000-4000-8000-000000000002".to_string(),
         });
     let server = MockServer::start(state.clone()).await;
 
@@ -2199,7 +2217,7 @@ const manifest = {
     entries: [
       {
         kind: "code",
-        project_id: "proj_mock",
+        project_id: "00000000-0000-4000-8000-000000000001",
         name: index === 0 ? "mock-tool" : `mock-tool-${index}`,
         slug: index === 0 ? "mock-tool" : `mock-tool-${index}`,
         function_type: "tool",
@@ -2275,7 +2293,11 @@ exit 24
     server.stop().await;
 
     if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
+        let stderr = format!(
+            "{}\n{}",
+            String::from_utf8_lossy(&output.stderr),
+            String::from_utf8_lossy(&output.stdout)
+        );
         panic!("mock push failed:\n{stderr}");
     }
 
@@ -2305,13 +2327,13 @@ async fn functions_view_by_positional_id_does_not_require_project_context() {
         .lock()
         .expect("pull rows lock")
         .push(serde_json::json!({
-            "id": "fn_123",
+            "id": "00000000-0000-4000-8000-000000000003",
             "name": "Doc Search",
             "slug": "doc-search",
-            "project_id": "proj_mock",
+            "project_id": "00000000-0000-4000-8000-000000000001",
             "description": "Search docs",
             "function_type": "tool",
-            "function_data": { "type": "code", "data": { "type": "inline", "code": "export default async function handler() {}" } },
+            "function_data": { "type": "code", "data": { "type": "inline", "runtime_context":{"runtime":"node","version":"22"}, "code": "export default async function handler() {}" } },
             "_xact_id": "0000000000000001"
         }));
 
@@ -2322,7 +2344,12 @@ async fn functions_view_by_positional_id_does_not_require_project_context() {
 
     let output = Command::new(common::bt_binary_path(&repo_root()))
         .current_dir(tmp.path())
-        .args(["functions", "--json", "view", "fn_123"])
+        .args([
+            "functions",
+            "--json",
+            "view",
+            "00000000-0000-4000-8000-000000000003",
+        ])
         .env("XDG_CONFIG_HOME", config_dir.path())
         .env("APPDATA", config_dir.path())
         .env("BRAINTRUST_API_KEY", "test-key")
@@ -2336,24 +2363,31 @@ async fn functions_view_by_positional_id_does_not_require_project_context() {
         .env_remove("BRAINTRUST_FUNCTIONS_VIEW_ID")
         .env_remove("BRAINTRUST_FUNCTIONS_VIEW_VERSION")
         .output()
-        .expect("run bt functions view fn_123");
+        .expect("run bt functions view 00000000-0000-4000-8000-000000000003");
 
     server.stop().await;
 
     if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
+        let stderr = format!(
+            "{}\n{}",
+            String::from_utf8_lossy(&output.stderr),
+            String::from_utf8_lossy(&output.stdout)
+        );
         panic!("mock view by id failed:\n{stderr}");
     }
 
     let function: Value = serde_json::from_slice(&output.stdout).expect("parse function JSON");
-    assert_eq!(function["id"].as_str(), Some("fn_123"));
+    assert_eq!(
+        function["id"].as_str(),
+        Some("00000000-0000-4000-8000-000000000003")
+    );
     assert_eq!(function["slug"].as_str(), Some("doc-search"));
 
     let requests = state.requests.lock().expect("requests lock").clone();
     assert!(
         requests
             .iter()
-            .any(|entry| entry == "/v1/function?ids=fn_123"),
+            .any(|entry| entry == "/v1/function?ids=00000000-0000-4000-8000-000000000003"),
         "view request should fetch the function by id, got {requests:?}"
     );
     assert!(
@@ -2372,13 +2406,13 @@ async fn functions_view_by_id_passes_version() {
         .lock()
         .expect("pull rows lock")
         .push(serde_json::json!({
-            "id": "fn_123",
+            "id": "00000000-0000-4000-8000-000000000003",
             "name": "Doc Search",
             "slug": "doc-search",
-            "project_id": "proj_mock",
+            "project_id": "00000000-0000-4000-8000-000000000001",
             "description": "Search docs",
             "function_type": "tool",
-            "function_data": { "type": "code", "data": { "type": "inline", "code": "export default async function handler() {}" } },
+            "function_data": { "type": "code", "data": { "type": "inline", "runtime_context":{"runtime":"node","version":"22"}, "code": "export default async function handler() {}" } },
             "_xact_id": "0000000000000007"
         }));
 
@@ -2394,7 +2428,7 @@ async fn functions_view_by_id_passes_version() {
             "--json",
             "view",
             "--id",
-            "fn_123",
+            "00000000-0000-4000-8000-000000000003",
             "--version",
             "0000000000000007",
         ])
@@ -2411,24 +2445,30 @@ async fn functions_view_by_id_passes_version() {
         .env_remove("BRAINTRUST_FUNCTIONS_VIEW_ID")
         .env_remove("BRAINTRUST_FUNCTIONS_VIEW_VERSION")
         .output()
-        .expect("run bt functions view --id fn_123 --version");
+        .expect("run bt functions view --id 00000000-0000-4000-8000-000000000003 --version");
 
     server.stop().await;
 
     if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
+        let stderr = format!(
+            "{}\n{}",
+            String::from_utf8_lossy(&output.stderr),
+            String::from_utf8_lossy(&output.stdout)
+        );
         panic!("mock view by id at version failed:\n{stderr}");
     }
 
     let function: Value = serde_json::from_slice(&output.stdout).expect("parse function JSON");
-    assert_eq!(function["id"].as_str(), Some("fn_123"));
+    assert_eq!(
+        function["id"].as_str(),
+        Some("00000000-0000-4000-8000-000000000003")
+    );
     assert_eq!(function["_xact_id"].as_str(), Some("0000000000000007"));
 
     let requests = state.requests.lock().expect("requests lock").clone();
     assert!(
-        requests
-            .iter()
-            .any(|entry| entry == "/v1/function?ids=fn_123&version=0000000000000007"),
+        requests.iter().any(|entry| entry
+            == "/v1/function?ids=00000000-0000-4000-8000-000000000003&version=0000000000000007"),
         "view request should include the version selector, got {requests:?}"
     );
     assert!(
@@ -2447,22 +2487,22 @@ async fn functions_view_by_slug_passes_version() {
         .lock()
         .expect("projects lock")
         .push(MockProject {
-            id: "proj_mock".to_string(),
+            id: "00000000-0000-4000-8000-000000000001".to_string(),
             name: "mock-project".to_string(),
-            org_id: "org_mock".to_string(),
+            org_id: "00000000-0000-4000-8000-000000000002".to_string(),
         });
     state
         .pull_rows
         .lock()
         .expect("pull rows lock")
         .push(serde_json::json!({
-            "id": "fn_123",
+            "id": "00000000-0000-4000-8000-000000000003",
             "name": "Doc Search",
             "slug": "doc-search",
-            "project_id": "proj_mock",
+            "project_id": "00000000-0000-4000-8000-000000000001",
             "description": "Search docs",
             "function_type": "tool",
-            "function_data": { "type": "code", "data": { "type": "inline", "code": "export default async function handler() {}" } },
+            "function_data": { "type": "code", "data": { "type": "inline", "runtime_context":{"runtime":"node","version":"22"}, "code": "export default async function handler() {}" } },
             "_xact_id": "0000000000000007"
         }));
 
@@ -2499,7 +2539,11 @@ async fn functions_view_by_slug_passes_version() {
     server.stop().await;
 
     if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
+        let stderr = format!(
+            "{}\n{}",
+            String::from_utf8_lossy(&output.stderr),
+            String::from_utf8_lossy(&output.stdout)
+        );
         panic!("mock view by slug at version failed:\n{stderr}");
     }
 
@@ -2510,7 +2554,7 @@ async fn functions_view_by_slug_passes_version() {
     let requests = state.requests.lock().expect("requests lock").clone();
     assert!(
         requests.iter().any(|entry| entry
-            == "/v1/function?project_id=proj_mock&slug=doc-search&version=0000000000000007"),
+            == "/v1/function?project_id=00000000-0000-4000-8000-000000000001&slug=doc-search&version=0000000000000007"),
         "view request should include project, slug, and version selectors, got {requests:?}"
     );
 }
@@ -2523,19 +2567,19 @@ async fn functions_pull_works_against_mock_api() {
         .lock()
         .expect("projects lock")
         .push(MockProject {
-            id: "proj_mock".to_string(),
+            id: "00000000-0000-4000-8000-000000000001".to_string(),
             name: "mock-project".to_string(),
-            org_id: "org_mock".to_string(),
+            org_id: "00000000-0000-4000-8000-000000000002".to_string(),
         });
     state
         .pull_rows
         .lock()
         .expect("pull rows lock")
         .push(serde_json::json!({
-            "id": "fn_123",
+            "id": "00000000-0000-4000-8000-000000000003",
             "name": "Doc Search",
             "slug": "doc-search",
-            "project_id": "proj_mock",
+            "project_id": "00000000-0000-4000-8000-000000000001",
             "description": "",
             "function_data": { "type": "prompt" },
             "prompt_data": {
@@ -2565,7 +2609,7 @@ async fn functions_pull_works_against_mock_api() {
             "--json",
             "pull",
             "--project-id",
-            "proj_mock",
+            "00000000-0000-4000-8000-000000000001",
             "--slug",
             "doc-search",
             "--force",
@@ -2588,7 +2632,11 @@ async fn functions_pull_works_against_mock_api() {
     server.stop().await;
 
     if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
+        let stderr = format!(
+            "{}\n{}",
+            String::from_utf8_lossy(&output.stderr),
+            String::from_utf8_lossy(&output.stdout)
+        );
         panic!("mock pull failed:\n{stderr}");
     }
 
@@ -2617,7 +2665,7 @@ async fn functions_pull_works_against_mock_api() {
     assert!(
         requests.iter().any(|entry| {
             entry.contains("/v1/function")
-                && entry.contains("project_id=proj_mock")
+                && entry.contains("project_id=00000000-0000-4000-8000-000000000001")
                 && entry.contains("slug=doc-search")
         }),
         "pull request should include selector query params"
@@ -2639,19 +2687,19 @@ async fn functions_pull_skips_untracked_existing_file_without_force() {
         .lock()
         .expect("projects lock")
         .push(MockProject {
-            id: "proj_mock".to_string(),
+            id: "00000000-0000-4000-8000-000000000001".to_string(),
             name: "mock-project".to_string(),
-            org_id: "org_mock".to_string(),
+            org_id: "00000000-0000-4000-8000-000000000002".to_string(),
         });
     state
         .pull_rows
         .lock()
         .expect("pull rows lock")
         .push(serde_json::json!({
-            "id": "fn_123",
+            "id": "00000000-0000-4000-8000-000000000003",
             "name": "Doc Search",
             "slug": "doc-search",
-            "project_id": "proj_mock",
+            "project_id": "00000000-0000-4000-8000-000000000001",
             "description": "",
             "function_data": { "type": "prompt" },
             "prompt_data": {
@@ -2685,7 +2733,7 @@ async fn functions_pull_skips_untracked_existing_file_without_force() {
             "--json",
             "pull",
             "--project-id",
-            "proj_mock",
+            "00000000-0000-4000-8000-000000000001",
             "--slug",
             "doc-search",
             "--output-dir",
@@ -2707,7 +2755,11 @@ async fn functions_pull_skips_untracked_existing_file_without_force() {
     server.stop().await;
 
     if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
+        let stderr = format!(
+            "{}\n{}",
+            String::from_utf8_lossy(&output.stderr),
+            String::from_utf8_lossy(&output.stdout)
+        );
         panic!("mock pull failed:\n{stderr}");
     }
 
@@ -2732,21 +2784,21 @@ async fn functions_pull_selector_with_unsupported_only_rows_still_succeeds() {
         .lock()
         .expect("projects lock")
         .push(MockProject {
-            id: "proj_mock".to_string(),
+            id: "00000000-0000-4000-8000-000000000001".to_string(),
             name: "mock-project".to_string(),
-            org_id: "org_mock".to_string(),
+            org_id: "00000000-0000-4000-8000-000000000002".to_string(),
         });
     state
         .pull_rows
         .lock()
         .expect("pull rows lock")
         .push(serde_json::json!({
-            "id": "fn_code_1",
+            "id": "00000000-0000-4000-8000-000000000004",
             "name": "Legacy Code Function",
             "slug": "legacy-code",
-            "project_id": "proj_mock",
+            "project_id": "00000000-0000-4000-8000-000000000001",
             "description": "",
-            "function_data": { "type": "code" },
+            "function_data": { "type": "code", "data":{"type":"inline","runtime_context":{"runtime":"node","version":"22"},"code":"export default function handler() {}"} },
             "_xact_id": "0000000000000001"
         }));
 
@@ -2763,7 +2815,7 @@ async fn functions_pull_selector_with_unsupported_only_rows_still_succeeds() {
             "--json",
             "pull",
             "--project-id",
-            "proj_mock",
+            "00000000-0000-4000-8000-000000000001",
             "--slug",
             "legacy-code",
             "--force",
@@ -2787,7 +2839,11 @@ async fn functions_pull_selector_with_unsupported_only_rows_still_succeeds() {
     server.stop().await;
 
     if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
+        let stderr = format!(
+            "{}\n{}",
+            String::from_utf8_lossy(&output.stderr),
+            String::from_utf8_lossy(&output.stdout)
+        );
         panic!("mock pull failed:\n{stderr}");
     }
 
@@ -2815,9 +2871,9 @@ async fn functions_pull_selector_with_unsupported_only_rows_still_succeeds() {
 async fn function_lists_use_read_only_auth_with_a_cached_project() {
     let state = Arc::new(MockServerState::default());
     state.projects.lock().unwrap().push(MockProject {
-        id: "test-project-id".into(),
+        id: "00000000-0000-4000-8000-000000000001".into(),
         name: "test-project".into(),
-        org_id: "test-org-id".into(),
+        org_id: "00000000-0000-4000-8000-000000000002".into(),
     });
     let server = MockServer::start(state.clone()).await;
     let root = tempdir().unwrap();
@@ -2826,7 +2882,7 @@ async fn function_lists_use_read_only_auth_with_a_cached_project() {
     fs::create_dir(root.path().join(".git")).unwrap();
     fs::write(
         config.join("config.json"),
-        r#"{"project_id":"test-project-id","org":"test-org"}"#,
+        r#"{"project_id":"00000000-0000-4000-8000-000000000001","org":"test-org"}"#,
     )
     .unwrap();
     for command in [

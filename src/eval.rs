@@ -15,11 +15,11 @@ use actix_web::http::header::{
 };
 use actix_web::{guard, web, App, HttpMessage, HttpRequest, HttpResponse, HttpServer};
 use anyhow::{Context, Result};
+use braintrust_api_client::backend::BackendConnection;
 use clap::{Args, ValueEnum};
 use crossterm::style::Stylize;
 use futures_util::stream;
 use indicatif::{MultiProgress, ProgressBar, ProgressDrawTarget, ProgressStyle};
-use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use tokio::process::Command;
@@ -146,12 +146,6 @@ struct EvalScore {
     function_id: Value,
 }
 
-#[derive(Debug, Deserialize)]
-struct DatasetLookupRow {
-    project_id: String,
-    name: String,
-}
-
 #[derive(Debug, Clone, Deserialize)]
 #[serde(untagged)]
 enum DatasetIdField {
@@ -188,7 +182,7 @@ struct DevServerState {
     allowed_org_name: Option<String>,
     allowed_origins: Vec<String>,
     app_url: String,
-    http_client: Client,
+    api_connection: BackendConnection,
 }
 
 #[derive(Debug)]
@@ -563,8 +557,11 @@ pub async fn run(base: BaseArgs, args: EvalArgs) -> Result<()> {
             allowed_org_name: args.dev_org_name.clone(),
             allowed_origins: collect_allowed_dev_origins(&args.dev_allowed_origin, &app_url),
             app_url,
-            http_client: crate::http::build_http_client(crate::http::DEFAULT_HTTP_TIMEOUT)
-                .context("failed to create dev server HTTP client")?,
+            api_connection: BackendConnection::new(
+                crate::http::DEFAULT_HTTP_TIMEOUT,
+                crate::http::BT_USER_AGENT,
+            )
+            .context("failed to create dev server HTTP client")?,
         };
         return run_dev_server(state).await;
     }
@@ -1286,12 +1283,9 @@ async fn authenticate_dev_request(
         }
     }
 
-    let client = braintrust_api_client::Client::builder()
-        .api_key(&token)
-        .api_url(&state.app_url)
-        .app_url(&state.app_url)
-        .http_client(state.http_client.clone())
-        .build()
+    let client = state
+        .api_connection
+        .client(&state.app_url, &state.app_url, &token)
         .map_err(|_| {
             json_error_response(actix_web::http::StatusCode::UNAUTHORIZED, "Unauthorized")
         })?;
@@ -1349,35 +1343,19 @@ async fn resolve_dataset_ref_for_eval_request(
         ));
     }
 
-    let client = braintrust_api_client::Client::builder()
-        .api_key(&auth.token)
-        .api_url(&state.app_url)
-        .app_url(&state.app_url)
-        .http_client(state.http_client.clone())
-        .build()
+    let client = state
+        .api_connection
+        .client(&state.app_url, &state.app_url, &auth.token)
         .map_err(|err| {
             json_error_response(actix_web::http::StatusCode::BAD_REQUEST, &err.to_string())
         })?;
-    let response = client
-        .app_request(reqwest::Method::POST, "api/dataset/get")
-        .header(HEADER_BT_ORG_NAME, auth.org_name.clone())
-        .json(&json!({ "id": dataset_id }))
-        .send()
+    let datasets = client
+        .lookup_dataset(&dataset_id, &auth.org_name)
         .await
         .map_err(|err| {
             json_error_response(
                 actix_web::http::StatusCode::BAD_REQUEST,
                 &format!("Failed to load dataset '{dataset_id}': {err}"),
-            )
-        })?;
-
-    let datasets = response
-        .json::<Vec<DatasetLookupRow>>()
-        .await
-        .map_err(|err| {
-            json_error_response(
-                actix_web::http::StatusCode::BAD_REQUEST,
-                &format!("Failed to parse dataset response for '{dataset_id}': {err}"),
             )
         })?;
     let Some(dataset) = datasets.first() else {

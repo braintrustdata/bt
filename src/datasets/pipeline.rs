@@ -1686,8 +1686,8 @@ async fn upload_deferred_attachment(
         "content_type": spec.content_type,
         "org_id": client.org_id(),
     });
-    let metadata: AttachmentUploadMetadata = client
-        .post("/attachment", &request)
+    let metadata = client
+        .request_attachment(&crate::http::into_api(&request)?)
         .await
         .context("failed to request signed URL from API server")?;
     let data = deferred_attachment_bytes(spec, base_dir)?;
@@ -1704,8 +1704,8 @@ async fn upload_deferred_attachment(
         "org_id": client.org_id(),
         "status": status,
     });
-    let _: Value = client
-        .post("/attachment/status", &status_request)
+    client
+        .attachment_status(&crate::http::into_api(&status_request)?)
         .await
         .context("failed to log attachment status")?;
     upload_result.context("failed to upload attachment to object store")?;
@@ -1716,14 +1716,6 @@ async fn upload_deferred_attachment(
         "content_type": spec.content_type,
         "key": key,
     }))
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct AttachmentUploadMetadata {
-    signed_url: String,
-    #[serde(default)]
-    headers: HashMap<String, String>,
 }
 
 fn deferred_attachment_bytes(

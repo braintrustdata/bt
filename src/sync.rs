@@ -17,12 +17,13 @@ use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Map, Value};
 use sha2::{Digest, Sha256};
-use urlencoding::encode;
 
 use crate::args::BaseArgs;
 use crate::auth::login;
 use crate::experiments::api::create_experiment;
-use crate::http::{ApiClient, BtqlOptions, BtqlResponse, HttpOptions, Pagination, RetryReason};
+use crate::http::{
+    ApiClient, BtqlOptions, BtqlResponse, OperationOptions, Pagination, RetryReason,
+};
 use crate::projects::api::{create_project, list_projects, Project};
 use crate::ui::{animations_enabled, fuzzy_select, is_quiet};
 use crate::utils::{app_project_url, parse_duration_to_seconds, write_json_atomic};
@@ -408,11 +409,6 @@ struct NamedObject {
 struct CreatedDataset {
     id: String,
     name: String,
-}
-
-#[derive(Debug, Deserialize)]
-struct NamedObjectListResponse {
-    objects: Vec<NamedObject>,
 }
 
 #[derive(Debug, Clone)]
@@ -967,7 +963,7 @@ async fn pull_spans_mode(
         |batch_limit, cursor| async move {
             let query = build_spans_query(source_expr, filter, batch_limit, cursor.as_deref());
             client
-                .with_options(HttpOptions {
+                .with_options(OperationOptions {
                     on_retry: Some(Arc::new(btql_retry_tracker.observer())),
                     trace: verbose.then_some("spans").map(str::to_owned),
                     ..Default::default()
@@ -1212,7 +1208,7 @@ async fn pull_traces_mode(
                 discovery_cursor.as_deref(),
             );
             let response = client
-                .with_options(HttpOptions {
+                .with_options(OperationOptions {
                     on_retry: Some(Arc::new(btql_retry_tracker.observer())),
                     trace: verbose.then_some("discover_roots").map(str::to_owned),
                     ..Default::default()
@@ -1520,7 +1516,7 @@ async fn process_trace_chunk(
             cursor.as_deref(),
         );
         let BtqlResponse { data, cursor, .. } = client
-            .with_options(HttpOptions {
+            .with_options(OperationOptions {
                 on_retry: Some(Arc::new(btql_retry_tracker.observer())),
                 trace: verbose.then_some("fetch_roots").map(str::to_owned),
                 ..Default::default()
@@ -2340,7 +2336,7 @@ async fn discover_vector_specs_global(
     ]
     .join(" | ");
     let response = client
-        .with_options(HttpOptions {
+        .with_options(OperationOptions {
             on_retry: Some(Arc::new(btql_retry_tracker.observer())),
             trace: verbose.then_some("vector_models").map(str::to_owned),
             ..Default::default()
@@ -2459,7 +2455,7 @@ async fn fetch_vector_columns_for_rows(
         id_literals.len().max(1)
     );
     let response = client
-        .with_options(HttpOptions {
+        .with_options(OperationOptions {
             on_retry: Some(Arc::new(btql_retry_tracker.observer())),
             trace: verbose.then_some("vector_rows").map(str::to_owned),
             ..Default::default()
@@ -3420,12 +3416,9 @@ async fn create_dataset(
     project_id: &str,
     name: &str,
 ) -> Result<CreatedDataset> {
-    let body = serde_json::json!({
-        "name": name,
-        "project_id": project_id,
-        "org_name": client.org_name(),
-    });
-    client.post("/v1/dataset", &body).await
+    crate::http::from_api(
+        crate::datasets::api::create_dataset(client, project_id, name, None).await?,
+    )
 }
 
 async fn list_project_named_objects(
@@ -3433,14 +3426,15 @@ async fn list_project_named_objects(
     object_type: ObjectType,
     project_id: &str,
 ) -> Result<Vec<NamedObject>> {
-    let path = format!(
-        "/v1/{}?org_name={}&project_id={}",
-        encode(object_type.as_str()),
-        encode(client.org_name()),
-        encode(project_id)
-    );
-    let response: NamedObjectListResponse = client.get(&path).await?;
-    Ok(response.objects)
+    match object_type {
+        ObjectType::Dataset => {
+            crate::http::from_api(crate::datasets::api::list_datasets(client, project_id).await?)
+        }
+        ObjectType::Experiment => crate::http::from_api(
+            crate::experiments::api::list_experiments_by_project_id(client, project_id).await?,
+        ),
+        ObjectType::ProjectLogs => anyhow::bail!("project logs do not have named child objects"),
+    }
 }
 
 async fn resolve_push_destination(
