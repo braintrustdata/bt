@@ -572,6 +572,27 @@ dependencies = [
 ]
 
 [[package]]
+name = "braintrust-api-client"
+version = "0.1.0-alpha.2"
+source = "git+https://github.com/braintrustdata/braintrust-sdk-rust?rev=7d7f1274b0fec9634607ddb4d67b5e927baae770#7d7f1274b0fec9634607ddb4d67b5e927baae770"
+dependencies = [
+ "bytes",
+ "chrono",
+ "futures-timer",
+ "futures-util",
+ "http 1.5.0",
+ "reqwest 0.13.5",
+ "reqwest-middleware",
+ "serde",
+ "serde_json 1.0.151",
+ "serde_urlencoded",
+ "thiserror 2.0.19",
+ "tracing",
+ "url",
+ "uuid",
+]
+
+[[package]]
 name = "braintrust-sdk-rust"
 version = "0.1.0-alpha.2"
 source = "git+https://github.com/braintrustdata/braintrust-sdk-rust?rev=45a2c88ca9d9ccc393ec0338ac438199fc3c5df2#45a2c88ca9d9ccc393ec0338ac438199fc3c5df2"
@@ -589,6 +610,36 @@ dependencies = [
  "indexmap 2.14.0",
  "regex",
  "reqwest 0.13.5",
+ "serde",
+ "serde_json 1.0.151",
+ "serde_repr",
+ "thiserror 2.0.19",
+ "tokio",
+ "tracing",
+ "url",
+ "uuid",
+]
+
+[[package]]
+name = "braintrust-sdk-rust"
+version = "0.1.0-alpha.2"
+source = "git+https://github.com/braintrustdata/braintrust-sdk-rust?rev=7d7f1274b0fec9634607ddb4d67b5e927baae770#7d7f1274b0fec9634607ddb4d67b5e927baae770"
+dependencies = [
+ "anyhow",
+ "arc-swap",
+ "async-trait",
+ "backoff",
+ "base64 0.23.1",
+ "bon",
+ "braintrust-api-client",
+ "bytes",
+ "chrono",
+ "crossbeam",
+ "futures",
+ "indexmap 2.14.0",
+ "regex",
+ "reqwest 0.13.5",
+ "reqwest-middleware",
  "serde",
  "serde_json 1.0.151",
  "serde_repr",
@@ -650,7 +701,8 @@ dependencies = [
  "async-trait",
  "backoff",
  "base64 0.22.1",
- "braintrust-sdk-rust",
+ "braintrust-api-client",
+ "braintrust-sdk-rust 0.1.0-alpha.2 (git+https://github.com/braintrustdata/braintrust-sdk-rust?rev=7d7f1274b0fec9634607ddb4d67b5e927baae770)",
  "bt-daemon",
  "chrono",
  "clap",
@@ -674,7 +726,8 @@ dependencies = [
  "predicates",
  "ratatui",
  "regex",
- "reqwest 0.12.28",
+ "reqwest 0.13.5",
+ "rustls-native-certs",
  "serde",
  "serde_json 1.0.151",
  "serde_path_to_error",
@@ -709,7 +762,7 @@ dependencies = [
  "anyhow",
  "async-trait",
  "base64 0.22.1",
- "braintrust-sdk-rust",
+ "braintrust-sdk-rust 0.1.0-alpha.2 (git+https://github.com/braintrustdata/braintrust-sdk-rust?rev=45a2c88ca9d9ccc393ec0338ac438199fc3c5df2)",
  "chrono",
  "clap",
  "fs2",
@@ -760,6 +813,9 @@ name = "bytes"
 version = "1.12.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "fc652a48c352aef3ea3aed32080501cf3ef6ed5da78602a020c991775b0aff04"
+dependencies = [
+ "serde",
+]
 
 [[package]]
 name = "bytes-str"
@@ -1421,7 +1477,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "39cab71617ae0d63f51a36d69f866391735b51691dbda63cf6f96d042b63efeb"
 dependencies = [
  "libc",
- "windows-sys 0.59.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -1640,6 +1696,16 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b231ed28831efb4a61a08580c4bc233ec56bc009f4cd8f52da2c3cb97df0c109"
 
 [[package]]
+name = "futures-timer"
+version = "3.0.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "af43fadb8a98512d547e37b4e92e0ced13e205c061b87b4623eff01d918d6968"
+dependencies = [
+ "gloo-timers",
+ "send_wrapper",
+]
+
+[[package]]
 name = "futures-util"
 version = "0.3.33"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1719,6 +1785,18 @@ name = "glob"
 version = "0.3.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "e4eba85ea1d0a966a983acd07deee566e67395d2d96b6fb39e62b5a833f1eb0b"
+
+[[package]]
+name = "gloo-timers"
+version = "0.4.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "482ce8a491a501da4cd806bd190275363d674f2845005c6ddbd5d3e1dd54495d"
+dependencies = [
+ "futures-channel",
+ "futures-core",
+ "js-sys",
+ "wasm-bindgen",
+]
 
 [[package]]
 name = "h2"
@@ -1922,7 +2000,6 @@ dependencies = [
  "hyper",
  "hyper-util",
  "rustls",
- "rustls-native-certs",
  "tokio",
  "tokio-rustls",
  "tower-service",
@@ -2646,7 +2723,7 @@ version = "0.50.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7957b9740744892f114936ab4a57b3f487491bbeafaf8083688b16841a4240e5"
 dependencies = [
- "windows-sys 0.59.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -3222,7 +3299,7 @@ dependencies = [
  "once_cell",
  "socket2 0.5.10",
  "tracing",
- "windows-sys 0.59.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -3520,7 +3597,6 @@ dependencies = [
  "pin-project-lite",
  "quinn",
  "rustls",
- "rustls-native-certs",
  "rustls-pki-types",
  "serde",
  "serde_json 1.0.151",
@@ -3565,6 +3641,7 @@ dependencies = [
  "rustls-platform-verifier",
  "serde",
  "serde_json 1.0.151",
+ "serde_urlencoded",
  "sync_wrapper",
  "tokio",
  "tokio-rustls",
@@ -3577,6 +3654,21 @@ dependencies = [
  "wasm-bindgen-futures",
  "wasm-streams",
  "web-sys",
+]
+
+[[package]]
+name = "reqwest-middleware"
+version = "0.5.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "07bc3f1384cffa4f274dad2d4ddd73aed32fed8f786d96c6be8aa4e5fd3c3b58"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "http 1.5.0",
+ "reqwest 0.13.5",
+ "serde",
+ "thiserror 2.0.19",
+ "tower-service",
 ]
 
 [[package]]
@@ -3684,7 +3776,7 @@ dependencies = [
  "errno",
  "libc",
  "linux-raw-sys 0.12.1",
- "windows-sys 0.59.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -3857,6 +3949,12 @@ name = "semver"
 version = "1.0.28"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "8a7852d02fc848982e0c167ef163aaff9cd91dc640ba85e263cb1ce46fae51cd"
+
+[[package]]
+name = "send_wrapper"
+version = "0.6.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "cd0b0ec5f1c1ca621c432a25813d8d60c88abe6d3e08a3eb9cf37d97a0fe3d73"
 
 [[package]]
 name = "seq-macro"
@@ -4715,7 +4813,7 @@ dependencies = [
  "getrandom 0.3.4",
  "once_cell",
  "rustix 1.1.4",
- "windows-sys 0.59.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -5559,7 +5657,7 @@ version = "0.1.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c2a7b1c03c876122aa43f3020e6c3c3ee5c05081c9a00739faf7503aeba10d22"
 dependencies = [
- "windows-sys 0.48.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]

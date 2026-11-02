@@ -28,8 +28,9 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
-use reqwest::header::{HeaderValue, CONTENT_TYPE};
-use reqwest::{Client, ClientBuilder, Method, StatusCode};
+use braintrust_api_client::{Client, Request, Transport};
+use reqwest::header::CONTENT_TYPE;
+use reqwest::{ClientBuilder, Method, StatusCode};
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 
@@ -38,19 +39,79 @@ use crate::auth::LoginContext;
 pub const DEFAULT_HTTP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 pub const BT_USER_AGENT: &str = concat!("bt-cli/", env!("CARGO_PKG_VERSION"));
 
-pub fn build_http_client(timeout: std::time::Duration) -> Result<Client> {
-    build_http_client_from_builder(Client::builder().timeout(timeout))
+pub fn build_http_client(timeout: std::time::Duration) -> Result<reqwest::Client> {
+    build_http_client_from_builder(reqwest::Client::builder().timeout(timeout))
 }
 
-pub fn build_http_client_from_builder(mut builder: ClientBuilder) -> Result<Client> {
+pub fn build_http_client_from_builder(builder: ClientBuilder) -> Result<reqwest::Client> {
+    configured_http_builder(builder)
+        .build()
+        .context("failed to build HTTP client")
+}
+
+fn configured_http_builder(builder: ClientBuilder) -> ClientBuilder {
     // Prefer the platform/native root store so standard envs like SSL_CERT_FILE
     // are honored consistently across the CLI.
-    builder = builder
-        .user_agent(BT_USER_AGENT)
-        .tls_built_in_native_certs(true)
-        .tls_built_in_webpki_certs(false);
+    let roots = rustls_native_certs::load_native_certs()
+        .certs
+        .into_iter()
+        .filter_map(|cert| reqwest::Certificate::from_der(cert.as_ref()).ok());
+    builder.user_agent(BT_USER_AGENT).tls_certs_only(roots)
+}
 
-    builder.build().context("failed to build HTTP client")
+pub fn build_auth_transport(timeout: Duration) -> Result<Transport> {
+    build_http_client(timeout).map(Transport::new)
+}
+
+pub fn build_auth_transport_from_builder(builder: ClientBuilder) -> Result<Transport> {
+    build_http_client_from_builder(builder).map(Transport::new)
+}
+
+pub fn build_api_client(
+    api_url: &str,
+    app_url: &str,
+    key: &str,
+    timeout: Duration,
+) -> Result<Client> {
+    Client::builder()
+        .api_key(key)
+        .api_url(api_url)
+        .app_url(app_url)
+        .http_client_builder(configured_http_builder(
+            reqwest::Client::builder().timeout(timeout),
+        ))
+        .build()
+        .context("failed to build Braintrust API client")
+}
+
+fn retry_after_header(headers: &reqwest::header::HeaderMap) -> Option<Duration> {
+    headers
+        .get(reqwest::header::RETRY_AFTER)?
+        .to_str()
+        .ok()?
+        .parse()
+        .ok()
+        .map(Duration::from_secs)
+}
+
+pub fn api_error(error: braintrust_api_client::Error) -> anyhow::Error {
+    match error {
+        braintrust_api_client::Error::Api(error) => {
+            let mut body = error.body;
+            if let Some(cause) = error.parse_error {
+                body.push_str(&format!("\nfailed to read error response body: {cause}"));
+            }
+            HttpError {
+                status: StatusCode::from_u16(error.status).expect("HTTP response status"),
+                body,
+            }
+            .into()
+        }
+        braintrust_api_client::Error::Transport(braintrust_api_client::HttpError::Network(
+            error,
+        )) => error.into(),
+        error => anyhow::anyhow!(error),
+    }
 }
 
 #[derive(Clone)]
@@ -76,27 +137,6 @@ impl std::fmt::Display for HttpError {
 }
 
 impl std::error::Error for HttpError {}
-
-// Keep the status and any received bytes when a server closes an error response early.
-async fn response_error(mut response: reqwest::Response) -> HttpError {
-    let status = response.status();
-    let mut body = Vec::new();
-    loop {
-        match response.chunk().await {
-            Ok(Some(chunk)) => body.extend_from_slice(&chunk),
-            Ok(None) => break,
-            Err(err) => {
-                let detail = format!("\nfailed to read error response body: {err}");
-                body.extend_from_slice(detail.as_bytes());
-                break;
-            }
-        }
-    }
-    HttpError {
-        status,
-        body: String::from_utf8_lossy(&body).into_owned(),
-    }
-}
 
 #[derive(Debug)]
 pub struct ResponseParseError {
@@ -204,12 +244,13 @@ pub struct BtqlResponse<T = serde_json::Map<String, serde_json::Value>> {
 
 impl ApiClient {
     pub fn new(ctx: &LoginContext) -> Result<Self> {
-        let http = build_http_client(DEFAULT_HTTP_TIMEOUT)?;
+        let api_key = ctx.login.api_key().context("login state missing API key")?;
+        let http = build_api_client(&ctx.api_url, &ctx.app_url, &api_key, DEFAULT_HTTP_TIMEOUT)?;
 
         Ok(Self {
             http,
             base_url: ctx.api_url.trim_end_matches('/').to_string(),
-            api_key: ctx.login.api_key().context("login state missing API key")?,
+            api_key,
             org_id: ctx.login.org_id().unwrap_or_default(),
             org_name: ctx.login.org_name().unwrap_or_default(),
             options: HttpOptions::default(),
@@ -259,11 +300,8 @@ impl ApiClient {
         })
     }
 
-    fn prepare(&self, method: Method, path: &str) -> reqwest::RequestBuilder {
-        let mut inner = self
-            .http
-            .request(method.clone(), self.url(path))
-            .bearer_auth(&self.api_key);
+    fn prepare(&self, method: Method, path: &str) -> Request {
+        let mut inner = self.http.api_request(method, path);
         for (name, value) in &self.options.headers {
             inner = inner.header(name, value);
         }
@@ -371,7 +409,7 @@ impl ApiClient {
         &self,
         method: Method,
         path: &str,
-        request: reqwest::RequestBuilder,
+        request: Request,
     ) -> Result<T> {
         let started = Instant::now();
         let mut backoff = ExponentialBackoffBuilder::new()
@@ -386,8 +424,8 @@ impl ApiClient {
         } else {
             1
         };
-        let (client, request) = request.build_split();
-        let request = request.context("failed to build API request")?;
+
+        let request = request.build().context("failed to build API request")?;
         let mut attempt = 0;
         loop {
             attempt += 1;
@@ -396,16 +434,21 @@ impl ApiClient {
                 .context("request body cannot be replayed for retry")?;
             let mut retry_after = None;
             let result = async {
-                let response = client.execute(request).await?;
+                let response = match request.send().await {
+                    Ok(response) => response,
+                    Err(error) => {
+                        if let Some(api) = error.api() {
+                            retry_after = retry_after_header(&api.headers);
+                        }
+                        return Err(api_error(error));
+                    }
+                };
                 retry_after = response
                     .headers()
                     .get(reqwest::header::RETRY_AFTER)
                     .and_then(|value| value.to_str().ok())
                     .and_then(|value| value.parse::<u64>().ok())
                     .map(Duration::from_secs);
-                if !response.status().is_success() {
-                    return Err(response_error(response).await.into());
-                }
                 T::decode(response, method.as_str(), path).await
             }
             .await;
@@ -508,28 +551,11 @@ pub async fn put_signed_url_with_headers(
     body: Vec<u8>,
     headers: &HashMap<String, String>,
 ) -> Result<()> {
-    let client =
-        build_http_client(UPLOAD_HTTP_TIMEOUT).context("failed to build signed-url HTTP client")?;
-
-    let mut request = client.put(url).body(body);
-    let mut has_azure_blob_type = false;
-    for (key, value) in headers {
-        if key.eq_ignore_ascii_case("x-ms-blob-type") {
-            has_azure_blob_type = true;
-        }
-        request = request.header(key.as_str(), value.as_str());
-    }
-    if url.contains(".blob.core.windows.net") && !has_azure_blob_type {
-        request = request.header("x-ms-blob-type", HeaderValue::from_static("BlockBlob"));
-    }
-
-    let response = request
-        .send()
+    let client = build_auth_transport(UPLOAD_HTTP_TIMEOUT)?;
+    client
+        .put_signed_url(url, body, headers)
         .await
-        .context("signed-url upload request failed")?;
-    if !response.status().is_success() {
-        return Err(response_error(response).await.into());
-    }
+        .map_err(api_error)?;
     Ok(())
 }
 
@@ -548,13 +574,14 @@ mod tests {
             socket.flush().unwrap();
             std::thread::sleep(std::time::Duration::from_millis(50));
         });
-        let response = build_http_client(DEFAULT_HTTP_TIMEOUT)
+        let error = build_auth_transport(DEFAULT_HTTP_TIMEOUT)
             .unwrap()
             .get(url)
             .send()
             .await
-            .unwrap();
-        let error = response_error(response).await;
+            .unwrap_err();
+        let error = api_error(error);
+        let error = error.downcast_ref::<HttpError>().unwrap();
         assert_eq!(error.status, StatusCode::BAD_GATEWAY);
         assert!(error.body.contains("upstream unavailable"), "{error}");
         assert!(
@@ -599,7 +626,7 @@ mod tests {
         HttpResponse::Ok().finish()
     }
 
-    async fn captured_user_agent(client: Client) -> Option<String> {
+    async fn captured_user_agent(client: reqwest::Client) -> Option<String> {
         let state = Arc::new(Mutex::new(None));
         let listener = TcpListener::bind(("127.0.0.1", 0)).expect("bind mock server");
         let addr = listener.local_addr().expect("mock server addr");

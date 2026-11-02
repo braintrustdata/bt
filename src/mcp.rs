@@ -9,7 +9,7 @@ use clap::{Arg, ArgAction, ArgMatches, Command, CommandFactory, FromArgMatches};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Map, Value};
 
-use crate::{args::BaseArgs, auth, http::build_http_client, Cli};
+use crate::{args::BaseArgs, auth, http::build_api_client, Cli};
 
 const PROTOCOL_VERSION: &str = "2025-03-26";
 
@@ -184,9 +184,7 @@ struct RpcRequest<'a> {
 }
 
 struct McpClient {
-    http: reqwest::Client,
-    endpoint: String,
-    api_key: String,
+    http: braintrust_api_client::Client,
     session_id: Option<String>,
     protocol_version: Option<String>,
     next_id: u64,
@@ -729,9 +727,12 @@ fn format_tool_result(result: &Value, json_output: bool) -> Result<String> {
 impl McpClient {
     fn new(endpoint: &str, api_key: &str) -> Result<Self> {
         Ok(Self {
-            http: build_http_client(std::time::Duration::from_secs(60))?,
-            endpoint: endpoint.to_owned(),
-            api_key: api_key.to_owned(),
+            http: build_api_client(
+                endpoint,
+                endpoint,
+                api_key,
+                std::time::Duration::from_secs(60),
+            )?,
             session_id: None,
             protocol_version: None,
             next_id: 1,
@@ -821,9 +822,6 @@ impl McpClient {
         let value = json!({ "jsonrpc": "2.0", "method": method, "params": params });
         let request = self.request_builder(value).await?;
         let response = request.send().await.context("MCP notification failed")?;
-        if !response.status().is_success() && response.status() != reqwest::StatusCode::ACCEPTED {
-            bail!("MCP notification failed ({})", response.status());
-        }
         self.capture_session(&response);
         Ok(())
     }
@@ -836,11 +834,6 @@ impl McpClient {
             .await
             .context("MCP request failed")?;
         self.capture_session(&response);
-        if !response.status().is_success() {
-            let status = response.status();
-            let body = response.text().await.unwrap_or_default();
-            bail!("MCP request failed ({status}): {body}");
-        }
         let body = response
             .text()
             .await
@@ -848,11 +841,10 @@ impl McpClient {
         parse_rpc_body(&body)
     }
 
-    async fn request_builder(&self, value: Value) -> Result<reqwest::RequestBuilder> {
+    async fn request_builder(&self, value: Value) -> Result<braintrust_api_client::Request> {
         let mut request = self
             .http
-            .post(&self.endpoint)
-            .bearer_auth(&self.api_key)
+            .api_request(reqwest::Method::POST, "")
             .header(
                 reqwest::header::ACCEPT,
                 "application/json, text/event-stream",
@@ -897,6 +889,72 @@ fn parse_rpc_body(body: &str) -> Result<Value> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn api_client_preserves_mcp_session_pagination_and_sse_responses() {
+        use actix_web::{web, App, HttpRequest, HttpResponse, HttpServer};
+        use std::sync::{
+            atomic::{AtomicUsize, Ordering},
+            Arc,
+        };
+        let calls = Arc::new(AtomicUsize::new(0));
+        let count = calls.clone();
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let endpoint = format!("http://{}/mcp", listener.local_addr().unwrap());
+        let server = HttpServer::new(move || {
+            let count = count.clone();
+            App::new().route("/mcp", web::post().to(move |req: HttpRequest, body: web::Json<Value>| {
+                let count = count.clone();
+                async move {
+                    assert_eq!(req.headers().get("authorization").unwrap(), "Bearer test-key");
+                    assert!(req.headers().get("x-bt-org-name").is_none());
+                    let index = count.fetch_add(1, Ordering::SeqCst);
+                    if index > 0 {
+                        assert_eq!(req.headers().get("Mcp-Session-Id").unwrap(), "test-session");
+                        assert_eq!(req.headers().get("MCP-Protocol-Version").unwrap(), PROTOCOL_VERSION);
+                    }
+                    let result = match body["method"].as_str().unwrap() {
+                        "initialize" => json!({"protocolVersion":PROTOCOL_VERSION}),
+                        "notifications/initialized" => return HttpResponse::Accepted().finish(),
+                        "tools/list" => if body["params"]["cursor"].is_null() {
+                            json!({"tools":[{"name":"test-first"}],"nextCursor":"test-next"})
+                        } else {
+                            assert_eq!(body["params"]["cursor"], "test-next");
+                            json!({"tools":[{"name":"test-second"}]})
+                        },
+                        "tools/call" => {
+                            assert_eq!(body["params"]["arguments"], json!({"query":"test-query"}));
+                            let rpc = json!({"jsonrpc":"2.0","id":body["id"],"result":{"structuredContent":{"ok":true}}});
+                            return HttpResponse::Ok().content_type("text/event-stream")
+                                .body(format!("event: message\ndata: {rpc}\n\n"));
+                        }
+                        other => panic!("unexpected method {other}"),
+                    };
+                    HttpResponse::Ok().insert_header(("Mcp-Session-Id", "test-session"))
+                        .json(json!({"jsonrpc":"2.0","id":body["id"],"result":result}))
+                }
+            }))
+        }).workers(1).listen(listener).unwrap().run();
+        let handle = server.handle();
+        tokio::spawn(server);
+        let mut client = McpClient::new(&endpoint, "test-key").unwrap();
+        client.initialize().await.unwrap();
+        let tools = client.list_tools().await.unwrap();
+        assert_eq!(
+            tools
+                .iter()
+                .map(|tool| tool.name.as_str())
+                .collect::<Vec<_>>(),
+            ["test-first", "test-second"]
+        );
+        let result = client
+            .call_tool("test-first", json!({"query":"test-query"}))
+            .await
+            .unwrap();
+        assert_eq!(result["structuredContent"]["ok"], true);
+        assert_eq!(calls.load(Ordering::SeqCst), 5);
+        handle.stop(false).await;
+    }
 
     #[test]
     fn telemetry_is_optional_without_fabricating_intent() {

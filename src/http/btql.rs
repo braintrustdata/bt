@@ -308,7 +308,13 @@ mod tests {
         let handle = server.handle();
         tokio::spawn(server);
         let client = ApiClient {
-            http: super::super::build_http_client(Duration::from_secs(2)).unwrap(),
+            http: super::super::build_api_client(
+                &base_url,
+                &base_url,
+                "test-key",
+                Duration::from_secs(2),
+            )
+            .unwrap(),
             base_url,
             api_key: "test-key".into(),
             org_id: "test-org-id".into(),
@@ -461,7 +467,13 @@ mod tests {
             }
         });
         let client = ApiClient {
-            http: super::super::build_http_client(Duration::from_secs(2)).unwrap(),
+            http: super::super::build_api_client(
+                &base_url,
+                &base_url,
+                "test-key",
+                Duration::from_secs(2),
+            )
+            .unwrap(),
             base_url,
             api_key: "test-key".into(),
             org_id: "test-org-id".into(),

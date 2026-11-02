@@ -33,7 +33,7 @@ use tokio::sync::oneshot;
 
 use crate::{
     args::{BaseArgs, DEFAULT_API_URL, DEFAULT_APP_URL},
-    http::{build_http_client, build_http_client_from_builder},
+    http::build_auth_transport_from_builder,
     ui,
 };
 
@@ -507,11 +507,6 @@ impl AuthProfile {
 }
 
 #[derive(Debug, Clone, Deserialize)]
-struct ApiKeyLoginResponse {
-    org_info: Vec<LoginOrgInfo>,
-}
-
-#[derive(Debug, Clone, Deserialize)]
 struct LoginOrgInfo {
     id: String,
     name: String,
@@ -857,18 +852,25 @@ async fn warn_ai_provider_key_staleness(ctx: &LoginContext) -> Result<()> {
     record_ai_provider_key_staleness_check(&mut state, &org_id, now);
     let _ = save_ai_provider_warning_state(&state);
 
-    let client = build_http_client(crate::http::DEFAULT_HTTP_TIMEOUT)?;
+    let client = crate::http::build_api_client(
+        &ctx.api_url,
+        &ctx.app_url,
+        &api_key,
+        crate::http::DEFAULT_HTTP_TIMEOUT,
+    )?;
     let response = client
-        .post(&url)
-        .bearer_auth(api_key)
+        .app_request(reqwest::Method::POST, "api/ai_secret/get")
         .json(&json!({ "org_id": org_id }))
         .send()
-        .await
-        .with_context(|| format!("failed to call AI provider secrets endpoint {url}"))?;
-
-    if !response.status().is_success() {
-        return Ok(());
-    }
+        .await;
+    let response = match response {
+        Ok(response) => response,
+        Err(error) if error.is_api_error() => return Ok(()),
+        Err(error) => {
+            return Err(crate::http::api_error(error))
+                .with_context(|| format!("failed to call AI provider secrets endpoint {url}"))
+        }
+    };
 
     let secrets = response
         .json::<Vec<AiProviderSecret>>()
@@ -2633,32 +2635,30 @@ pub(crate) fn format_verification_block(v: &ProfileVerification, selected: bool)
 }
 
 async fn fetch_login_orgs(api_key: &str, app_url: &str) -> Result<Vec<LoginOrgInfo>> {
-    let login_url = format!("{}/api/apikey/login", app_url.trim_end_matches('/'));
-    let client = build_http_client(crate::http::DEFAULT_HTTP_TIMEOUT)
-        .context("failed to initialize HTTP client")?;
-    let response = client
-        .post(&login_url)
-        .bearer_auth(api_key)
-        .header("Content-Type", "application/json")
-        .send()
+    let client = crate::http::build_api_client(
+        app_url,
+        app_url,
+        api_key,
+        crate::http::DEFAULT_HTTP_TIMEOUT,
+    )?;
+    let payload = client
+        .login()
         .await
-        .with_context(|| format!("failed to call login endpoint {login_url}"))?;
-
-    if !response.status().is_success() {
-        let status = response.status();
-        let body = response.text().await.unwrap_or_default();
-        return Err(crate::http::HttpError { status, body }.into());
-    }
-
-    let payload: ApiKeyLoginResponse = response
-        .json()
-        .await
-        .context("failed to parse login response")?;
+        .map_err(crate::http::api_error)
+        .context("failed to call login endpoint")?
+        .into_inner();
     if payload.org_info.is_empty() {
         bail!("no organizations found for this API key");
     }
-
-    Ok(payload.org_info)
+    Ok(payload
+        .org_info
+        .into_iter()
+        .map(|org| LoginOrgInfo {
+            id: org.id,
+            name: org.name,
+            api_url: org.api_url,
+        })
+        .collect())
 }
 
 fn single_org_api_key_constraint<'a>(
@@ -3172,7 +3172,7 @@ async fn exchange_oauth_authorization_code(
     code: &str,
     code_verifier: PkceCodeVerifier,
 ) -> Result<OAuthTokenResponse> {
-    let http_client = build_http_client_from_builder(
+    let http_client = build_auth_transport_from_builder(
         reqwest::Client::builder()
             .timeout(crate::http::DEFAULT_HTTP_TIMEOUT)
             .redirect(reqwest::redirect::Policy::none()),
@@ -3225,7 +3225,7 @@ async fn refresh_oauth_access_token(
     client_id: &str,
     profile_name: &str,
 ) -> Result<OAuthTokenResponse> {
-    let http_client = build_http_client_from_builder(
+    let http_client = build_auth_transport_from_builder(
         reqwest::Client::builder()
             .timeout(crate::http::DEFAULT_HTTP_TIMEOUT)
             .redirect(reqwest::redirect::Policy::none()),
@@ -3239,7 +3239,7 @@ async fn refresh_oauth_access_token(
             ("client_id", client_id),
             ("refresh_token", refresh_token),
         ])
-        .send()
+        .send_unchecked()
         .await
         .with_context(|| format!("failed to call oauth token endpoint {token_url}"))?;
     if !response.status().is_success() {
@@ -3260,7 +3260,7 @@ async fn refresh_oauth_access_token(
 }
 
 async fn request_oauth_token(
-    http_client: &reqwest::Client,
+    http_client: &braintrust_api_client::Transport,
     api_url: &str,
     params: &[(&str, &str)],
 ) -> Result<OAuthTokenResponse> {
@@ -3268,7 +3268,7 @@ async fn request_oauth_token(
     let response = http_client
         .post(&token_url)
         .form(params)
-        .send()
+        .send_unchecked()
         .await
         .with_context(|| format!("failed to call oauth token endpoint {token_url}"))?;
     if !response.status().is_success() {

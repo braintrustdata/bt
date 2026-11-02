@@ -1288,7 +1288,7 @@ async fn setup_wizard_response_json<T: serde::de::DeserializeOwned>(
 }
 
 async fn create_setup_wizard_session(
-    http: &reqwest::Client,
+    http: &braintrust_api_client::Transport,
     app_url: &reqwest::Url,
 ) -> Result<SetupWizardSession> {
     let url = app_url
@@ -1296,7 +1296,7 @@ async fn create_setup_wizard_session(
         .context("failed to build setup browser session URL")?;
     let response = http
         .post(url.clone())
-        .send()
+        .send_unchecked()
         .await
         .with_context(|| format!("failed to create setup browser session at {url}"))?;
 
@@ -1304,7 +1304,7 @@ async fn create_setup_wizard_session(
 }
 
 async fn poll_setup_wizard_completion_with_interval(
-    http: &reqwest::Client,
+    http: &braintrust_api_client::Transport,
     app_url: &reqwest::Url,
     session_token: &str,
     poll_token: &str,
@@ -1320,7 +1320,11 @@ async fn poll_setup_wizard_completion_with_interval(
         url.query_pairs_mut()
             .append_pair("session_token", session_token);
 
-        let response = http.get(url.clone()).bearer_auth(poll_token).send().await;
+        let response = http
+            .get(url.clone())
+            .bearer_auth(poll_token)
+            .send_unchecked()
+            .await;
         let response = match response {
             Ok(response) => response,
             Err(err) => {
@@ -1413,7 +1417,7 @@ async fn poll_setup_wizard_completion_with_interval(
 }
 
 async fn poll_setup_wizard_completion(
-    http: &reqwest::Client,
+    http: &braintrust_api_client::Transport,
     app_url: &reqwest::Url,
     session_token: &str,
     poll_token: &str,
@@ -1436,7 +1440,7 @@ async fn run_setup_browser_auth(
     _requested_org: Option<&str>,
 ) -> Result<SetupAuthLogin> {
     let app_url = setup_wizard_app_url(base)?;
-    let http = crate::http::build_http_client(crate::http::DEFAULT_HTTP_TIMEOUT)?;
+    let http = crate::http::build_auth_transport(crate::http::DEFAULT_HTTP_TIMEOUT)?;
     let session = create_setup_wizard_session(&http, &app_url).await?;
     let login_url = setup_wizard_login_url(&app_url, &session.login_path)?;
     let explicitly_quiet = base.quiet && base.quiet_source.is_some();
@@ -5546,8 +5550,8 @@ mod tests {
         let handle = server.handle();
         tokio::spawn(server);
 
-        let http =
-            crate::http::build_http_client(crate::http::DEFAULT_HTTP_TIMEOUT).expect("http client");
+        let http = crate::http::build_auth_transport(crate::http::DEFAULT_HTTP_TIMEOUT)
+            .expect("http client");
         let session = create_setup_wizard_session(&http, &app_url)
             .await
             .expect("create session");

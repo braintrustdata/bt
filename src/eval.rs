@@ -1216,15 +1216,6 @@ fn collect_allowed_dev_origins(explicit: &[String], app_url: &str) -> Vec<String
     deduped.into_iter().collect()
 }
 
-fn join_app_url(app_url: &str, path: &str) -> Result<String> {
-    let base = format!("{}/", app_url.trim_end_matches('/'));
-    let base_url = reqwest::Url::parse(&base).context("invalid app URL")?;
-    let joined = base_url
-        .join(path.trim_start_matches('/'))
-        .context("failed to join app URL path")?;
-    Ok(joined.to_string())
-}
-
 fn json_error_response(status: actix_web::http::StatusCode, message: &str) -> HttpResponse {
     HttpResponse::build(status).json(json!({ "error": message }))
 }
@@ -1295,63 +1286,30 @@ async fn authenticate_dev_request(
         }
     }
 
-    let login_url = match join_app_url(&state.app_url, "api/apikey/login") {
-        Ok(url) => url,
-        Err(err) => {
-            return Err(json_error_response(
-                actix_web::http::StatusCode::INTERNAL_SERVER_ERROR,
-                &format!("{err:#}"),
-            ));
-        }
-    };
-    let response = state
-        .http_client
-        .post(login_url)
-        .bearer_auth(&token)
-        // The Next.js login endpoint only falls back to the Authorization
-        // header when the request body was parsed as an object.
-        .header("Content-Type", "application/json")
-        .send()
-        .await
+    let client = braintrust_api_client::Client::builder()
+        .api_key(&token)
+        .api_url(&state.app_url)
+        .app_url(&state.app_url)
+        .http_client(state.http_client.clone())
+        .build()
         .map_err(|_| {
             json_error_response(actix_web::http::StatusCode::UNAUTHORIZED, "Unauthorized")
         })?;
-    if !response.status().is_success() {
-        return Err(json_error_response(
-            actix_web::http::StatusCode::UNAUTHORIZED,
-            "Unauthorized",
-        ));
-    }
-
-    let payload = response.json::<Value>().await.unwrap_or(Value::Null);
-    if let Some(orgs) = payload.get("org_info").and_then(|value| value.as_array()) {
-        let matched_org = orgs.iter().find(|org| {
-            org.get("name")
-                .and_then(|name| name.as_str())
-                .map(|name| name == org_name)
-                .unwrap_or(false)
-        });
-        let Some(matched_org) = matched_org else {
-            return Err(json_error_response(
-                actix_web::http::StatusCode::UNAUTHORIZED,
-                "Unauthorized",
-            ));
-        };
-        let api_url = matched_org
-            .get("api_url")
-            .and_then(|value| value.as_str())
-            .map(str::to_string);
-        Ok(DevAuthContext {
-            token,
-            org_name,
-            api_url,
-        })
-    } else {
-        Err(json_error_response(
-            actix_web::http::StatusCode::UNAUTHORIZED,
-            "Unauthorized",
-        ))
-    }
+    let payload = client.login().await.map_err(|_| {
+        json_error_response(actix_web::http::StatusCode::UNAUTHORIZED, "Unauthorized")
+    })?;
+    let matched_org = payload
+        .org_info
+        .iter()
+        .find(|org| org.name == org_name)
+        .ok_or_else(|| {
+            json_error_response(actix_web::http::StatusCode::UNAUTHORIZED, "Unauthorized")
+        })?;
+    Ok(DevAuthContext {
+        token,
+        org_name,
+        api_url: matched_org.api_url.clone(),
+    })
 }
 
 async fn resolve_dataset_ref_for_eval_request(
@@ -1391,19 +1349,17 @@ async fn resolve_dataset_ref_for_eval_request(
         ));
     }
 
-    let lookup_url = match join_app_url(&state.app_url, "api/dataset/get") {
-        Ok(url) => url,
-        Err(err) => {
-            return Err(json_error_response(
-                actix_web::http::StatusCode::INTERNAL_SERVER_ERROR,
-                &format!("{err:#}"),
-            ));
-        }
-    };
-    let response = state
-        .http_client
-        .post(lookup_url)
-        .bearer_auth(&auth.token)
+    let client = braintrust_api_client::Client::builder()
+        .api_key(&auth.token)
+        .api_url(&state.app_url)
+        .app_url(&state.app_url)
+        .http_client(state.http_client.clone())
+        .build()
+        .map_err(|err| {
+            json_error_response(actix_web::http::StatusCode::BAD_REQUEST, &err.to_string())
+        })?;
+    let response = client
+        .app_request(reqwest::Method::POST, "api/dataset/get")
         .header(HEADER_BT_ORG_NAME, auth.org_name.clone())
         .json(&json!({ "id": dataset_id }))
         .send()
@@ -1414,15 +1370,6 @@ async fn resolve_dataset_ref_for_eval_request(
                 &format!("Failed to load dataset '{dataset_id}': {err}"),
             )
         })?;
-    if !response.status().is_success() {
-        return Err(json_error_response(
-            actix_web::http::StatusCode::BAD_REQUEST,
-            &format!(
-                "Failed to load dataset '{dataset_id}' (status {}).",
-                response.status()
-            ),
-        ));
-    }
 
     let datasets = response
         .json::<Vec<DatasetLookupRow>>()
@@ -4242,13 +4189,6 @@ mod tests {
             })
             .to_string(),
         }
-    }
-
-    #[test]
-    fn join_app_url_normalizes_slashes() {
-        let joined =
-            join_app_url("https://www.braintrust.dev/", "/api/dataset/get").expect("join app url");
-        assert_eq!(joined, "https://www.braintrust.dev/api/dataset/get");
     }
 
     #[test]
