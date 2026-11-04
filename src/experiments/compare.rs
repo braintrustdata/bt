@@ -45,8 +45,8 @@ struct MetricComparisonRow {
     role: String,
     value: Option<f64>,
     delta_vs_base: Option<f64>,
-    improvements: usize,
-    regressions: usize,
+    improvements: i64,
+    regressions: i64,
 }
 
 #[derive(Debug)]
@@ -85,7 +85,11 @@ pub(super) async fn run(
 
     let base_summary = with_spinner(
         "Loading base experiment summary...",
-        api::summarize_experiment(&ctx.client, &base_experiment.id, Some(&base_experiment.id)),
+        api::summarize_experiment(
+            &ctx.client,
+            &base_experiment.id.to_string(),
+            Some(&base_experiment.id.to_string()),
+        ),
     )
     .await?;
 
@@ -94,7 +98,11 @@ pub(super) async fn run(
         let message = format!("Loading summary for {}...", experiment.name);
         let summary = with_spinner(
             &message,
-            api::summarize_experiment(&ctx.client, &experiment.id, Some(&base_experiment.id)),
+            api::summarize_experiment(
+                &ctx.client,
+                &experiment.id.to_string(),
+                Some(&base_experiment.id.to_string()),
+            ),
         )
         .await?;
         comparison_summaries.push(summary);
@@ -206,21 +214,21 @@ fn build_report(
         .iter()
         .zip(comparison_summaries)
         .map(|(experiment, summary)| ExperimentSummaryRef {
-            id: experiment.id.clone(),
+            id: experiment.id.to_string(),
             name: experiment.name.clone(),
-            url: summary.experiment_url.clone(),
+            url: summary.experiment_url.to_string(),
         })
         .collect::<Vec<_>>();
 
     ExperimentComparisonReport {
         project: ExperimentProjectRef {
-            id: ctx.project.id.clone(),
+            id: ctx.project.id.to_string(),
             name: ctx.project.name.clone(),
         },
         base: ExperimentSummaryRef {
-            id: base_experiment.id.clone(),
+            id: base_experiment.id.to_string(),
             name: base_experiment.name.clone(),
-            url: base_summary.experiment_url.clone(),
+            url: base_summary.experiment_url.to_string(),
         },
         comparisons,
         rows: build_rows(
@@ -376,7 +384,9 @@ fn map_scores(summary: &api::ExperimentSummary) -> BTreeMap<String, api::ScoreSu
     summary
         .scores
         .clone()
+        .flatten()
         .unwrap_or_default()
+        .additional_properties
         .into_iter()
         .collect()
 }
@@ -385,7 +395,9 @@ fn map_metrics(summary: &api::ExperimentSummary) -> BTreeMap<String, api::Metric
     summary
         .metrics
         .clone()
+        .flatten()
         .unwrap_or_default()
+        .additional_properties
         .into_iter()
         .collect()
 }
@@ -420,7 +432,11 @@ fn print_report_text(report: &ExperimentComparisonReport, show_all_rows: bool) -
     let columns = report_summary_columns(report);
     let rows = report_summary_rows(report);
     let mut parts = vec![
-        format!("project: {} ({})", report.project.id, report.project.name),
+        format!(
+            "project: {} ({})",
+            report.project.id.to_string(),
+            report.project.name
+        ),
         comparison_summary_line(report),
     ];
     if !rows.is_empty() {
@@ -510,21 +526,20 @@ fn report_summary_cell(row: &MetricComparisonRow) -> SummaryMetricCell {
     SummaryMetricCell {
         value: row.value,
         delta: row.delta_vs_base,
-        improvements: row.improvements as i64,
-        regressions: row.regressions as i64,
+        improvements: row.improvements,
+        regressions: row.regressions,
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::collections::HashMap;
 
     fn test_experiment(name: &str) -> api::Experiment {
         api::Experiment {
-            id: format!("{name}-id"),
+            id: uuid::Uuid::new_v4(),
             name: name.to_string(),
-            project_id: "test-project-id".to_string(),
+            project_id: uuid::Uuid::nil(),
             public: false,
             description: None,
             created: None,
@@ -535,6 +550,11 @@ mod tests {
             user_id: None,
             tags: None,
             metadata: None,
+            deleted_at: None,
+            internal_metadata: None,
+            parameters_id: None,
+            repo_info: None,
+            parameters_version: None,
         }
     }
 
@@ -598,81 +618,110 @@ mod tests {
         let base = api::ExperimentSummary {
             project_name: "test-project".to_string(),
             experiment_name: "baseline".to_string(),
-            project_url: "https://www.example.test/app/test-org/p/test-project".to_string(),
+            project_url: "https://www.example.test/app/test-org/p/test-project"
+                .parse()
+                .unwrap(),
             experiment_url:
                 "https://www.example.test/app/test-org/p/test-project/experiments/baseline"
-                    .to_string(),
-            comparison_experiment_name: Some("baseline".to_string()),
-            scores: Some(HashMap::from([(
-                "score_a".to_string(),
-                api::ScoreSummary {
-                    name: "score_a".to_string(),
-                    score: 0.5,
-                    diff: Some(0.0),
-                    improvements: 0,
-                    regressions: 0,
+                    .parse()
+                    .unwrap(),
+            comparison_experiment_name: Some(Some("baseline".to_string())),
+            scores: Some(Some(
+                braintrust_api_client::types::SummarizeExperimentResponseScores {
+                    additional_properties: BTreeMap::from([(
+                        "score_a".to_string(),
+                        api::ScoreSummary {
+                            name: "score_a".to_string(),
+                            score: 0.5,
+                            diff: Some(0.0),
+                            improvements: 0,
+                            regressions: 0,
+                        },
+                    )]),
                 },
-            )])),
-            metrics: Some(HashMap::from([(
-                "duration".to_string(),
-                api::MetricSummary {
-                    name: "duration".to_string(),
-                    metric: 2.0,
-                    unit: "s".to_string(),
-                    diff: Some(0.0),
-                    improvements: 0,
-                    regressions: 0,
+            )),
+            metrics: Some(Some(
+                braintrust_api_client::types::SummarizeExperimentResponseMetrics {
+                    additional_properties: BTreeMap::from([(
+                        "duration".to_string(),
+                        api::MetricSummary {
+                            name: "duration".to_string(),
+                            metric: 2.0,
+                            unit: "s".to_string(),
+                            diff: Some(0.0),
+                            improvements: 0,
+                            regressions: 0,
+                        },
+                    )]),
                 },
-            )])),
+            )),
         };
         let challenger_a = api::ExperimentSummary {
             project_name: "test-project".to_string(),
             experiment_name: "challenger-a".to_string(),
-            project_url: "https://www.example.test/app/test-org/p/test-project".to_string(),
+            project_url: "https://www.example.test/app/test-org/p/test-project"
+                .parse()
+                .unwrap(),
             experiment_url:
                 "https://www.example.test/app/test-org/p/test-project/experiments/challenger-a"
-                    .to_string(),
-            comparison_experiment_name: Some("baseline".to_string()),
-            scores: Some(HashMap::from([(
-                "score_a".to_string(),
-                api::ScoreSummary {
-                    name: "score_a".to_string(),
-                    score: 0.75,
-                    diff: Some(0.25),
-                    improvements: 1,
-                    regressions: 0,
+                    .parse()
+                    .unwrap(),
+            comparison_experiment_name: Some(Some("baseline".to_string())),
+            scores: Some(Some(
+                braintrust_api_client::types::SummarizeExperimentResponseScores {
+                    additional_properties: BTreeMap::from([(
+                        "score_a".to_string(),
+                        api::ScoreSummary {
+                            name: "score_a".to_string(),
+                            score: 0.75,
+                            diff: Some(0.25),
+                            improvements: 1,
+                            regressions: 0,
+                        },
+                    )]),
                 },
-            )])),
-            metrics: Some(HashMap::from([(
-                "duration".to_string(),
-                api::MetricSummary {
-                    name: "duration".to_string(),
-                    metric: 3.0,
-                    unit: "s".to_string(),
-                    diff: Some(1.0),
-                    improvements: 0,
-                    regressions: 1,
+            )),
+            metrics: Some(Some(
+                braintrust_api_client::types::SummarizeExperimentResponseMetrics {
+                    additional_properties: BTreeMap::from([(
+                        "duration".to_string(),
+                        api::MetricSummary {
+                            name: "duration".to_string(),
+                            metric: 3.0,
+                            unit: "s".to_string(),
+                            diff: Some(1.0),
+                            improvements: 0,
+                            regressions: 1,
+                        },
+                    )]),
                 },
-            )])),
+            )),
         };
         let challenger_b = api::ExperimentSummary {
             project_name: "test-project".to_string(),
             experiment_name: "challenger-b".to_string(),
-            project_url: "https://www.example.test/app/test-org/p/test-project".to_string(),
+            project_url: "https://www.example.test/app/test-org/p/test-project"
+                .parse()
+                .unwrap(),
             experiment_url:
                 "https://www.example.test/app/test-org/p/test-project/experiments/challenger-b"
-                    .to_string(),
-            comparison_experiment_name: Some("baseline".to_string()),
-            scores: Some(HashMap::from([(
-                "score_b".to_string(),
-                api::ScoreSummary {
-                    name: "score_b".to_string(),
-                    score: 0.8,
-                    diff: Some(0.8),
-                    improvements: 2,
-                    regressions: 0,
+                    .parse()
+                    .unwrap(),
+            comparison_experiment_name: Some(Some("baseline".to_string())),
+            scores: Some(Some(
+                braintrust_api_client::types::SummarizeExperimentResponseScores {
+                    additional_properties: BTreeMap::from([(
+                        "score_b".to_string(),
+                        api::ScoreSummary {
+                            name: "score_b".to_string(),
+                            score: 0.8,
+                            diff: Some(0.8),
+                            improvements: 2,
+                            regressions: 0,
+                        },
+                    )]),
                 },
-            )])),
+            )),
             metrics: None,
         };
 

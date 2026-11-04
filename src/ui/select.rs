@@ -392,10 +392,14 @@ mod tests {
 
     fn project(name: &str) -> Project {
         Project {
-            id: format!("id-{name}"),
+            id: uuid::Uuid::nil(),
             name: name.to_string(),
-            org_id: "org".to_string(),
+            org_id: uuid::Uuid::nil(),
             description: None,
+            created: None,
+            deleted_at: None,
+            settings: None,
+            user_id: None,
         }
     }
 

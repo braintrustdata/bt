@@ -57,13 +57,15 @@ pub(crate) async fn resolve_definition_project(
     project_name: Option<&str>,
 ) -> Result<Option<Project>> {
     if let Some(project_id) = project_id.map(str::trim).filter(|value| !value.is_empty()) {
-        if let Some(project) = default_project.filter(|project| project.id == project_id) {
+        if let Some(project) =
+            default_project.filter(|project| project.id.to_string() == project_id)
+        {
             return Ok(Some(project.clone()));
         }
         let projects = list_projects(client).await?;
         return projects
             .into_iter()
-            .find(|project| project.id == project_id)
+            .find(|project| project.id.to_string() == project_id)
             .map(Some)
             .ok_or_else(|| anyhow!("project id '{project_id}' not found"));
     }

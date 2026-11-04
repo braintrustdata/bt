@@ -480,6 +480,7 @@ async fn preview(base: BaseArgs, args: PreviewArgs) -> Result<()> {
         &target.object_id,
         &target.root_span_id,
     );
+    let request = braintrust_api_client::backend::resource_definition(&request)?;
     let output = with_spinner(
         "Running preprocessor...",
         functions_api::invoke_function(&client, &request),
@@ -732,7 +733,7 @@ async fn prepare_preprocessors(
                     entry.slug
                 )
             })?;
-            if !seen.insert((project.id.clone(), entry.slug.clone())) {
+            if !seen.insert((project.id.to_string(), entry.slug.clone())) {
                 bail!(
                     "duplicate preprocessor slug '{}' in project '{}'",
                     entry.slug,
@@ -752,7 +753,7 @@ async fn prepare_preprocessors(
 
 fn build_insert_event(preprocessor: &PreparedPreprocessor, if_exists: IfExistsMode) -> Value {
     json!({
-        "project_id": preprocessor.project.id,
+        "project_id": preprocessor.project.id.to_string(),
         "name": preprocessor.entry.name,
         "slug": preprocessor.entry.slug,
         "function_type": "preprocessor",
@@ -818,7 +819,7 @@ fn resolve_pushed_preprocessors(
         let result = results
             .iter()
             .find(|result| {
-                result.project_id == preprocessor.project.id
+                result.project_id == preprocessor.project.id.to_string()
                     && result.slug == preprocessor.entry.slug
             })
             .with_context(|| {
@@ -834,7 +835,7 @@ fn resolve_pushed_preprocessors(
             source_file: preprocessor.source_file.clone(),
             name: preprocessor.entry.name.clone(),
             slug: preprocessor.entry.slug.clone(),
-            project_id: preprocessor.project.id.clone(),
+            project_id: preprocessor.project.id.to_string(),
             project_name: preprocessor.project.name.clone(),
             function_id: result.id.clone(),
         });
@@ -850,10 +851,14 @@ mod tests {
 
     fn test_project() -> Project {
         Project {
-            id: "proj_test".to_string(),
+            id: "854ac738-d77f-5aca-88ae-113a8552665a".parse().unwrap(),
             name: "test-project".to_string(),
-            org_id: "org_test".to_string(),
+            org_id: "a62dfe69-c4f4-5cce-8915-66ba56903b53".parse().unwrap(),
             description: None,
+            created: None,
+            deleted_at: None,
+            settings: None,
+            user_id: None,
         }
     }
 
@@ -907,7 +912,7 @@ import { customPreprocessor } from "braintrust/preprocessors";
 
 console.log("test discovery log");
 export default customPreprocessor(
-  { name: "Test Preprocessor", slug: "test-preprocessor", project: { id: "proj_test" } },
+  { name: "Test Preprocessor", slug: "test-preprocessor", project: { id: "854ac738-d77f-5aca-88ae-113a8552665a" } },
   ({ output }) => [{ role: assistantRole, content: output }],
 );
 "#,
@@ -932,7 +937,10 @@ export default customPreprocessor(
         assert_eq!(entry.name, "Test Preprocessor");
         assert_eq!(entry.slug, "test-preprocessor");
         assert_eq!(entry.export_names, ["default"]);
-        assert_eq!(entry.project_id.as_deref(), Some("proj_test"));
+        assert_eq!(
+            entry.project_id.as_deref(),
+            Some("854ac738-d77f-5aca-88ae-113a8552665a")
+        );
         assert!(entry.code.contains("function handler(span)"));
         assert!(!entry.code.contains(": string"));
 
@@ -1120,7 +1128,7 @@ export default preprocessor;
         let preprocessor = test_preprocessor("test-preprocessor");
 
         let event = build_insert_event(&preprocessor, IfExistsMode::Replace);
-        assert_eq!(event["project_id"], "proj_test");
+        assert_eq!(event["project_id"], "854ac738-d77f-5aca-88ae-113a8552665a");
         assert_eq!(event["function_type"], "preprocessor");
         assert_eq!(event["if_exists"], "replace");
         assert_eq!(event["function_data"]["type"], "code");
@@ -1143,8 +1151,12 @@ export default preprocessor;
             runtime_version: "latest".to_string(),
         };
 
-        let request =
-            build_preview_invoke_request(&preprocessor, "project_logs", "proj_test", "root-span");
+        let request = build_preview_invoke_request(
+            &preprocessor,
+            "project_logs",
+            "854ac738-d77f-5aca-88ae-113a8552665a",
+            "root-span",
+        );
         assert_eq!(
             request["inline_context"],
             json!({ "runtime": "quickjs", "version": "latest" })
@@ -1154,7 +1166,7 @@ export default preprocessor;
             request["input"]["trace_ref"],
             json!({
                 "object_type": "project_logs",
-                "object_id": "proj_test",
+                "object_id": "854ac738-d77f-5aca-88ae-113a8552665a",
                 "root_span_id": "root-span",
             })
         );
@@ -1244,13 +1256,13 @@ export default preprocessor;
         let results = [
             functions_api::InsertedFunctionResult {
                 id: "fn_test_new".to_string(),
-                project_id: "proj_test".to_string(),
+                project_id: "854ac738-d77f-5aca-88ae-113a8552665a".to_string(),
                 slug: "new-preprocessor".to_string(),
                 found_existing: false,
             },
             functions_api::InsertedFunctionResult {
                 id: "fn_test_existing".to_string(),
-                project_id: "proj_test".to_string(),
+                project_id: "854ac738-d77f-5aca-88ae-113a8552665a".to_string(),
                 slug: "existing-preprocessor".to_string(),
                 found_existing: true,
             },

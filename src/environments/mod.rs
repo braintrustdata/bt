@@ -152,8 +152,18 @@ async fn list(client: &ApiClient, json: bool) -> Result<()> {
     ]);
     apply_column_padding(&mut table, (0, 6));
     for environment in environments {
-        let description = display(environment.description.as_deref(), 60);
-        let created = display(environment.created.as_deref(), 10);
+        let description = display(
+            environment
+                .description
+                .as_ref()
+                .and_then(|value| value.as_deref()),
+            60,
+        );
+        let created_value = environment
+            .created
+            .flatten()
+            .map(|value| value.to_rfc3339());
+        let created = display(created_value.as_deref(), 10);
         table.add_row([environment.name, environment.slug, description, created]);
     }
     write!(output, "{table}")?;
@@ -169,11 +179,22 @@ async fn view(client: &ApiClient, slug: Option<&str>, json: bool) -> Result<()> 
 
     let mut output = String::new();
     writeln!(output, "{}", console::style(&environment.name).bold())?;
+    let created = environment
+        .created
+        .flatten()
+        .map(|value| value.to_rfc3339());
+    let id = environment.id.to_string();
     for (label, value) in [
         ("Slug:", Some(environment.slug.as_str())),
-        ("Description:", environment.description.as_deref()),
-        ("Created:", environment.created.as_deref()),
-        ("ID:", Some(environment.id.as_str())),
+        (
+            "Description:",
+            environment
+                .description
+                .as_ref()
+                .and_then(|value| value.as_deref()),
+        ),
+        ("Created:", created.as_deref()),
+        ("ID:", Some(id.as_str())),
     ] {
         writeln!(
             output,
@@ -194,10 +215,10 @@ async fn create(client: &ApiClient, args: CreateArgs, json: bool) -> Result<()> 
     )?;
     let slug = create_slug(args.slug.as_deref(), &name)?;
     let body = api::CreateEnvironment {
-        name: &name,
-        slug: &slug,
-        description: args.description.as_deref(),
-        org_name: client.org_name(),
+        name: name.clone(),
+        slug: slug.clone(),
+        description: args.description.clone().map(Some),
+        org_name: Some(Some(client.org_name().to_owned())),
     };
     let environment = with_spinner("Creating environment...", api::create(client, &body)).await?;
     output_result(&environment, json, "Created")
@@ -213,17 +234,17 @@ async fn update(client: &ApiClient, args: UpdateArgs, json: bool) -> Result<()> 
     }
     let environment = resolve(client, args.selector.value(), "update").await?;
     let body = api::UpdateEnvironment {
-        name: args.name.as_deref(),
-        slug: args.new_slug.as_deref(),
+        name: args.name.clone().map(Some),
+        slug: args.new_slug.clone().map(Some),
         description: if args.clear_description {
             Some(None)
         } else {
-            args.description.as_deref().map(Some)
+            args.description.clone().map(Some)
         },
     };
     let environment = with_spinner(
         "Updating environment...",
-        api::update(client, &environment.id, &body),
+        api::update(client, &environment.id.to_string(), &body),
     )
     .await?;
     output_result(&environment, json, "Updated")
@@ -251,7 +272,7 @@ async fn delete(client: &ApiClient, args: DeleteArgs, json: bool) -> Result<()> 
     }
     let environment = with_spinner(
         "Deleting environment...",
-        api::delete(client, &environment.id),
+        api::delete(client, &environment.id.to_string()),
     )
     .await?;
     output_result(&environment, json, "Deleted")?;

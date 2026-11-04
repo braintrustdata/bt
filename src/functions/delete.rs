@@ -19,7 +19,7 @@ pub async fn run(
         );
     }
 
-    let project_id = &ctx.project.id;
+    let project_id = &ctx.project.id.to_string();
 
     let function = match slug {
         Some(s) => api::get_function_by_slug(&ctx.client, project_id, s, None, None)
@@ -33,7 +33,12 @@ pub async fn run(
                     label_plural(ft),
                 );
             }
-            select_function_interactive(&ctx.client, project_id, ft).await?
+            {
+                let selected = select_function_interactive(&ctx.client, project_id, ft).await?;
+                api::get_function_by_slug(&ctx.client, project_id, &selected.slug, None, None)
+                    .await?
+                    .ok_or_else(|| anyhow!("function not found"))?
+            }
         }
     };
 
@@ -54,7 +59,7 @@ pub async fn run(
 
     match with_spinner(
         &format!("Deleting {}...", label(ft)),
-        api::delete_function(&ctx.client, &function.id),
+        api::delete_function(&ctx.client, &function.id.to_string()),
     )
     .await
     {

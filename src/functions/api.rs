@@ -1,14 +1,13 @@
-use crate::http::HttpOptions;
+use crate::http::OperationOptions;
 use std::collections::HashSet;
 
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use urlencoding::encode;
 
 use crate::{
     error::user_error,
-    http::{ApiClient, BtqlResponse, HttpError},
+    http::{ApiClient, BtqlResponse},
 };
 
 fn escape_sql(s: &str) -> String {
@@ -16,7 +15,7 @@ fn escape_sql(s: &str) -> String {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct Function {
+pub struct FunctionRow {
     pub id: String,
     pub name: String,
     pub slug: String,
@@ -41,113 +40,16 @@ pub struct Function {
     pub _xact_id: Option<String>,
 }
 
-#[derive(Debug, Clone, Default)]
-pub struct FunctionListQuery {
-    pub project_id: Option<String>,
-    pub project_name: Option<String>,
-    pub slug: Option<String>,
-    pub id: Option<String>,
-    pub version: Option<String>,
-    pub environment: Option<String>,
-    pub cursor: Option<String>,
-    pub snapshot: Option<String>,
-}
+pub use braintrust_api_client::backend::extensions::{
+    CodeUploadSlot, FunctionListQuery, FunctionPage as FunctionListPage,
+};
+pub use braintrust_api_client::types::Function;
 
-#[derive(Debug, Clone)]
-pub struct FunctionListPage {
-    pub objects: Vec<Value>,
-    pub next_cursor: Option<String>,
-    pub snapshot: Option<String>,
-}
+pub use braintrust_api_client::backend::extensions::InsertedFunction as InsertedFunctionResult;
 
-#[derive(Debug, Clone, Deserialize)]
-pub struct CodeUploadSlot {
-    pub url: String,
-    #[serde(rename = "bundleId")]
-    pub bundle_id: String,
-}
-
-#[derive(Debug, Clone, Deserialize)]
-pub struct InsertedFunctionResult {
-    pub id: String,
-    pub project_id: String,
-    pub slug: String,
-    pub found_existing: bool,
-}
-
-#[derive(Debug, Clone, Deserialize)]
-pub struct FunctionValidationSuggestion {
-    pub action: String,
-    #[serde(default)]
-    pub value: Option<Value>,
-}
-
-#[derive(Debug, Clone, Deserialize)]
-pub struct FunctionValidationIssue {
-    pub code: String,
-    pub path: Vec<Value>,
-    pub message: String,
-    pub blocking: bool,
-    #[serde(default)]
-    pub suggestion: Option<FunctionValidationSuggestion>,
-}
-
-impl std::fmt::Display for FunctionValidationIssue {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        if self.path.is_empty() {
-            f.write_str(&self.code)?;
-        } else {
-            for (index, part) in self.path.iter().enumerate() {
-                if index > 0 {
-                    f.write_str(".")?;
-                }
-                match part.as_str() {
-                    Some(part) => f.write_str(part)?,
-                    None => write!(f, "{part}")?,
-                }
-            }
-        }
-        write!(f, ": {}", self.message)?;
-        if let Some(suggestion) = &self.suggestion {
-            match (suggestion.action.as_str(), &suggestion.value) {
-                ("remove", _) => f.write_str("; suggestion: remove this parameter")?,
-                ("set", Some(value)) => write!(f, "; suggestion: set it to {value}")?,
-                _ => {}
-            }
-        }
-        Ok(())
-    }
-}
-
-#[derive(Debug, Clone, Deserialize)]
-pub struct FunctionValidationResult {
-    pub issues: Vec<FunctionValidationIssue>,
-}
-
-#[derive(Debug, Clone, Deserialize)]
-pub struct FunctionValidationReport {
-    pub valid: bool,
-    pub results: Vec<FunctionValidationResult>,
-}
-
-#[derive(Debug)]
-pub struct FunctionValidationError {
-    pub report: FunctionValidationReport,
-}
-
-impl std::fmt::Display for FunctionValidationError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str("the backend rejected the function definition")?;
-        for result in &self.report.results {
-            for issue in &result.issues {
-                write!(f, "; {issue}")?;
-            }
-        }
-        Ok(())
-    }
-}
-
-impl std::error::Error for FunctionValidationError {}
+pub use braintrust_api_client::backend::extensions::{
+    FunctionValidationError, FunctionValidationReport,
+};
 
 #[derive(Debug, Clone)]
 pub struct InsertFunctionsResult {
@@ -156,21 +58,13 @@ pub struct InsertFunctionsResult {
     pub functions: Vec<InsertedFunctionResult>,
 }
 
-#[derive(Debug, Deserialize)]
-struct InsertFunctionsResponse {
-    #[serde(default)]
-    xact_id: Option<String>,
-    #[serde(default)]
-    functions: Vec<InsertedFunctionResult>,
-}
-
 pub async fn list_functions(
     client: &ApiClient,
     project_id: &str,
     function_type: Option<&str>,
-) -> Result<Vec<Function>> {
+) -> Result<Vec<FunctionRow>> {
     let query = list_functions_query(project_id, function_type);
-    let response: BtqlResponse<Function> = client.btql(&query).await?;
+    let response: BtqlResponse<FunctionRow> = client.btql(&query).await?;
 
     Ok(response.data)
 }
@@ -213,9 +107,7 @@ pub async fn get_function_by_slug(
         return Ok(None);
     };
 
-    serde_json::from_value(raw)
-        .map(Some)
-        .context("unexpected function response shape")
+    Ok(Some(raw))
 }
 
 pub async fn get_function_by_id(
@@ -235,115 +127,49 @@ pub async fn get_function_by_id(
         return Ok(None);
     };
 
-    serde_json::from_value(raw)
-        .map(Some)
-        .context("unexpected function response shape")
+    Ok(Some(raw))
 }
 
 pub async fn invoke_function(
     client: &ApiClient,
-    body: &serde_json::Value,
+    body: &braintrust_api_client::backend::extensions::Invocation,
 ) -> Result<serde_json::Value> {
-    let client = if client.org_name().is_empty() {
-        client.clone()
-    } else {
-        client.header("x-bt-org-name", client.org_name())
-    };
     let result = client
-        .with_options(HttpOptions {
+        .with_options(OperationOptions {
             timeout: Some(std::time::Duration::from_secs(300)),
             ..Default::default()
         })
-        .post("/function/invoke", body)
+        .invoke(body)
         .await;
-
     match result {
-        Ok(value) => Ok(value),
         Err(error)
-            if error
-                .downcast_ref::<HttpError>()
-                .is_some_and(is_provider_auth_response) =>
+            if braintrust_api_client::backend::is_provider_authentication_failure(&error) =>
         {
             Err(user_error(error))
         }
-        Err(error) => Err(error),
+        result => result,
     }
 }
 
+#[cfg(test)]
+use crate::http::HttpError;
+#[cfg(test)]
 fn is_provider_auth_response(error: &HttpError) -> bool {
-    if error.status != reqwest::StatusCode::UNAUTHORIZED
-        && error.status != reqwest::StatusCode::FORBIDDEN
-    {
-        return false;
-    }
-
-    let Ok(body) = serde_json::from_str::<Value>(&error.body) else {
-        return false;
-    };
-    let provider_error = body.get("error").unwrap_or(&body);
-    provider_error.get("code").and_then(Value::as_str) == Some("invalid_api_key")
-        || provider_error
-            .get("message")
-            .and_then(Value::as_str)
-            .is_some_and(|message| {
-                let message = message.to_ascii_lowercase();
-                message.contains("incorrect api key provided")
-                    || message.contains("llm provider") && message.contains("credential")
-            })
+    braintrust_api_client::backend::extensions::is_provider_auth_response(error)
 }
 
 pub async fn delete_function(client: &ApiClient, function_id: &str) -> Result<()> {
-    let path = format!("/v1/function/{}", encode(function_id));
-    client.delete(&path).await
+    client
+        .run(|| client.generated().delete_function_id(function_id))
+        .await?;
+    Ok(())
 }
 
 pub async fn list_functions_page(
     client: &ApiClient,
     query: &FunctionListQuery,
 ) -> Result<FunctionListPage> {
-    let mut params = Vec::new();
-    if let Some(project_id) = &query.project_id {
-        params.push(("project_id", project_id.clone()));
-    }
-    if let Some(project_name) = &query.project_name {
-        params.push(("project_name", project_name.clone()));
-    }
-    if let Some(slug) = &query.slug {
-        params.push(("slug", slug.clone()));
-    }
-    if let Some(id) = &query.id {
-        params.push(("ids", id.clone()));
-    }
-    if let Some(version) = &query.version {
-        params.push(("version", version.clone()));
-    }
-    if let Some(environment) = &query.environment {
-        params.push(("environment", environment.clone()));
-    }
-    if let Some(cursor) = &query.cursor {
-        params.push(("cursor", cursor.clone()));
-    }
-    if let Some(snapshot) = &query.snapshot {
-        params.push(("snapshot", snapshot.clone()));
-    }
-
-    let path = if params.is_empty() {
-        "/v1/function".to_string()
-    } else {
-        let query = params
-            .into_iter()
-            .map(|(key, value)| format!("{}={}", encode(key), encode(&value)))
-            .collect::<Vec<_>>()
-            .join("&");
-        format!("/v1/function?{query}")
-    };
-
-    let raw: Value = client
-        .get(&path)
-        .await
-        .with_context(|| format!("failed to list functions via {path}"))?;
-
-    parse_function_list_page(raw)
+    client.function_page(query).await
 }
 
 /// List a project's functions using the public API's cursor contract.
@@ -360,13 +186,7 @@ pub async fn list_all_functions(client: &ApiClient, project_id: &str) -> Result<
         if query.snapshot.is_none() {
             query.snapshot = page.snapshot;
         }
-        functions.extend(
-            page.objects
-                .into_iter()
-                .map(serde_json::from_value)
-                .collect::<std::result::Result<Vec<_>, _>>()
-                .context("unexpected function response shape")?,
-        );
+        functions.extend(page.objects);
         let Some(cursor) = page.next_cursor else {
             break;
         };
@@ -380,39 +200,19 @@ pub async fn list_all_functions(client: &ApiClient, project_id: &str) -> Result<
 }
 
 pub async fn create_function(client: &ApiClient, body: &Value) -> Result<Function> {
-    client.post("/v1/function", body).await
+    let request: braintrust_api_client::types::CreateFunction =
+        braintrust_api_client::backend::resource_definition(body)?;
+    client
+        .run(|| client.generated().post_function(request.clone()))
+        .await
 }
 
 pub async fn replace_function(client: &ApiClient, body: &Value) -> Result<Function> {
-    client.put("/v1/function", body).await
-}
-
-fn parse_function_list_page(raw: Value) -> Result<FunctionListPage> {
-    let objects = raw
-        .get("objects")
-        .and_then(Value::as_array)
-        .cloned()
-        .ok_or_else(|| anyhow::anyhow!("missing 'objects' array in /v1/function response"))?;
-
-    let next_cursor = raw
-        .get("next_cursor")
-        .and_then(Value::as_str)
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .map(ToOwned::to_owned);
-
-    let snapshot = raw
-        .get("snapshot")
-        .and_then(Value::as_str)
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .map(ToOwned::to_owned);
-
-    Ok(FunctionListPage {
-        objects,
-        next_cursor,
-        snapshot,
-    })
+    let request: braintrust_api_client::types::CreateFunction =
+        braintrust_api_client::backend::resource_definition(body)?;
+    client
+        .run(|| client.generated().put_function(request.clone()))
+        .await
 }
 
 pub async fn request_code_upload_slot(
@@ -421,18 +221,14 @@ pub async fn request_code_upload_slot(
     runtime: &str,
     version: &str,
 ) -> Result<CodeUploadSlot> {
-    let body = serde_json::json!({
-        "org_id": org_id,
-        "runtime_context": {
-            "runtime": runtime,
-            "version": version,
-        }
-    });
-
-    client
-        .post("/function/code", &body)
-        .await
-        .context("failed to request code upload slot")
+    let request = braintrust_api_client::backend::extensions::CodeUploadRequest {
+        org_id: org_id.to_owned(),
+        runtime_context: braintrust_api_client::backend::extensions::RuntimeContext {
+            runtime: runtime.to_owned(),
+            version: version.to_owned(),
+        },
+    };
+    client.code_upload(&request).await
 }
 
 pub async fn upload_bundle(
@@ -450,27 +246,24 @@ pub async fn insert_functions(
     functions: &[Value],
 ) -> Result<InsertFunctionsResult> {
     let body = insert_functions_body(functions);
-    let raw: Value = match client.post("/insert-functions", &body).await {
-        Ok(raw) => raw,
-        Err(error) => {
-            let Some(http_error) = error.downcast_ref::<HttpError>() else {
-                return Err(error).context("failed to insert functions");
-            };
-            if http_error.status != reqwest::StatusCode::UNPROCESSABLE_ENTITY {
-                return Err(error).context("failed to insert functions");
-            }
-            let report = serde_json::from_str(&http_error.body)
-                .context("unexpected insert-functions validation error response shape")?;
-            return Err(FunctionValidationError { report }.into());
-        }
-    };
-
-    let response: InsertFunctionsResponse = serde_json::from_value(raw.clone())
-        .context("unexpected insert-functions response shape")?;
-
+    let response = client
+        .insert_functions(&braintrust_api_client::backend::resource_definition(&body)?)
+        .await?;
+    let ignored_entries = response.ignored_count.or_else(|| {
+        (response.functions.len() == functions.len()).then(|| {
+            response
+                .functions
+                .iter()
+                .zip(functions)
+                .filter(|(result, request)| {
+                    request.get("if_exists").and_then(Value::as_str) == Some("ignore")
+                        && result.found_existing
+                })
+                .count()
+        })
+    });
     Ok(InsertFunctionsResult {
-        ignored_entries: ignored_count(&raw)
-            .or_else(|| ignored_count_from_function_results(&raw, functions)),
+        ignored_entries,
         xact_id: response.xact_id,
         functions: response.functions,
     })
@@ -480,12 +273,14 @@ pub(crate) fn insert_functions_body(functions: &[Value]) -> Value {
     serde_json::json!({ "functions": functions })
 }
 
+#[cfg(test)]
 fn ignored_count(raw: &Value) -> Option<usize> {
     raw.get("ignored_count")
         .and_then(Value::as_u64)
         .and_then(|count| usize::try_from(count).ok())
 }
 
+#[cfg(test)]
 fn ignored_count_from_function_results(raw: &Value, requests: &[Value]) -> Option<usize> {
     let results = raw.get("functions")?.as_array()?;
     if results.len() != requests.len() {
@@ -600,16 +395,17 @@ mod tests {
 
     #[test]
     fn parses_insert_function_operation_fields() {
-        let response: InsertFunctionsResponse = serde_json::from_value(serde_json::json!({
-            "xact_id": "1000000000000000001",
-            "functions": [{
-                "id": "fn_test_scorer",
-                "project_id": "test-project",
-                "slug": "test-scorer",
-                "found_existing": true
-            }]
-        }))
-        .expect("insert response");
+        let response: braintrust_api_client::backend::extensions::InsertFunctionsResponse =
+            serde_json::from_value(serde_json::json!({
+                "xact_id": "1000000000000000001",
+                "functions": [{
+                    "id": "fn_test_scorer",
+                    "project_id": "test-project",
+                    "slug": "test-scorer",
+                    "found_existing": true
+                }]
+            }))
+            .expect("insert response");
 
         assert_eq!(response.xact_id.as_deref(), Some("1000000000000000001"));
         assert_eq!(response.functions[0].id, "fn_test_scorer");
@@ -624,38 +420,5 @@ mod tests {
         let body = insert_functions_body(&functions);
 
         assert_eq!(body, serde_json::json!({ "functions": functions }));
-    }
-
-    #[test]
-    fn parse_function_list_page_allows_non_paginated_shape() {
-        let raw = serde_json::json!({
-            "objects": [],
-        });
-
-        let page = parse_function_list_page(raw).expect("parse function page");
-        assert!(page.objects.is_empty());
-        assert!(page.next_cursor.is_none());
-    }
-
-    #[test]
-    fn parse_function_list_page_detects_next_pagination_field() {
-        let raw = serde_json::json!({
-            "objects": [],
-            "next_cursor": "cursor-1",
-        });
-
-        let page = parse_function_list_page(raw).expect("parse function page");
-        assert_eq!(page.next_cursor.as_deref(), Some("cursor-1"));
-    }
-
-    #[test]
-    fn parse_function_list_page_extracts_snapshot() {
-        let raw = serde_json::json!({
-            "objects": [],
-            "snapshot": "snapshot-1",
-        });
-
-        let page = parse_function_list_page(raw).expect("parse function page");
-        assert_eq!(page.snapshot.as_deref(), Some("snapshot-1"));
     }
 }

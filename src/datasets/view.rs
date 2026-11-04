@@ -26,7 +26,7 @@ pub async fn run(
     let dataset = match name {
         Some(name) => with_spinner(
             "Loading dataset...",
-            api::get_dataset_by_name(&ctx.client, &ctx.project.id, name),
+            api::get_dataset_by_name(&ctx.client, &ctx.project.id.to_string(), name),
         )
         .await?
         .ok_or_else(|| anyhow!("dataset '{name}' not found"))?,
@@ -35,7 +35,7 @@ pub async fn run(
                 bail!("dataset name required. Use: bt datasets view <name>");
             }
             let Some(dataset) =
-                super::select_dataset_interactive(&ctx.client, &ctx.project.id).await?
+                super::select_dataset_interactive(&ctx.client, &ctx.project.id.to_string()).await?
             else {
                 super::print_no_datasets_found(&ctx.project.name);
                 return Ok(());
@@ -61,7 +61,12 @@ pub async fn run(
     let full_rows_command = format!("bt sync pull dataset:{}", dataset.id);
     let (rows, rows_truncated) = with_spinner(
         "Loading dataset rows...",
-        api::list_dataset_rows_limited(&ctx.client, &dataset.id, max_rows, preview_length),
+        api::list_dataset_rows_limited(
+            &ctx.client,
+            &dataset.id.to_string(),
+            max_rows,
+            preview_length,
+        ),
     )
     .await?;
 
@@ -83,7 +88,7 @@ pub async fn run(
     let mut output = String::new();
     writeln!(output, "Viewing {}", console::style(&dataset.name).bold())?;
 
-    if let Some(description) = dataset.description_text() {
+    if let Some(description) = api::description_text(&dataset) {
         writeln!(
             output,
             "{} {}",
@@ -98,7 +103,7 @@ pub async fn run(
         console::style("Project:").dim(),
         ctx.project.name
     )?;
-    if let Some(created) = dataset.created_text() {
+    if let Some(created) = api::created_text(&dataset) {
         writeln!(output, "{} {}", console::style("Created:").dim(), created)?;
     }
     if rows_truncated {

@@ -32,7 +32,7 @@
         "Initial snapshot"
       ],
       "stdout_contains": [
-        "\"dataset_id\":\"dataset_1\"",
+        "\"dataset_id\":\"00000000-0000-4000-8000-000000000101\"",
         "\"name\":\"baseline\"",
         "\"xact_id\":\"1000192656880881099\"",
         "\"found_existing\":false",
@@ -70,7 +70,7 @@
       ],
       "stdout_contains": [
         "\"snapshots\":[",
-        "\"dataset_id\":\"dataset_1\"",
+        "\"dataset_id\":\"00000000-0000-4000-8000-000000000101\"",
         "\"name\":\"baseline\"",
         "\"xact_id\":\"1000192656880881099\""
       ],

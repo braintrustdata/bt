@@ -1528,7 +1528,7 @@ async fn prepare_views(
     for file in &manifest.files {
         for entry in &file.entries {
             let project = resolve_project_for_entry(client, default_project, entry).await?;
-            if !seen.insert((project.id.clone(), entry.slug.clone())) {
+            if !seen.insert((project.id.to_string(), entry.slug.clone())) {
                 bail!(
                     "duplicate custom view slug '{}' in project '{}'",
                     entry.slug,
@@ -1582,10 +1582,10 @@ async fn resolve_dataset_for_entry(
         .map(str::trim)
         .filter(|value| !value.is_empty())
     {
-        let datasets = datasets_api::list_datasets(client, &project.id).await?;
+        let datasets = datasets_api::list_datasets(client, &project.id.to_string()).await?;
         return datasets
             .into_iter()
-            .find(|dataset| dataset.id == dataset_id)
+            .find(|dataset| dataset.id.to_string() == dataset_id)
             .ok_or_else(|| {
                 anyhow!(
                     "dataset id '{dataset_id}' not found in project '{}'",
@@ -1606,7 +1606,7 @@ async fn resolve_dataset_for_entry(
             )
         })?;
 
-    datasets_api::get_dataset_by_name(client, &project.id, dataset_name)
+    datasets_api::get_dataset_by_name(client, &project.id.to_string(), dataset_name)
         .await?
         .ok_or_else(|| {
             anyhow!(
@@ -1618,7 +1618,7 @@ async fn resolve_dataset_for_entry(
 
 fn build_insert_event(view: &PreparedView, if_exists: IfExistsMode) -> Value {
     let mut event = json!({
-        "project_id": view.project.id,
+        "project_id": view.project.id.to_string(),
         "name": view.entry.name,
         "slug": view.entry.slug,
         "function_type": "custom_view",
@@ -1639,7 +1639,7 @@ fn build_insert_event(view: &PreparedView, if_exists: IfExistsMode) -> Value {
     if let Some(dataset) = &view.dataset {
         event["origin"] = json!({
             "object_type": "dataset",
-            "object_id": dataset.id,
+            "object_id": dataset.id.to_string(),
         });
     }
 
@@ -1692,7 +1692,7 @@ fn resolve_pushed_views(
     for view in views {
         let result = results
             .iter()
-            .find(|result| result.project_id == view.project.id && result.slug == view.entry.slug)
+            .find(|result| result.project_id == view.project.id.to_string() && result.slug == view.entry.slug)
             .with_context(|| {
                 format!(
                     "custom view insert succeeded, but its response omitted '{}' in project '{}'; check the published views before retrying",
@@ -1707,9 +1707,9 @@ fn resolve_pushed_views(
             name: view.entry.name.clone(),
             slug: view.entry.slug.clone(),
             view_type: view.entry.view_type,
-            project_id: view.project.id.clone(),
+            project_id: view.project.id.to_string(),
             project_name: view.project.name.clone(),
-            dataset_id: view.dataset.as_ref().map(|dataset| dataset.id.clone()),
+            dataset_id: view.dataset.as_ref().map(|dataset| dataset.id.to_string()),
             function_id: result.id.clone(),
             url: custom_view_url(app_url, org_name, view, &result.id),
         });
@@ -1755,7 +1755,7 @@ async fn build_dataset_preview_data(
     };
 
     let row = if let Some(row_id) = args.row_id.as_deref() {
-        datasets_api::get_dataset_row_by_id(client, &dataset.id, row_id)
+        datasets_api::get_dataset_row_by_id(client, &dataset.id.to_string(), row_id)
             .await?
             .ok_or_else(|| anyhow!("dataset row id '{row_id}' not found in '{}'", dataset.name))?
     } else {
@@ -1763,7 +1763,7 @@ async fn build_dataset_preview_data(
         let limit = index.checked_add(1).context("row index is too large")?;
         let (rows, _) = datasets_api::list_dataset_rows_limited(
             client,
-            &dataset.id,
+            &dataset.id.to_string(),
             Some(limit),
             datasets_api::DatasetRowsPreviewLength::Full,
         )
@@ -1794,10 +1794,10 @@ async fn resolve_dataset_by_selector(
     project: &Project,
     selector: &str,
 ) -> Result<datasets_api::Dataset> {
-    let datasets = datasets_api::list_datasets(client, &project.id).await?;
+    let datasets = datasets_api::list_datasets(client, &project.id.to_string()).await?;
     datasets
         .into_iter()
-        .find(|dataset| dataset.id == selector || dataset.name == selector)
+        .find(|dataset| dataset.id.to_string() == selector || dataset.name == selector)
         .ok_or_else(|| {
             anyhow!(
                 "dataset '{selector}' not found in project '{}'",
@@ -2080,7 +2080,7 @@ mod tests {
         let login = braintrust_sdk_rust::LoginState::new();
         login.set(
             "sk-test".to_string(),
-            "org_test".to_string(),
+            "a62dfe69-c4f4-5cce-8915-66ba56903b53".to_string(),
             "test-org".to_string(),
             api_url.to_string(),
             api_url.to_string(),
@@ -2136,10 +2136,14 @@ mod tests {
 
     fn test_project() -> Project {
         Project {
-            id: "proj_test".to_string(),
+            id: "854ac738-d77f-5aca-88ae-113a8552665a".parse().unwrap(),
             name: "test-project".to_string(),
-            org_id: "org_test".to_string(),
+            org_id: "a62dfe69-c4f4-5cce-8915-66ba56903b53".parse().unwrap(),
             description: None,
+            created: None,
+            deleted_at: None,
+            settings: None,
+            user_id: None,
         }
     }
 
@@ -2174,7 +2178,7 @@ import { jsx } from "react/jsx-runtime";
 
 console.log("test discovery log");
 export default customTraceView(
-  { name: "SWC Trace", slug: "swc-trace", project: { id: "proj_test" } },
+  { name: "SWC Trace", slug: "swc-trace", project: { id: "854ac738-d77f-5aca-88ae-113a8552665a" } },
   function SwcTraceView() {
     return <section>{jsx("strong", { children: label }, "test-key")}</section>;
   },
@@ -2200,7 +2204,10 @@ export default customTraceView(
         assert_eq!(entry.view_type, ViewType::Trace);
         assert_eq!(entry.name, "SWC Trace");
         assert_eq!(entry.slug, "swc-trace");
-        assert_eq!(entry.project_id.as_deref(), Some("proj_test"));
+        assert_eq!(
+            entry.project_id.as_deref(),
+            Some("854ac738-d77f-5aca-88ae-113a8552665a")
+        );
         assert!(entry
             .code
             .contains("module.exports = __BraintrustCustomView"));
@@ -2528,7 +2535,8 @@ export default customDatasetView(
                     "/v1/experiment",
                     web::get().to(|| async {
                         HttpResponse::Ok().json(json!({"objects": [{
-                            "id": "exp_test",
+                            "id": "00000000-0000-4000-8000-000000000002",
+                            "public": false,
                             "name": "test-experiment",
                             "project_id": "00000000-0000-4000-8000-000000000001",
                         }]}))
@@ -2538,7 +2546,8 @@ export default customDatasetView(
                     "/btql",
                     web::post().to(|body: web::Json<Value>| async move {
                         let query = body["query"].as_str().unwrap();
-                        if !query.contains("from: experiment('exp_test')")
+                        if !query
+                            .contains("from: experiment('00000000-0000-4000-8000-000000000002')")
                             || query.contains("created >=")
                         {
                             return HttpResponse::BadRequest()
@@ -2655,7 +2664,10 @@ export default customDatasetView(
         .await
         .expect("resolve target");
 
-        assert_eq!(target.source_expr, "project_logs('proj_test')");
+        assert_eq!(
+            target.source_expr,
+            "project_logs('854ac738-d77f-5aca-88ae-113a8552665a')"
+        );
         assert_eq!(target.root_span_id, "root-span");
         assert_eq!(target.span_id.as_deref(), Some("selected-span"));
         server.stop(true).await;
@@ -2775,18 +2787,24 @@ export default customDatasetView(
             },
             project: test_project(),
             dataset: Some(datasets_api::Dataset {
-                id: "dataset_test".to_string(),
+                id: "00000000-0000-4000-8000-000000000101".parse().unwrap(),
                 name: "test-dataset".to_string(),
-                project_id: Some("proj_test".to_string()),
+                project_id: "854ac738-d77f-5aca-88ae-113a8552665a".parse().unwrap(),
                 description: None,
                 created: None,
-                created_at: None,
                 metadata: None,
+                deleted_at: None,
+                tags: None,
+                url_slug: "test-dataset".into(),
+                user_id: None,
             }),
         };
         let dataset_event = build_insert_event(&dataset_view, IfExistsMode::Error);
         assert_eq!(dataset_event["origin"]["object_type"], "dataset");
-        assert_eq!(dataset_event["origin"]["object_id"], "dataset_test");
+        assert_eq!(
+            dataset_event["origin"]["object_id"],
+            "00000000-0000-4000-8000-000000000101"
+        );
     }
 
     #[test]
@@ -2837,13 +2855,13 @@ export default customDatasetView(
         let results = [
             functions_api::InsertedFunctionResult {
                 id: "fn_test_new".to_string(),
-                project_id: "proj_test".to_string(),
+                project_id: "854ac738-d77f-5aca-88ae-113a8552665a".to_string(),
                 slug: "new-view".to_string(),
                 found_existing: false,
             },
             functions_api::InsertedFunctionResult {
                 id: "fn_test_existing".to_string(),
-                project_id: "proj_test".to_string(),
+                project_id: "854ac738-d77f-5aca-88ae-113a8552665a".to_string(),
                 slug: "existing-view".to_string(),
                 found_existing: true,
             },
