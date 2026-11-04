@@ -57,7 +57,7 @@ pub async fn run_view_target(
         print_with_pager(&render_single_config(
             &format_project_header(
                 &report.project.name,
-                &report.project.id,
+                &report.project.id.to_string(),
                 &report.project.org_name,
             ),
             automation,
@@ -100,7 +100,11 @@ pub async fn run_set(ctx: &ResolvedContext, args: &ConfigSetArgs, json: bool) ->
 
     print_command_status(CommandStatus::Success, "Updated Topics automation config");
     print_with_pager(&render_single_config(
-        &format_project_header(&ctx.project.name, &ctx.project.id, ctx.client.org_name()),
+        &format_project_header(
+            &ctx.project.name,
+            &ctx.project.id.to_string(),
+            ctx.client.org_name(),
+        ),
         &updated,
     ))?;
     Ok(())
@@ -118,7 +122,11 @@ pub async fn run_enable(ctx: &ResolvedContext, args: &ConfigEnableArgs, json: bo
 
     print_command_status(CommandStatus::Success, "Enabled Topics automation");
     print_with_pager(&render_single_config(
-        &format_project_header(&ctx.project.name, &ctx.project.id, ctx.client.org_name()),
+        &format_project_header(
+            &ctx.project.name,
+            &ctx.project.id.to_string(),
+            ctx.client.org_name(),
+        ),
         &created,
     ))?;
     Ok(())
@@ -185,7 +193,11 @@ pub async fn run_topic_map_set(
 
     print_command_status(CommandStatus::Success, "Updated Topics topic map config");
     print_with_pager(&render_single_topic_map_update(
-        &format_project_header(&ctx.project.name, &ctx.project.id, ctx.client.org_name()),
+        &format_project_header(
+            &ctx.project.name,
+            &ctx.project.id.to_string(),
+            ctx.client.org_name(),
+        ),
         &updated,
     ))?;
     Ok(())
@@ -194,7 +206,7 @@ pub async fn run_topic_map_set(
 fn render_report(report: &TopicsConfigReport) -> String {
     let mut output = format_project_header(
         &report.project.name,
-        &report.project.id,
+        &report.project.id.to_string(),
         &report.project.org_name,
     );
 
@@ -257,7 +269,7 @@ fn render_single_topic_map_config(
 fn render_delete_report(report: &TopicsDeleteReport) -> String {
     let mut output = format_project_header(
         &report.project.name,
-        &report.project.id,
+        &report.project.id.to_string(),
         &report.project.org_name,
     );
     output.push_str("\n\nDeleted Topics automation:\n");
@@ -415,7 +427,7 @@ fn print_topic_map_view(
     print_with_pager(&render_single_topic_map_config(
         &format_project_header(
             &report.project.name,
-            &report.project.id,
+            &report.project.id.to_string(),
             &report.project.org_name,
         ),
         resolved.automation,

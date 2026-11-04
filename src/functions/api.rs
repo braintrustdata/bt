@@ -15,7 +15,7 @@ fn escape_sql(s: &str) -> String {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct Function {
+pub struct FunctionRow {
     pub id: String,
     pub name: String,
     pub slug: String,
@@ -40,39 +40,12 @@ pub struct Function {
     pub _xact_id: Option<String>,
 }
 
-#[derive(Debug, Clone, Default, Serialize)]
-pub struct FunctionListQuery {
-    pub project_id: Option<String>,
-    pub project_name: Option<String>,
-    pub slug: Option<String>,
-    pub id: Option<String>,
-    pub version: Option<String>,
-    pub environment: Option<String>,
-    pub cursor: Option<String>,
-    pub snapshot: Option<String>,
-}
+pub use braintrust_api_client::backend::extensions::{
+    CodeUploadSlot, FunctionListQuery, FunctionPage as FunctionListPage,
+};
+pub use braintrust_api_client::types::Function;
 
-#[derive(Debug, Clone, Deserialize)]
-pub struct FunctionListPage {
-    pub objects: Vec<Value>,
-    pub next_cursor: Option<String>,
-    pub snapshot: Option<String>,
-}
-
-#[derive(Debug, Clone, Deserialize)]
-pub struct CodeUploadSlot {
-    pub url: String,
-    #[serde(rename = "bundleId")]
-    pub bundle_id: String,
-}
-
-#[derive(Debug, Clone, Deserialize)]
-pub struct InsertedFunctionResult {
-    pub id: String,
-    pub project_id: String,
-    pub slug: String,
-    pub found_existing: bool,
-}
+pub use braintrust_api_client::backend::extensions::InsertedFunction as InsertedFunctionResult;
 
 pub use braintrust_api_client::backend::extensions::{
     FunctionValidationError, FunctionValidationReport,
@@ -85,21 +58,13 @@ pub struct InsertFunctionsResult {
     pub functions: Vec<InsertedFunctionResult>,
 }
 
-#[derive(Debug, Deserialize)]
-struct InsertFunctionsResponse {
-    #[serde(default)]
-    xact_id: Option<String>,
-    #[serde(default)]
-    functions: Vec<InsertedFunctionResult>,
-}
-
 pub async fn list_functions(
     client: &ApiClient,
     project_id: &str,
     function_type: Option<&str>,
-) -> Result<Vec<Function>> {
+) -> Result<Vec<FunctionRow>> {
     let query = list_functions_query(project_id, function_type);
-    let response: BtqlResponse<Function> = client.btql(&query).await?;
+    let response: BtqlResponse<FunctionRow> = client.btql(&query).await?;
 
     Ok(response.data)
 }
@@ -142,9 +107,7 @@ pub async fn get_function_by_slug(
         return Ok(None);
     };
 
-    serde_json::from_value(raw)
-        .map(Some)
-        .context("unexpected function response shape")
+    Ok(Some(raw))
 }
 
 pub async fn get_function_by_id(
@@ -164,21 +127,19 @@ pub async fn get_function_by_id(
         return Ok(None);
     };
 
-    serde_json::from_value(raw)
-        .map(Some)
-        .context("unexpected function response shape")
+    Ok(Some(raw))
 }
 
 pub async fn invoke_function(
     client: &ApiClient,
-    body: &serde_json::Value,
+    body: &braintrust_api_client::backend::extensions::Invocation,
 ) -> Result<serde_json::Value> {
     let result = client
         .with_options(OperationOptions {
             timeout: Some(std::time::Duration::from_secs(300)),
             ..Default::default()
         })
-        .invoke(&crate::http::into_api(body)?)
+        .invoke(body)
         .await;
     match result {
         Err(error)
@@ -208,7 +169,7 @@ pub async fn list_functions_page(
     client: &ApiClient,
     query: &FunctionListQuery,
 ) -> Result<FunctionListPage> {
-    crate::http::from_api(client.function_page(&crate::http::into_api(query)?).await?)
+    client.function_page(query).await
 }
 
 /// List a project's functions using the public API's cursor contract.
@@ -225,13 +186,7 @@ pub async fn list_all_functions(client: &ApiClient, project_id: &str) -> Result<
         if query.snapshot.is_none() {
             query.snapshot = page.snapshot;
         }
-        functions.extend(
-            page.objects
-                .into_iter()
-                .map(serde_json::from_value)
-                .collect::<std::result::Result<Vec<_>, _>>()
-                .context("unexpected function response shape")?,
-        );
+        functions.extend(page.objects);
         let Some(cursor) = page.next_cursor else {
             break;
         };
@@ -245,21 +200,19 @@ pub async fn list_all_functions(client: &ApiClient, project_id: &str) -> Result<
 }
 
 pub async fn create_function(client: &ApiClient, body: &Value) -> Result<Function> {
-    let request: braintrust_api_client::types::CreateFunction = crate::http::into_api(body)?;
-    crate::http::from_api(
-        client
-            .run(|| client.generated().post_function(request.clone()))
-            .await?,
-    )
+    let request: braintrust_api_client::types::CreateFunction =
+        braintrust_api_client::backend::resource_definition(body)?;
+    client
+        .run(|| client.generated().post_function(request.clone()))
+        .await
 }
 
 pub async fn replace_function(client: &ApiClient, body: &Value) -> Result<Function> {
-    let request: braintrust_api_client::types::CreateFunction = crate::http::into_api(body)?;
-    crate::http::from_api(
-        client
-            .run(|| client.generated().put_function(request.clone()))
-            .await?,
-    )
+    let request: braintrust_api_client::types::CreateFunction =
+        braintrust_api_client::backend::resource_definition(body)?;
+    client
+        .run(|| client.generated().put_function(request.clone()))
+        .await
 }
 
 pub async fn request_code_upload_slot(
@@ -275,7 +228,7 @@ pub async fn request_code_upload_slot(
             version: version.to_owned(),
         },
     };
-    crate::http::from_api(client.code_upload(&request).await?)
+    client.code_upload(&request).await
 }
 
 pub async fn upload_bundle(
@@ -293,18 +246,24 @@ pub async fn insert_functions(
     functions: &[Value],
 ) -> Result<InsertFunctionsResult> {
     let body = insert_functions_body(functions);
-    let raw = serde_json::to_value(
-        client
-            .insert_functions(&crate::http::into_api(&body)?)
-            .await?,
-    )?;
-
-    let response: InsertFunctionsResponse = serde_json::from_value(raw.clone())
-        .context("unexpected insert-functions response shape")?;
-
+    let response = client
+        .insert_functions(&braintrust_api_client::backend::resource_definition(&body)?)
+        .await?;
+    let ignored_entries = response.ignored_count.or_else(|| {
+        (response.functions.len() == functions.len()).then(|| {
+            response
+                .functions
+                .iter()
+                .zip(functions)
+                .filter(|(result, request)| {
+                    request.get("if_exists").and_then(Value::as_str) == Some("ignore")
+                        && result.found_existing
+                })
+                .count()
+        })
+    });
     Ok(InsertFunctionsResult {
-        ignored_entries: ignored_count(&raw)
-            .or_else(|| ignored_count_from_function_results(&raw, functions)),
+        ignored_entries,
         xact_id: response.xact_id,
         functions: response.functions,
     })
@@ -314,12 +273,14 @@ pub(crate) fn insert_functions_body(functions: &[Value]) -> Value {
     serde_json::json!({ "functions": functions })
 }
 
+#[cfg(test)]
 fn ignored_count(raw: &Value) -> Option<usize> {
     raw.get("ignored_count")
         .and_then(Value::as_u64)
         .and_then(|count| usize::try_from(count).ok())
 }
 
+#[cfg(test)]
 fn ignored_count_from_function_results(raw: &Value, requests: &[Value]) -> Option<usize> {
     let results = raw.get("functions")?.as_array()?;
     if results.len() != requests.len() {
@@ -434,16 +395,17 @@ mod tests {
 
     #[test]
     fn parses_insert_function_operation_fields() {
-        let response: InsertFunctionsResponse = serde_json::from_value(serde_json::json!({
-            "xact_id": "1000000000000000001",
-            "functions": [{
-                "id": "fn_test_scorer",
-                "project_id": "test-project",
-                "slug": "test-scorer",
-                "found_existing": true
-            }]
-        }))
-        .expect("insert response");
+        let response: braintrust_api_client::backend::extensions::InsertFunctionsResponse =
+            serde_json::from_value(serde_json::json!({
+                "xact_id": "1000000000000000001",
+                "functions": [{
+                    "id": "fn_test_scorer",
+                    "project_id": "test-project",
+                    "slug": "test-scorer",
+                    "found_existing": true
+                }]
+            }))
+            .expect("insert response");
 
         assert_eq!(response.xact_id.as_deref(), Some("1000000000000000001"));
         assert_eq!(response.functions[0].id, "fn_test_scorer");

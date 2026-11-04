@@ -23,7 +23,7 @@ pub async fn run(ctx: &ResolvedContext, json: bool) -> Result<()> {
 fn render_report(report: &api::TopicsPokeReport) -> String {
     let mut lines = vec![format_project_header(
         &report.project.name,
-        &report.project.id,
+        &report.project.id.to_string(),
         &report.project.org_name,
     )];
 

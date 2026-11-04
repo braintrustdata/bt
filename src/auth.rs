@@ -657,22 +657,7 @@ pub async fn login(base: &BaseArgs) -> Result<LoginContext> {
     Ok(ctx)
 }
 
-#[derive(Debug, Deserialize)]
-struct AiProviderSecret {
-    #[serde(default)]
-    id: Option<String>,
-    name: String,
-    #[serde(default)]
-    r#type: Option<String>,
-    #[serde(default)]
-    preview_secret: Option<String>,
-    #[serde(default)]
-    secret_updated_at: Option<String>,
-    #[serde(default)]
-    updated_at: Option<String>,
-    #[serde(default)]
-    created: Option<String>,
-}
+use braintrust_api_client::backend::extensions::AiProviderSecret;
 
 #[derive(Debug, Default, Deserialize, Serialize)]
 struct AiProviderKeyStalenessWarningState {
@@ -834,7 +819,7 @@ async fn warn_ai_provider_key_staleness(ctx: &LoginContext) -> Result<()> {
 
     let client = crate::http::ApiClient::new(ctx)?;
     let secrets: Vec<AiProviderSecret> = match client.ai_provider_secrets().await {
-        Ok(secrets) => crate::http::from_api(secrets)?,
+        Ok(secrets) => secrets,
         Err(error) if braintrust_api_client::backend::is_response_rejection(&error) => {
             return Ok(());
         }

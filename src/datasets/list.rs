@@ -13,7 +13,7 @@ use super::{api, ResolvedContext};
 pub async fn run(ctx: &ResolvedContext, json: bool) -> Result<()> {
     let datasets = with_spinner(
         "Loading datasets...",
-        api::list_datasets(&ctx.client, &ctx.project.id),
+        api::list_datasets(&ctx.client, &ctx.project.id.to_string()),
     )
     .await?;
 
@@ -46,13 +46,11 @@ pub async fn run(ctx: &ResolvedContext, json: bool) -> Result<()> {
     apply_column_padding(&mut table, (0, 6));
 
     for dataset in &datasets {
-        let description = dataset
-            .description_text()
+        let description = api::description_text(dataset)
             .map(|description| truncate(description, 60))
             .unwrap_or_else(|| "-".to_string());
-        let created = dataset
-            .created_text()
-            .map(|created| truncate(created, 10))
+        let created = api::created_text(dataset)
+            .map(|created| truncate(&created, 10))
             .unwrap_or_else(|| "-".to_string());
         table.add_row(vec![&dataset.name, &description, &created]);
     }

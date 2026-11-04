@@ -14,7 +14,7 @@ pub async fn run(ctx: &ResolvedContext, json: bool, ft: Option<FunctionTypeFilte
     let function_type = ft.map(|f| f.as_str());
     let functions = with_spinner(
         &format!("Loading {}...", label_plural(ft)),
-        api::list_functions(&ctx.client, &ctx.project.id, function_type),
+        api::list_functions(&ctx.client, &ctx.project.id.to_string(), function_type),
     )
     .await?;
 

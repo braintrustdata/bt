@@ -2,7 +2,7 @@ use std::io::{self, Read};
 
 use anyhow::{bail, Context, Result};
 use clap::Args;
-use serde_json::{json, Value};
+use serde_json::Value;
 
 use super::{select_function_interactive, FunctionTypeFilter, ResolvedContext, SlugArgs};
 use crate::ui::is_interactive;
@@ -77,7 +77,8 @@ pub async fn run(
     let slug = match args.slug() {
         Some(s) => s.to_string(),
         None if is_interactive() => {
-            let f = select_function_interactive(&ctx.client, &ctx.project.id, ft).await?;
+            let f =
+                select_function_interactive(&ctx.client, &ctx.project.id.to_string(), ft).await?;
             f.slug
         }
         None => bail!("<SLUG> required"),
@@ -85,28 +86,14 @@ pub async fn run(
 
     let resolved_input = resolve_input(&args.input)?;
 
-    let mut body = json!({
-        "project_name": ctx.project.name,
-        "slug": slug,
-    });
-
-    if let Some(input) = resolved_input {
-        body["input"] = input;
-    }
-    if !args.message.is_empty() {
-        let messages: Vec<Value> = args
-            .message
-            .iter()
-            .map(|m| json!({"role": "user", "content": m}))
-            .collect();
-        body["messages"] = json!(messages);
-    }
-    if let Some(mode) = resolve_mode(args.mode.as_deref(), json_output) {
-        body["mode"] = json!(mode);
-    }
-    if let Some(version) = &args.version {
-        body["version"] = json!(version);
-    }
+    let body = build_invocation(
+        &ctx.project.name,
+        slug,
+        resolved_input,
+        &args.message,
+        resolve_mode(args.mode.as_deref(), json_output),
+        args.version.as_deref(),
+    )?;
 
     let result = super::api::invoke_function(&ctx.client, &body).await?;
 
@@ -123,9 +110,78 @@ pub async fn run(
     Ok(())
 }
 
+fn build_invocation(
+    project_name: &str,
+    slug: String,
+    input: Option<Value>,
+    messages: &[String],
+    mode: Option<&str>,
+    version: Option<&str>,
+) -> Result<braintrust_api_client::backend::extensions::Invocation> {
+    use braintrust_api_client::{
+        backend::extensions::Invocation,
+        types::{
+            ChatCompletionMessageParam, ContentBlockInline, ContentBlockInlineContent,
+            ContentBlockInlineRole, FunctionId, InvokeApi, ProjectNameContent, StreamingMode,
+        },
+    };
+    let messages = (!messages.is_empty()).then(|| {
+        messages
+            .iter()
+            .map(|message| {
+                ChatCompletionMessageParam::User(ContentBlockInline {
+                    content: Some(ContentBlockInlineContent::String(message.clone())),
+                    name: None,
+                    role: ContentBlockInlineRole::User,
+                })
+            })
+            .collect()
+    });
+    let mode = mode
+        .map(|mode| match mode {
+            "auto" => Ok(StreamingMode::Auto),
+            "json" => Ok(StreamingMode::Json),
+            "text" => Ok(StreamingMode::Text),
+            "parallel" => Ok(StreamingMode::Parallel),
+            other => bail!("unsupported invocation mode '{other}'"),
+        })
+        .transpose()?;
+    Ok(Invocation {
+        function: FunctionId::ProjectNameContent(ProjectNameContent {
+            project_name: project_name.to_owned(),
+            slug,
+            version: version.map(ToOwned::to_owned),
+        }),
+        arguments: InvokeApi {
+            input,
+            messages,
+            mode: mode.map(Some),
+            ..Default::default()
+        },
+    })
+}
+
 #[cfg(test)]
 mod tests {
-    use super::resolve_mode;
+    use super::{build_invocation, resolve_mode};
+    use serde_json::json;
+
+    #[test]
+    fn typed_invocation_preserves_cli_request_shape() {
+        let request = build_invocation(
+            "test project",
+            "test-slug".into(),
+            Some(json!({"key":"value"})),
+            &["hello".into()],
+            Some("json"),
+            Some("version-1"),
+        )
+        .unwrap();
+        assert_eq!(
+            serde_json::to_value(request).unwrap(),
+            json!({"project_name":"test project", "slug":"test-slug", "version":"version-1", "input":{"key":"value"}, "messages":[{"role":"user", "content":"hello"}], "mode":"json"})
+        );
+    }
 
     #[test]
     fn resolves_invoke_mode() {

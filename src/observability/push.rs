@@ -14,12 +14,12 @@ use crate::{
 };
 
 use super::template::{
-    add_topics_functions, default_topics_config, embedding_model, is_loop_config, is_topics,
-    loop_config_for_target, new_topic_map_request, reconciled_topic_map_request,
-    remove_topics_functions, saved_preprocessor_slug, topic_map_ids, topic_map_matches,
-    topic_map_slug, topics_config_for_target, topics_settings, validate_topics_scope,
-    with_preprocessor_id, ActiveObservabilityTemplate, AutomationTemplate, FacetTemplate,
-    PortableFunction, DEFAULT_TOPICS_DESCRIPTION,
+    add_topics_functions, automation_topic_map_ids, default_topics_config, embedding_model,
+    is_loop_automation, is_topics_automation, loop_config_for_target, new_topic_map_request,
+    reconciled_topic_map_request, remove_topics_functions, saved_preprocessor_slug,
+    topic_map_matches, topic_map_slug, topics_config_for_target, topics_settings,
+    validate_topics_scope, with_preprocessor_id, ActiveObservabilityTemplate, AutomationTemplate,
+    FacetTemplate, PortableFunction, DEFAULT_TOPICS_DESCRIPTION,
 };
 
 #[derive(Debug)]
@@ -60,7 +60,7 @@ struct LoopMutation {
 
 #[derive(Debug, Clone)]
 enum TopicsTarget {
-    Existing(ProjectAutomation),
+    Existing(Box<ProjectAutomation>),
     New(String),
 }
 
@@ -101,7 +101,7 @@ pub(crate) fn plan(
     let functions_by_id = snapshot
         .functions
         .iter()
-        .map(|function| (function.id.as_str(), function))
+        .map(|function| (function.id.to_string(), function))
         .collect::<HashMap<_, _>>();
     let automations_by_name = unique_automations_by_name(&snapshot.automations)?;
 
@@ -137,7 +137,7 @@ pub(crate) fn plan(
     let topics_automations = snapshot
         .automations
         .iter()
-        .filter(|automation| is_topics(&automation.config))
+        .filter(|automation| is_topics_automation(automation))
         .collect::<Vec<_>>();
     let mut topics = BTreeMap::<String, TopicsMutation>::new();
     let mut detached_topic_maps = BTreeMap::new();
@@ -166,7 +166,7 @@ pub(crate) fn plan(
             &automations_by_name,
         )?;
         let binding_automations = match &target {
-            TopicsTarget::Existing(automation) => vec![automation],
+            TopicsTarget::Existing(automation) => vec![automation.as_ref()],
             TopicsTarget::New(_) => Vec::new(),
         };
         let map_slug = topic_map_slug(&facet.slug);
@@ -179,13 +179,10 @@ pub(crate) fn plan(
             force,
         )?;
         if let Some(topic_map) = topic_map {
-            if topic_map
-                .function_data
-                .as_ref()
-                .and_then(|data| data.get("type"))
-                .and_then(Value::as_str)
-                != Some("topic_map")
-            {
+            if !matches!(
+                topic_map.function_data,
+                braintrust_api_client::types::FunctionData::TopicMap(_)
+            ) {
                 bail!(
                     "function slug '{map_slug}' is occupied by a classifier that is not a topic map"
                 );
@@ -205,11 +202,13 @@ pub(crate) fn plan(
         };
         // Validate destination-owned Topics configuration before any mutation begins.
         let config = match &target {
-            TopicsTarget::Existing(automation) => add_topics_functions(&automation.config, &[])?,
+            TopicsTarget::Existing(automation) => {
+                add_topics_functions(&serde_json::to_value(&automation.config)?, &[])?
+            }
             TopicsTarget::New(_) => default_topics_config(),
         };
         let description = match &target {
-            TopicsTarget::Existing(automation) => automation.description.clone(),
+            TopicsTarget::Existing(automation) => automation.description.clone().flatten(),
             TopicsTarget::New(_) => Some(DEFAULT_TOPICS_DESCRIPTION.to_string()),
         };
         topics.entry(key.clone()).or_insert(TopicsMutation {
@@ -220,9 +219,9 @@ pub(crate) fn plan(
         });
         for map in &duplicate_topic_maps {
             detached_topic_maps
-                .entry(map.id.clone())
+                .entry(map.id.to_string())
                 .or_insert_with(|| PushedResource {
-                    id: map.id.clone(),
+                    id: map.id.to_string(),
                     name: map.name.clone(),
                     slug: Some(map.slug.clone()),
                 });
@@ -251,8 +250,10 @@ pub(crate) fn plan(
             };
             if let TopicsTarget::Existing(existing) = &mutation.target {
                 if !force
-                    && (topics_settings(&existing.config)? != settings.config
-                        || existing.description != settings.description)
+                    && (!json_equivalent(
+                        &topics_settings(&serde_json::to_value(&existing.config)?)?,
+                        &settings.config,
+                    ) || existing.description.clone().flatten() != settings.description)
                 {
                     bail!("Topics automation '{name}' has different settings; use --force to replace them or --topics-automation to use the destination settings");
                 }
@@ -268,7 +269,7 @@ pub(crate) fn plan(
         .map(|template| {
             let existing = automations_by_name.get(template.name.as_str()).copied();
             if let Some(existing) = existing {
-                if !is_loop_config(&existing.config) {
+                if !is_loop_automation(existing) {
                     bail!(
                         "automation '{}' already exists but is not a Loop automation",
                         template.name
@@ -305,8 +306,15 @@ pub(crate) fn plan(
         function_ids: snapshot
             .functions
             .into_iter()
-            .filter(|function| function.function_type.as_deref() == Some("preprocessor"))
-            .map(|function| (function.slug, function.id))
+            .filter(|function| {
+                function
+                    .function_type
+                    .as_ref()
+                    .and_then(|v| v.as_ref())
+                    .map(|v| v.as_str())
+                    == Some("preprocessor")
+            })
+            .map(|function| (function.slug, function.id.to_string()))
             .collect(),
     })
 }
@@ -320,12 +328,39 @@ fn plan_topics_removals(
         .get_mut(selected_key)
         .expect("resolved Topics destination");
     for duplicate in duplicate_topic_maps {
-        if let Some(config) = remove_topics_functions(&selected.config, None, Some(&duplicate.id))?
+        if let Some(config) =
+            remove_topics_functions(&selected.config, None, Some(&duplicate.id.to_string()))?
         {
             selected.config = config;
         }
     }
     Ok(())
+}
+
+fn json_equivalent(left: &Value, right: &Value) -> bool {
+    match (left, right) {
+        (Value::Number(a), Value::Number(b)) => {
+            let safe = |number: &serde_json::Number| {
+                number
+                    .as_i64()
+                    .is_none_or(|v| v.unsigned_abs() <= 9_007_199_254_740_992)
+                    && number.as_u64().is_none_or(|v| v <= 9_007_199_254_740_992)
+            };
+            a == b
+                || (safe(a) && safe(b) && a.as_f64().zip(b.as_f64()).is_some_and(|(a, b)| a == b))
+        }
+        (Value::Array(a), Value::Array(b)) => {
+            a.len() == b.len() && a.iter().zip(b).all(|(a, b)| json_equivalent(a, b))
+        }
+        (Value::Object(a), Value::Object(b)) => {
+            a.len() == b.len()
+                && a.iter().all(|(key, value)| {
+                    b.get(key)
+                        .is_some_and(|other| json_equivalent(value, other))
+                })
+        }
+        _ => left == right,
+    }
 }
 
 fn functions_by_slug(functions: &[Function]) -> HashMap<&str, Vec<&Function>> {
@@ -366,14 +401,24 @@ fn checked_function_by_slug<'a>(
     let Some(functions) = functions_by_slug.get(slug) else {
         return Ok(None);
     };
-    let mut matching = functions
-        .iter()
-        .copied()
-        .filter(|function| function.function_type.as_deref() == Some(expected_type));
+    let mut matching = functions.iter().copied().filter(|function| {
+        function
+            .function_type
+            .as_ref()
+            .and_then(|v| v.as_ref())
+            .map(|v| v.as_str())
+            == Some(expected_type)
+    });
     let Some(function) = matching.next() else {
         let actual_type = functions
             .first()
-            .and_then(|function| function.function_type.as_deref())
+            .and_then(|function| {
+                function
+                    .function_type
+                    .as_ref()
+                    .and_then(|v| v.as_ref())
+                    .map(|v| v.as_str())
+            })
             .unwrap_or("unknown");
         bail!("function slug '{slug}' is occupied by a '{actual_type}' function, not a {label}");
     };
@@ -386,7 +431,7 @@ fn checked_function_by_slug<'a>(
 fn existing_topic_map<'a>(
     facet: Option<&Function>,
     topics_automations: &[&ProjectAutomation],
-    functions_by_id: &HashMap<&str, &'a Function>,
+    functions_by_id: &HashMap<String, &'a Function>,
     functions_by_slug: &HashMap<&str, Vec<&'a Function>>,
     fallback_slug: &str,
     force: bool,
@@ -394,20 +439,23 @@ fn existing_topic_map<'a>(
     if let Some(facet) = facet {
         let mut matches = BTreeMap::new();
         for automation in topics_automations {
-            for id in topic_map_ids(&automation.config) {
+            for id in automation_topic_map_ids(automation) {
                 let Some(topic_map) = functions_by_id.get(id).copied() else {
                     continue;
                 };
-                if topic_map.function_type.as_deref() == Some("classifier")
-                    && topic_map
-                        .function_data
-                        .as_ref()
-                        .and_then(|data| data.get("type"))
-                        .and_then(Value::as_str)
-                        == Some("topic_map")
+                if topic_map
+                    .function_type
+                    .as_ref()
+                    .and_then(|v| v.as_ref())
+                    .map(|v| v.as_str())
+                    == Some("classifier")
+                    && matches!(
+                        topic_map.function_data,
+                        braintrust_api_client::types::FunctionData::TopicMap(_)
+                    )
                     && topic_map_matches(topic_map, facet)
                 {
-                    matches.insert(topic_map.id.as_str(), topic_map);
+                    matches.insert(topic_map.id.to_string(), topic_map);
                 }
             }
         }
@@ -463,7 +511,9 @@ fn resolve_topics_target(
         }
         let matches = all_automations
             .iter()
-            .filter(|automation| automation.id == selector || automation.name == selector)
+            .filter(|automation| {
+                automation.id.to_string() == selector || automation.name == selector
+            })
             .collect::<Vec<_>>();
         let automation = match matches.as_slice() {
             [] => bail!(
@@ -474,16 +524,16 @@ fn resolve_topics_target(
                 "--topics-automation '{selector}' is ambiguous; use the exact automation ID"
             ),
         };
-        if !is_topics(&automation.config) {
+        if !is_topics_automation(automation) {
             bail!("automation '{selector}' is not a Topics automation");
         }
-        return Ok(TopicsTarget::Existing(automation.clone()));
+        return Ok(TopicsTarget::Existing(Box::new(automation.clone())));
     }
 
     if let Some(name) = facet.topics_automation.as_deref() {
         return match by_name.get(name).copied() {
-            Some(automation) if is_topics(&automation.config) => {
-                Ok(TopicsTarget::Existing(automation.clone()))
+            Some(automation) if is_topics_automation(automation) => {
+                Ok(TopicsTarget::Existing(Box::new(automation.clone())))
             }
             Some(_) => bail!(
                 "automation '{name}' exists but is not a Topics automation; use a different mapping"
@@ -493,7 +543,7 @@ fn resolve_topics_target(
     }
 
     match topics_automations {
-        [automation] => Ok(TopicsTarget::Existing((*automation).clone())),
+        [automation] => Ok(TopicsTarget::Existing(Box::new((*automation).clone()))),
         [] => bail!(
             "no Topics automation can be inferred for facet '{}'; use --topics-automation <NAME_OR_ID>",
             facet.name
@@ -524,7 +574,7 @@ pub(crate) async fn execute(
         let pushed = upsert_function(client, &request, mutation.existing.is_some())
             .await
             .with_context(|| format!("failed to push preprocessor '{}'", mutation.template.slug))?;
-        plan.function_ids.insert(pushed.slug, pushed.id);
+        plan.function_ids.insert(pushed.slug, pushed.id.to_string());
     }
 
     let mut topic_functions: BTreeMap<String, Vec<(String, String)>> = BTreeMap::new();
@@ -549,8 +599,11 @@ pub(crate) async fn execute(
 
         let topic_map = match &mutation.topic_map {
             Some(existing) => {
-                let request =
-                    reconciled_topic_map_request(existing, &mutation.template, &facet.id)?;
+                let request = reconciled_topic_map_request(
+                    existing,
+                    &mutation.template,
+                    &facet.id.to_string(),
+                )?;
                 replace_function(client, &request)
                     .await
                     .with_context(|| format!("failed to reconcile topic map '{}'", existing.slug))?
@@ -561,8 +614,12 @@ pub(crate) async fn execute(
                     .get(&mutation.topics_key)
                     .expect("facet Topics plan exists")
                     .embedding_model;
-                let request =
-                    new_topic_map_request(project_id, &mutation.template, &facet.id, model);
+                let request = new_topic_map_request(
+                    project_id,
+                    &mutation.template,
+                    &facet.id.to_string(),
+                    model,
+                );
                 create_function(client, &request).await.with_context(|| {
                     format!(
                         "failed to create topic map '{}'",
@@ -574,9 +631,9 @@ pub(crate) async fn execute(
         topic_functions
             .entry(mutation.topics_key.clone())
             .or_default()
-            .push((facet.id.clone(), topic_map.id));
+            .push((facet.id.to_string(), topic_map.id.to_string()));
         pushed_facets.push(PushedResource {
-            id: facet.id,
+            id: facet.id.to_string(),
             name: facet.name,
             slug: Some(facet.slug),
         });
@@ -595,7 +652,7 @@ pub(crate) async fn execute(
                     "description": mutation.description,
                     "config": config,
                 });
-                patch_project_automation(client, &automation.id, &body)
+                patch_project_automation(client, &automation.id.to_string(), &body)
                     .await
                     .with_context(|| {
                         format!("failed to update Topics automation '{}'", automation.name)
@@ -620,8 +677,12 @@ pub(crate) async fn execute(
 
     let mut pushed_loops = Vec::with_capacity(plan.loops.len());
     for mutation in &plan.loops {
-        let existing_config = mutation.existing.as_ref().map(|row| &row.config);
-        let config = loop_config_for_target(&mutation.template.config, existing_config)?;
+        let existing_config = mutation
+            .existing
+            .as_ref()
+            .map(|row| serde_json::to_value(&row.config))
+            .transpose()?;
+        let config = loop_config_for_target(&mutation.template.config, existing_config.as_ref())?;
         let pushed = if mutation.existing.is_some() {
             let body = json!({
                 "project_id": project_id,
@@ -654,7 +715,7 @@ pub(crate) async fn execute(
                 })?
         };
         pushed_loops.push(PushedResource {
-            id: pushed.id,
+            id: pushed.id.to_string(),
             name: pushed.name,
             slug: None,
         });
@@ -678,6 +739,66 @@ async fn upsert_function(client: &ApiClient, request: &Value, replace: bool) -> 
 #[cfg(test)]
 mod tests {
     use super::*;
+    fn test_id(value: &str) -> uuid::Uuid {
+        use std::hash::{Hash, Hasher};
+        if let Ok(id) = value.parse() {
+            return id;
+        }
+        let mut hash = std::collections::hash_map::DefaultHasher::new();
+        value.hash(&mut hash);
+        uuid::Uuid::from_u128(hash.finish() as u128)
+    }
+    fn test_automation_config(
+        mut config: Value,
+    ) -> braintrust_api_client::types::ProjectAutomationConfig {
+        if let Some(map) = config.as_object_mut() {
+            if map.get("event_type").and_then(Value::as_str) == Some("topic") {
+                map.entry("sampling_rate").or_insert(json!(1.0));
+                map.entry("facet_functions").or_insert(json!([]));
+                map.entry("topic_map_functions").or_insert(json!([]));
+            }
+        }
+        serde_json::from_value(config).expect("valid automation config")
+    }
+    fn set_automation_field(automation: &mut ProjectAutomation, key: &str, value: Value) {
+        let mut config = serde_json::to_value(&automation.config).unwrap();
+        config[key] = value;
+        automation.config = test_automation_config(config);
+    }
+    fn test_function_data(mut data: Value) -> braintrust_api_client::types::FunctionData {
+        if let Some(map) = data.as_object_mut() {
+            match map.get("type").and_then(Value::as_str) {
+                Some("topic_map") => {
+                    map.entry("source_facet").or_insert(json!("test-facet"));
+                    map.entry("embedding_model").or_insert(json!("test-model"));
+                    if let Some(settings) = map
+                        .get_mut("generation_settings")
+                        .and_then(Value::as_object_mut)
+                    {
+                        settings.entry("algorithm").or_insert(json!("hdbscan"));
+                        settings
+                            .entry("dimension_reduction")
+                            .or_insert(json!("umap"));
+                    }
+                }
+                Some("facet") => {
+                    map.entry("prompt").or_insert(json!("Classify this trace"));
+                }
+                Some("code") => {
+                    let data = map
+                        .entry("data")
+                        .or_insert(json!({"type":"inline", "code":"return input"}));
+                    if let Some(data) = data.as_object_mut() {
+                        data.entry("runtime_context")
+                            .or_insert(json!({"runtime":"node", "version":"20"}));
+                    }
+                }
+                _ => {}
+            }
+        }
+        serde_json::from_value(data).expect("valid function data")
+    }
+
     use crate::observability::template::{deduplicate_preprocessors, validate, KIND};
 
     fn facet(topics: Option<&str>) -> FacetTemplate {
@@ -706,33 +827,39 @@ mod tests {
 
     fn automation(id: &str, name: &str, event_type: &str) -> ProjectAutomation {
         ProjectAutomation {
-            id: id.to_string(),
-            project_id: "test-project-id".to_string(),
+            id: test_id(id),
+            project_id: uuid::Uuid::nil(),
             name: name.to_string(),
             description: None,
-            config: json!({
+            created: None,
+            runtime_block: None,
+            user_id: None,
+            config: test_automation_config(json!({
                 "event_type": event_type,
                 "facet_functions": [],
                 "topic_map_functions": []
-            }),
+            })),
         }
     }
 
     fn existing_function(slug: &str, function_type: &str, data_type: &str) -> Function {
         Function {
-            id: format!("fn-{slug}"),
+            id: test_id(&format!("fn-{slug}")),
             name: slug.to_string(),
             slug: slug.to_string(),
-            project_id: "test-project-id".to_string(),
+            project_id: uuid::Uuid::nil(),
             description: None,
-            function_type: Some(function_type.to_string()),
+            function_type: Some(Some(serde_json::from_value(json!(function_type)).unwrap())),
             prompt_data: None,
-            function_data: Some(json!({"type": data_type})),
+            function_data: test_function_data(json!({"type": data_type})),
             tags: None,
             function_schema: None,
             metadata: None,
             created: None,
-            _xact_id: None,
+            xact_id: "1".into(),
+            log_id: Default::default(),
+            org_id: uuid::Uuid::nil(),
+            origin: None,
         }
     }
 
@@ -753,7 +880,7 @@ mod tests {
 
     #[test]
     fn active_observability_plans_topics_selection_rules() {
-        let only = automation("auto-topics", "Topics", "topic");
+        let only = automation("9eadb6b9-8bd2-5c47-8e06-680f35119f70", "Topics", "topic");
         let inferred = plan(
             &template(facet(None)),
             Snapshot {
@@ -764,7 +891,9 @@ mod tests {
             false,
         )
         .expect("single Topics automation");
-        assert!(inferred.topics.contains_key("id:auto-topics"));
+        assert!(inferred
+            .topics
+            .contains_key("id:9eadb6b9-8bd2-5c47-8e06-680f35119f70"));
 
         let missing = plan(
             &template(facet(None)),
@@ -782,7 +911,10 @@ mod tests {
             &template(facet(None)),
             Snapshot {
                 functions: vec![],
-                automations: vec![only.clone(), automation("auto-other", "Other", "topic")],
+                automations: vec![
+                    only.clone(),
+                    automation("fbac4484-8efd-5502-9fcc-a63bacfe12ee", "Other", "topic"),
+                ],
             },
             None,
             false,
@@ -794,13 +926,18 @@ mod tests {
             &template(facet(None)),
             Snapshot {
                 functions: vec![],
-                automations: vec![only, automation("auto-other", "Other", "topic")],
+                automations: vec![
+                    only,
+                    automation("fbac4484-8efd-5502-9fcc-a63bacfe12ee", "Other", "topic"),
+                ],
             },
-            Some("auto-other"),
+            Some("fbac4484-8efd-5502-9fcc-a63bacfe12ee"),
             false,
         )
         .expect("CLI override");
-        assert!(selected.topics.contains_key("id:auto-other"));
+        assert!(selected
+            .topics
+            .contains_key("id:fbac4484-8efd-5502-9fcc-a63bacfe12ee"));
     }
 
     #[test]
@@ -857,7 +994,11 @@ mod tests {
             &source,
             Snapshot {
                 functions: Vec::new(),
-                automations: vec![automation("auto-topics", "Topics", "topic")],
+                automations: vec![automation(
+                    "9eadb6b9-8bd2-5c47-8e06-680f35119f70",
+                    "Topics",
+                    "topic",
+                )],
             },
             None,
             false,
@@ -871,26 +1012,38 @@ mod tests {
     #[test]
     fn active_observability_preserves_other_automation_bindings() {
         let mut existing_facet = existing_function("test-facet", "facet", "facet");
-        existing_facet.id = "fn-existing-facet".to_string();
+        existing_facet.id = test_id("5f9f07dd-42b8-5f69-8eed-a8638e1b900d");
         let mut existing_topic_map = existing_function("test-facet", "classifier", "topic_map");
-        existing_topic_map.id = "fn-existing-topic-map".to_string();
-        existing_topic_map.function_data = Some(json!({
+        existing_topic_map.id = test_id("25b19838-1a88-54f9-9fec-be7c99188c7d");
+        existing_topic_map.function_data = test_function_data(json!({
             "type": "topic_map",
             "source_facet": "Test facet",
             "source_facet_function": {
                 "type": "function",
-                "id": "fn-existing-facet"
+                "id": "5f9f07dd-42b8-5f69-8eed-a8638e1b900d"
             }
         }));
-        let mut previous = automation("auto-previous", "Previous Topics", "topic");
-        previous.config["facet_functions"] = json!([
-            {"type": "function", "id": "fn-existing-facet"},
-            {"type": "function", "id": "fn-unrelated-facet"}
-        ]);
-        previous.config["topic_map_functions"] = json!([
-            {"function": {"type": "function", "id": "fn-existing-topic-map"}},
-            {"function": {"type": "function", "id": "fn-unrelated-topic-map"}}
-        ]);
+        let mut previous = automation(
+            "7aa21a3b-b554-5230-a800-92d43517e9dc",
+            "Previous Topics",
+            "topic",
+        );
+        set_automation_field(
+            &mut previous,
+            "facet_functions",
+            json!([
+                {"type": "function", "id": "5f9f07dd-42b8-5f69-8eed-a8638e1b900d"},
+                {"type": "function", "id": "a02c9d63-bb96-51ad-8e38-e0bcb1eaaee7"}
+            ]),
+        );
+        set_automation_field(
+            &mut previous,
+            "topic_map_functions",
+            json!([
+                {"function": {"type": "function", "id": "25b19838-1a88-54f9-9fec-be7c99188c7d"}},
+                {"function": {"type": "function", "id": "5ed6e37c-d797-5da7-b442-e31b4562028f"}}
+            ]),
+        );
 
         let planned = plan(
             &template(facet(Some("Destination Topics"))),
@@ -898,7 +1051,11 @@ mod tests {
                 functions: vec![existing_facet, existing_topic_map],
                 automations: vec![
                     previous,
-                    automation("auto-destination", "Destination Topics", "topic"),
+                    automation(
+                        "ee159b4d-a7d2-5080-a04f-1c8d7934cffc",
+                        "Destination Topics",
+                        "topic",
+                    ),
                 ],
             },
             None,
@@ -907,46 +1064,66 @@ mod tests {
         .expect("existing topic map is found through Topics wiring");
 
         assert!(planned.facets[0].topic_map.is_none());
-        assert!(!planned.topics.contains_key("id:auto-previous"));
-        assert!(planned.topics.contains_key("id:auto-destination"));
+        assert!(!planned
+            .topics
+            .contains_key("id:7aa21a3b-b554-5230-a800-92d43517e9dc"));
+        assert!(planned
+            .topics
+            .contains_key("id:ee159b4d-a7d2-5080-a04f-1c8d7934cffc"));
     }
 
     #[test]
     fn active_observability_force_repairs_duplicate_topic_map_wiring() {
         let mut existing_facet = existing_function("test-facet", "facet", "facet");
-        existing_facet.id = "fn-existing-facet".to_string();
+        existing_facet.id = test_id("5f9f07dd-42b8-5f69-8eed-a8638e1b900d");
 
         let mut original_topic_map =
             existing_function("legacy-test-topic-map", "classifier", "topic_map");
-        original_topic_map.id = "fn-original-topic-map".to_string();
-        original_topic_map.created = Some("2026-01-01T00:00:00Z".to_string());
-        original_topic_map.function_data = Some(json!({
+        original_topic_map.id = test_id("ee9d6299-33a8-549d-b1c8-ab903b383483");
+        original_topic_map.created = Some(Some(
+            chrono::DateTime::parse_from_rfc3339("2026-01-01T00:00:00Z")
+                .unwrap()
+                .with_timezone(&chrono::Utc),
+        ));
+        original_topic_map.function_data = test_function_data(json!({
             "type": "topic_map",
             "source_facet_function": {
                 "type": "function",
-                "id": "fn-existing-facet"
+                "id": "5f9f07dd-42b8-5f69-8eed-a8638e1b900d"
             },
-            "generation_settings": {"max_topics": 12}
+            "generation_settings": {"n_clusters": 12}
         }));
 
         let mut duplicate_topic_map =
             existing_function("test-facet-topic-map", "classifier", "topic_map");
-        duplicate_topic_map.id = "fn-duplicate-topic-map".to_string();
-        duplicate_topic_map.created = Some("2026-02-01T00:00:00Z".to_string());
-        duplicate_topic_map.function_data = Some(json!({
+        duplicate_topic_map.id = test_id("0e77aa07-f172-51a0-9c66-8ecf0d82ab06");
+        duplicate_topic_map.created = Some(Some(
+            chrono::DateTime::parse_from_rfc3339("2026-02-01T00:00:00Z")
+                .unwrap()
+                .with_timezone(&chrono::Utc),
+        ));
+        duplicate_topic_map.function_data = test_function_data(json!({
             "type": "topic_map",
             "source_facet_function": {
                 "type": "function",
-                "id": "fn-existing-facet"
+                "id": "5f9f07dd-42b8-5f69-8eed-a8638e1b900d"
             }
         }));
 
-        let mut topics = automation("auto-topics", "Topics", "topic");
-        topics.config["facet_functions"] = json!([{"type": "function", "id": "fn-existing-facet"}]);
-        topics.config["topic_map_functions"] = json!([
-            {"function": {"type": "function", "id": "fn-original-topic-map"}},
-            {"function": {"type": "function", "id": "fn-duplicate-topic-map"}}
-        ]);
+        let mut topics = automation("9eadb6b9-8bd2-5c47-8e06-680f35119f70", "Topics", "topic");
+        set_automation_field(
+            &mut topics,
+            "facet_functions",
+            json!([{"type": "function", "id": "5f9f07dd-42b8-5f69-8eed-a8638e1b900d"}]),
+        );
+        set_automation_field(
+            &mut topics,
+            "topic_map_functions",
+            json!([
+                {"function": {"type": "function", "id": "ee9d6299-33a8-549d-b1c8-ab903b383483"}},
+                {"function": {"type": "function", "id": "0e77aa07-f172-51a0-9c66-8ecf0d82ab06"}}
+            ]),
+        );
 
         let planned = plan(
             &template(facet(Some("Topics"))),
@@ -963,13 +1140,19 @@ mod tests {
             .topic_map
             .as_ref()
             .expect("template map is retained");
-        assert_eq!(selected.id, "fn-duplicate-topic-map");
-        assert_eq!(planned.detached_topic_maps.len(), 1);
-        assert_eq!(planned.detached_topic_maps[0].id, "fn-original-topic-map");
         assert_eq!(
-            planned.topics["id:auto-topics"].config["topic_map_functions"],
+            selected.id.to_string(),
+            "0e77aa07-f172-51a0-9c66-8ecf0d82ab06"
+        );
+        assert_eq!(planned.detached_topic_maps.len(), 1);
+        assert_eq!(
+            planned.detached_topic_maps[0].id,
+            "ee9d6299-33a8-549d-b1c8-ab903b383483"
+        );
+        assert_eq!(
+            planned.topics["id:9eadb6b9-8bd2-5c47-8e06-680f35119f70"].config["topic_map_functions"],
             json!([
-                {"function": {"type": "function", "id": "fn-duplicate-topic-map"}}
+                {"function": {"type": "function", "id": "0e77aa07-f172-51a0-9c66-8ecf0d82ab06"}}
             ])
         );
     }
@@ -980,7 +1163,11 @@ mod tests {
             &template(facet(Some("Topics"))),
             Snapshot {
                 functions: vec![existing_function("test-facet", "tool", "code")],
-                automations: vec![automation("auto-topics", "Topics", "topic")],
+                automations: vec![automation(
+                    "9eadb6b9-8bd2-5c47-8e06-680f35119f70",
+                    "Topics",
+                    "topic",
+                )],
             },
             None,
             true,
@@ -995,7 +1182,11 @@ mod tests {
             &template(facet(Some("Topics"))),
             Snapshot {
                 functions: vec![existing_function("test-facet", "facet", "facet")],
-                automations: vec![automation("auto-topics", "Topics", "topic")],
+                automations: vec![automation(
+                    "9eadb6b9-8bd2-5c47-8e06-680f35119f70",
+                    "Topics",
+                    "topic",
+                )],
             },
             None,
             false,
@@ -1020,7 +1211,11 @@ mod tests {
             },
             Snapshot {
                 functions: vec![],
-                automations: vec![automation("auto-test", "Test automation", "topic")],
+                automations: vec![automation(
+                    "3ccdd03d-e7c0-5843-9bba-bc658796f6e6",
+                    "Test automation",
+                    "topic",
+                )],
             },
             None,
             true,
@@ -1050,20 +1245,37 @@ mod tests {
         let settings = &expected.topics_automations[0];
         let source_facet = existing_function("test-facet", "facet", "facet");
         let mut source_map = existing_function("test-facet-topic-map", "classifier", "topic_map");
-        source_map.function_data = Some(
+        source_map.function_data = test_function_data(
             json!({"type":"topic_map", "source_facet_function":{"type":"function", "id":source_facet.id}}),
         );
-        let mut remote = automation("test-source-automation", &settings.name, "topic");
-        remote.description = settings.description.clone();
-        remote.config = add_topics_functions(
-            &topics_config_for_target(&settings.config, &json!({})).unwrap(),
-            &[(source_facet.id.clone(), source_map.id.clone())],
-        )
-        .unwrap();
+        let mut remote = automation(
+            "2ef70f95-bd88-59b9-af74-50f422e75226",
+            &settings.name,
+            "topic",
+        );
+        remote.description = Some(settings.description.clone());
+        remote.config = test_automation_config(
+            add_topics_functions(
+                &topics_config_for_target(&settings.config, &json!({})).unwrap(),
+                &[(source_facet.id.to_string(), source_map.id.to_string())],
+            )
+            .unwrap(),
+        );
         let pulled = from_remote(&[source_facet, source_map], &[remote]).unwrap();
         let source = serde_json::from_str(&serde_json::to_string(&pulled).unwrap()).unwrap();
         validate(&source).unwrap();
-        assert_eq!(source.topics_automations, expected.topics_automations);
+        assert_eq!(
+            source.topics_automations.len(),
+            expected.topics_automations.len()
+        );
+        assert!(json_equivalent(
+            &source.topics_automations[0].config,
+            &expected.topics_automations[0].config
+        ));
+        assert_eq!(
+            source.topics_automations[0].description,
+            expected.topics_automations[0].description
+        );
         let planned = plan(
             &source,
             Snapshot {
@@ -1075,19 +1287,39 @@ mod tests {
         )
         .unwrap();
         let mutation = &planned.topics["new:Test scoped Topics"];
-        assert_eq!(topics_settings(&mutation.config).unwrap(), settings.config);
+        assert!(json_equivalent(
+            &topics_settings(&mutation.config).unwrap(),
+            &settings.config
+        ));
         assert_eq!(mutation.description, settings.description);
         assert_eq!(mutation.config["facet_functions"], json!([]));
         assert_eq!(mutation.config["topic_map_functions"], json!([]));
     }
 
     #[test]
+    fn numeric_config_comparison_accepts_equal_integer_and_float_without_rounding_large_values() {
+        assert!(json_equivalent(
+            &json!({"values": [1, 86400]}),
+            &json!({"values": [1.0, 86400.0]})
+        ));
+        assert!(!json_equivalent(
+            &json!({"value": 9_007_199_254_740_993u64}),
+            &json!({"value": 9_007_199_254_740_992.0})
+        ));
+    }
+
+    #[test]
     fn active_observability_v2_matching_settings_do_not_require_force() {
         let source = scoped_template();
         let settings = &source.topics_automations[0];
-        let mut existing = automation("test-existing-automation", &settings.name, "topic");
-        existing.config = topics_config_for_target(&settings.config, &json!({})).unwrap();
-        existing.description = settings.description.clone();
+        let mut existing = automation(
+            "b40d851c-6199-55a0-ae7b-49540f471aa1",
+            &settings.name,
+            "topic",
+        );
+        existing.config =
+            test_automation_config(topics_config_for_target(&settings.config, &json!({})).unwrap());
+        existing.description = Some(settings.description.clone());
         let planned = plan(
             &source,
             Snapshot {
@@ -1098,13 +1330,13 @@ mod tests {
             false,
         )
         .unwrap();
+        assert!(json_equivalent(
+            &planned.topics["id:b40d851c-6199-55a0-ae7b-49540f471aa1"].config,
+            &serde_json::to_value(&existing.config).unwrap()
+        ));
         assert_eq!(
-            planned.topics["id:test-existing-automation"].config,
-            existing.config
-        );
-        assert_eq!(
-            planned.topics["id:test-existing-automation"].description,
-            existing.description
+            planned.topics["id:b40d851c-6199-55a0-ae7b-49540f471aa1"].description,
+            existing.description.clone().flatten()
         );
     }
 
@@ -1112,17 +1344,23 @@ mod tests {
     fn active_observability_v2_differing_settings_require_force_and_keep_wiring() {
         let mut source = scoped_template();
         source.topics_automations[0].description = None;
-        let mut existing = automation("test-existing-automation", "Test scoped Topics", "topic");
-        existing.description = Some("Test destination description".to_string());
-        existing.config = add_topics_functions(
-            &default_topics_config(),
-            &[(
-                "fn-test-other-facet".to_string(),
-                "fn-test-other-map".to_string(),
-            )],
-        )
-        .unwrap();
-        existing.config["test_destination_only"] = json!(true);
+        let mut existing = automation(
+            "b40d851c-6199-55a0-ae7b-49540f471aa1",
+            "Test scoped Topics",
+            "topic",
+        );
+        existing.description = Some(Some("Test destination description".to_string()));
+        existing.config = test_automation_config(
+            add_topics_functions(
+                &default_topics_config(),
+                &[(
+                    "db44faba-c265-5e33-b01b-1c2e9f050e0f".to_string(),
+                    "6b015af7-d7b8-5ff9-b9b7-d3029c6dfe7e".to_string(),
+                )],
+            )
+            .unwrap(),
+        );
+        set_automation_field(&mut existing, "test_destination_only", json!(true));
         let snapshot = || Snapshot {
             functions: vec![],
             automations: vec![existing.clone()],
@@ -1132,18 +1370,18 @@ mod tests {
             .to_string()
             .contains("--force"));
         let planned = plan(&source, snapshot(), None, true).unwrap();
-        let mutation = &planned.topics["id:test-existing-automation"];
+        let mutation = &planned.topics["id:b40d851c-6199-55a0-ae7b-49540f471aa1"];
         assert_eq!(
             topics_settings(&mutation.config).unwrap(),
             source.topics_automations[0].config
         );
         assert_eq!(
             mutation.config["facet_functions"],
-            existing.config["facet_functions"]
+            serde_json::to_value(&existing.config).unwrap()["facet_functions"]
         );
         assert_eq!(
             mutation.config["topic_map_functions"],
-            existing.config["topic_map_functions"]
+            serde_json::to_value(&existing.config).unwrap()["topic_map_functions"]
         );
         assert!(mutation.description.is_none());
     }
@@ -1155,7 +1393,7 @@ mod tests {
             json!({"type":"experiment", "experiment_id":"test-experiment-id"});
         source.topics_automations[0].config["backfill_time_range"] = json!("server-owned-value");
         let existing = automation(
-            "test-destination-automation",
+            "52e8e135-e382-5559-9bf7-dd86545b79ec",
             "Test destination Topics",
             "topic",
         );
@@ -1165,14 +1403,17 @@ mod tests {
                 functions: vec![],
                 automations: vec![existing.clone()],
             },
-            Some("test-destination-automation"),
+            Some("52e8e135-e382-5559-9bf7-dd86545b79ec"),
             false,
         )
         .unwrap();
         assert_eq!(planned.topics.len(), 1);
-        let mutation = &planned.topics["id:test-destination-automation"];
-        assert_eq!(mutation.config, existing.config);
-        assert_eq!(mutation.description, existing.description);
+        let mutation = &planned.topics["id:52e8e135-e382-5559-9bf7-dd86545b79ec"];
+        assert_eq!(
+            mutation.config,
+            serde_json::to_value(&existing.config).unwrap()
+        );
+        assert_eq!(mutation.description, existing.description.clone().flatten());
     }
 
     #[tokio::test]
@@ -1248,12 +1489,12 @@ mod tests {
         let mut source = scoped_template();
         source.topics_automations[0].description = None;
         let mut facet = existing_function("test-facet", "facet", "facet");
-        facet.project_id = "00000000-0000-4000-8000-000000000024".into();
-        facet.id = "00000000-0000-4000-8000-000000000021".to_string();
+        facet.project_id = test_id("00000000-0000-4000-8000-000000000024");
+        facet.id = test_id("00000000-0000-4000-8000-000000000021");
         let mut map = existing_function("test-facet-topic-map", "classifier", "topic_map");
-        map.project_id = "00000000-0000-4000-8000-000000000024".into();
-        map.id = "00000000-0000-4000-8000-000000000022".to_string();
-        map.function_data = Some(
+        map.project_id = test_id("00000000-0000-4000-8000-000000000024");
+        map.id = test_id("00000000-0000-4000-8000-000000000022");
+        map.function_data = test_function_data(
             json!({"type": "topic_map", "source_facet":"test-facet", "embedding_model":"test-embedding-model", "source_facet_function": {"type": "function", "id": facet.id}}),
         );
         let mut automation = automation(
@@ -1261,11 +1502,15 @@ mod tests {
             "Test scoped Topics",
             "topic",
         );
-        automation.project_id = "00000000-0000-4000-8000-000000000024".into();
-        automation.description = Some("Test old description".to_string());
-        automation.config =
-            add_topics_functions(&automation.config, &[(facet.id.clone(), map.id.clone())])
-                .unwrap();
+        automation.project_id = test_id("00000000-0000-4000-8000-000000000024");
+        automation.description = Some(Some("Test old description".to_string()));
+        automation.config = test_automation_config(
+            add_topics_functions(
+                &serde_json::to_value(&automation.config).unwrap(),
+                &[(facet.id.to_string(), map.id.to_string())],
+            )
+            .unwrap(),
+        );
         let planned = plan(
             &source,
             Snapshot {

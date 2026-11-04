@@ -405,12 +405,6 @@ struct NamedObject {
     name: String,
 }
 
-#[derive(Debug, Clone, Deserialize)]
-struct CreatedDataset {
-    id: String,
-    name: String,
-}
-
 #[derive(Debug, Clone)]
 struct InteractiveChoice {
     label: String,
@@ -3053,7 +3047,8 @@ async fn resolve_pull_object_ref(
         object_ref: format!("project_logs:{}", project.id),
     }];
 
-    match list_project_named_objects(client, ObjectType::Experiment, &project.id).await {
+    match list_project_named_objects(client, ObjectType::Experiment, &project.id.to_string()).await
+    {
         Ok(mut experiments) => {
             experiments.sort_by(|a, b| a.name.cmp(&b.name));
             choices.extend(experiments.into_iter().map(|obj| InteractiveChoice {
@@ -3067,7 +3062,7 @@ async fn resolve_pull_object_ref(
         ),
     }
 
-    match list_project_named_objects(client, ObjectType::Dataset, &project.id).await {
+    match list_project_named_objects(client, ObjectType::Dataset, &project.id.to_string()).await {
         Ok(mut datasets) => {
             datasets.sort_by(|a, b| a.name.cmp(&b.name));
             choices.extend(datasets.into_iter().map(|obj| InteractiveChoice {
@@ -3114,12 +3109,12 @@ async fn resolve_destination(
                 resolve_project_logs_target(client, requested.object_name.trim(), mode).await?;
             let object = ObjectRef {
                 object_type: ObjectType::ProjectLogs,
-                object_name: project.id.clone(),
+                object_name: project.id.to_string(),
             };
             Ok(ResolvedDestination {
                 object_ref: format!("project_logs:{}", project.id),
                 object,
-                project_id: project.id.clone(),
+                project_id: project.id.to_string(),
                 project_name: project.name.clone(),
                 object_name: project.name,
                 run_id: None,
@@ -3230,7 +3225,8 @@ async fn resolve_named_object_target(
 
     if let Some(project_selector) = project_selector {
         let project = find_project_by_selector(&projects, project_selector)?;
-        let objects = list_project_named_objects(client, object_type, &project.id).await?;
+        let objects =
+            list_project_named_objects(client, object_type, &project.id.to_string()).await?;
         let object = find_named_object_by_selector(
             &objects,
             object_selector,
@@ -3240,13 +3236,13 @@ async fn resolve_named_object_target(
         return Ok(ResolvedNamedObjectTarget {
             object_id: object.id.clone(),
             object_name: object.name.clone(),
-            project_id: project.id.clone(),
+            project_id: project.id.to_string(),
             project_name: project.name.clone(),
         });
     }
 
     for project in &projects {
-        let objects = list_project_named_objects(client, object_type, &project.id)
+        let objects = list_project_named_objects(client, object_type, &project.id.to_string())
             .await
             .with_context(|| {
                 format!(
@@ -3258,7 +3254,7 @@ async fn resolve_named_object_target(
             return Ok(ResolvedNamedObjectTarget {
                 object_id: object.id.clone(),
                 object_name: object.name.clone(),
-                project_id: project.id.clone(),
+                project_id: project.id.to_string(),
                 project_name: project.name.clone(),
             });
         }
@@ -3300,7 +3296,8 @@ async fn resolve_push_experiment_target(
         .await
         .with_context(|| format!("project '{project_selector}' not found"))?;
 
-    let objects = list_project_named_objects(client, ObjectType::Experiment, &project.id).await?;
+    let objects =
+        list_project_named_objects(client, ObjectType::Experiment, &project.id.to_string()).await?;
     if let Ok(object) = find_named_object_by_selector(
         &objects,
         experiment_selector,
@@ -3310,7 +3307,7 @@ async fn resolve_push_experiment_target(
         return Ok(ResolvedNamedObjectTarget {
             object_id: object.id.clone(),
             object_name: object.name.clone(),
-            project_id: project.id.clone(),
+            project_id: project.id.to_string(),
             project_name: project.name.clone(),
         });
     }
@@ -3323,7 +3320,7 @@ async fn resolve_push_experiment_target(
         );
     }
 
-    let created = create_experiment(client, &project.id, experiment_selector)
+    let created = create_experiment(client, &project.id.to_string(), experiment_selector)
         .await
         .with_context(|| {
             format!("experiment '{experiment_selector}' not found, and creating it failed")
@@ -3337,9 +3334,9 @@ async fn resolve_push_experiment_target(
     }
 
     Ok(ResolvedNamedObjectTarget {
-        object_id: created.id,
+        object_id: created.id.to_string(),
         object_name: created.name,
-        project_id: project.id,
+        project_id: project.id.to_string(),
         project_name: project.name,
     })
 }
@@ -3367,7 +3364,8 @@ async fn resolve_push_dataset_target(
         .await
         .with_context(|| format!("project '{project_selector}' not found"))?;
 
-    let objects = list_project_named_objects(client, ObjectType::Dataset, &project.id).await?;
+    let objects =
+        list_project_named_objects(client, ObjectType::Dataset, &project.id.to_string()).await?;
     if let Ok(object) = find_named_object_by_selector(
         &objects,
         dataset_selector,
@@ -3377,7 +3375,7 @@ async fn resolve_push_dataset_target(
         return Ok(ResolvedNamedObjectTarget {
             object_id: object.id.clone(),
             object_name: object.name.clone(),
-            project_id: project.id.clone(),
+            project_id: project.id.to_string(),
             project_name: project.name.clone(),
         });
     }
@@ -3390,7 +3388,7 @@ async fn resolve_push_dataset_target(
         );
     }
 
-    let created = create_dataset(client, &project.id, dataset_selector)
+    let created = create_dataset(client, &project.id.to_string(), dataset_selector)
         .await
         .with_context(|| {
             format!("dataset '{dataset_selector}' not found, and creating it failed")
@@ -3404,9 +3402,9 @@ async fn resolve_push_dataset_target(
     }
 
     Ok(ResolvedNamedObjectTarget {
-        object_id: created.id,
+        object_id: created.id.to_string(),
         object_name: created.name,
-        project_id: project.id,
+        project_id: project.id.to_string(),
         project_name: project.name,
     })
 }
@@ -3415,10 +3413,8 @@ async fn create_dataset(
     client: &ApiClient,
     project_id: &str,
     name: &str,
-) -> Result<CreatedDataset> {
-    crate::http::from_api(
-        crate::datasets::api::create_dataset(client, project_id, name, None).await?,
-    )
+) -> Result<crate::datasets::api::Dataset> {
+    crate::datasets::api::create_dataset(client, project_id, name, None).await
 }
 
 async fn list_project_named_objects(
@@ -3426,15 +3422,28 @@ async fn list_project_named_objects(
     object_type: ObjectType,
     project_id: &str,
 ) -> Result<Vec<NamedObject>> {
-    match object_type {
-        ObjectType::Dataset => {
-            crate::http::from_api(crate::datasets::api::list_datasets(client, project_id).await?)
+    let objects = match object_type {
+        ObjectType::Dataset => crate::datasets::api::list_datasets(client, project_id)
+            .await?
+            .into_iter()
+            .map(|object| NamedObject {
+                id: object.id.to_string(),
+                name: object.name,
+            })
+            .collect(),
+        ObjectType::Experiment => {
+            crate::experiments::api::list_experiments_by_project_id(client, project_id)
+                .await?
+                .into_iter()
+                .map(|object| NamedObject {
+                    id: object.id.to_string(),
+                    name: object.name,
+                })
+                .collect()
         }
-        ObjectType::Experiment => crate::http::from_api(
-            crate::experiments::api::list_experiments_by_project_id(client, project_id).await?,
-        ),
         ObjectType::ProjectLogs => anyhow::bail!("project logs do not have named child objects"),
-    }
+    };
+    Ok(objects)
 }
 
 async fn resolve_push_destination(
@@ -3465,7 +3474,9 @@ fn find_project_by_selector<'a>(projects: &'a [Project], selector: &str) -> Resu
         bail!("project selector cannot be empty");
     }
 
-    let mut id_matches = projects.iter().filter(|project| project.id == selector);
+    let mut id_matches = projects
+        .iter()
+        .filter(|project| project.id.to_string() == selector);
     if let Some(project) = id_matches.next() {
         return Ok(project);
     }
@@ -5117,21 +5128,35 @@ mod tests {
     fn find_project_by_selector_supports_id_and_name() -> Result<()> {
         let projects = vec![
             Project {
-                id: "p1".to_string(),
+                id: "638729dd-2774-5508-826c-288c6882afc4".parse().unwrap(),
                 name: "Alpha".to_string(),
-                org_id: "o1".to_string(),
+                org_id: "f44e2da1-57d6-5667-8640-7c2a5bd965e9".parse().unwrap(),
                 description: None,
+                created: None,
+                deleted_at: None,
+                settings: None,
+                user_id: None,
             },
             Project {
-                id: "p2".to_string(),
+                id: "48785758-ab06-574d-ac64-78f6fc97396c".parse().unwrap(),
                 name: "Beta".to_string(),
-                org_id: "o1".to_string(),
+                org_id: "f44e2da1-57d6-5667-8640-7c2a5bd965e9".parse().unwrap(),
                 description: None,
+                created: None,
+                deleted_at: None,
+                settings: None,
+                user_id: None,
             },
         ];
 
-        assert_eq!(find_project_by_selector(&projects, "p1")?.name, "Alpha");
-        assert_eq!(find_project_by_selector(&projects, "Beta")?.id, "p2");
+        assert_eq!(
+            find_project_by_selector(&projects, "638729dd-2774-5508-826c-288c6882afc4")?.name,
+            "Alpha"
+        );
+        assert_eq!(
+            find_project_by_selector(&projects, "Beta")?.id.to_string(),
+            "48785758-ab06-574d-ac64-78f6fc97396c"
+        );
         Ok(())
     }
 
@@ -5139,16 +5164,24 @@ mod tests {
     fn find_project_by_selector_rejects_ambiguous_casefold_match() {
         let projects = vec![
             Project {
-                id: "p1".to_string(),
+                id: "638729dd-2774-5508-826c-288c6882afc4".parse().unwrap(),
                 name: "Alpha".to_string(),
-                org_id: "o1".to_string(),
+                org_id: "f44e2da1-57d6-5667-8640-7c2a5bd965e9".parse().unwrap(),
                 description: None,
+                created: None,
+                deleted_at: None,
+                settings: None,
+                user_id: None,
             },
             Project {
-                id: "p2".to_string(),
+                id: "48785758-ab06-574d-ac64-78f6fc97396c".parse().unwrap(),
                 name: "ALPHA".to_string(),
-                org_id: "o1".to_string(),
+                org_id: "f44e2da1-57d6-5667-8640-7c2a5bd965e9".parse().unwrap(),
                 description: None,
+                created: None,
+                deleted_at: None,
+                settings: None,
+                user_id: None,
             },
         ];
 

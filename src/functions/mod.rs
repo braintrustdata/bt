@@ -23,7 +23,7 @@ mod push;
 pub(crate) mod report;
 mod view;
 
-use api::Function;
+use api::FunctionRow as Function;
 
 #[derive(Debug, Clone, Copy, ValueEnum)]
 pub enum FunctionTypeFilter {
@@ -111,25 +111,33 @@ pub enum PushLanguage {
     Python,
 }
 
-fn build_web_path(function: &Function) -> String {
-    let id = &function.id;
-    match function.function_type.as_deref() {
+fn build_web_path_parts(
+    id: &str,
+    function_type: Option<&str>,
+    has_prompt_data: bool,
+    xact_id: &str,
+) -> String {
+    match function_type {
         Some("tool") => format!("tools?pr={}", urlencoding::encode(id)),
         Some("scorer") => format!("scorers/{}", urlencoding::encode(id)),
-        Some("classifier") if function.prompt_data.is_some() => {
-            format!("scorers/{}", urlencoding::encode(id))
-        }
-        Some("classifier") => {
-            let xact_id = function._xact_id.as_deref().unwrap_or("");
-            format!(
-                "topics?topicMapId={}&topicMapVersion={}",
-                urlencoding::encode(id),
-                urlencoding::encode(xact_id)
-            )
-        }
+        Some("classifier") if has_prompt_data => format!("scorers/{}", urlencoding::encode(id)),
+        Some("classifier") => format!(
+            "topics?topicMapId={}&topicMapVersion={}",
+            urlencoding::encode(id),
+            urlencoding::encode(xact_id)
+        ),
         Some("parameters") => format!("parameters/{}", urlencoding::encode(id)),
         _ => format!("functions/{}", urlencoding::encode(id)),
     }
+}
+#[cfg(test)]
+fn build_web_path(function: &Function) -> String {
+    build_web_path_parts(
+        &function.id,
+        function.function_type.as_deref(),
+        function.prompt_data.is_some(),
+        function._xact_id.as_deref().unwrap_or(""),
+    )
 }
 
 fn label(ft: Option<FunctionTypeFilter>) -> &'static str {

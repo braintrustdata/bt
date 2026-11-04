@@ -135,8 +135,8 @@ pub(crate) struct CreateArgs {
 pub(crate) async fn run(ctx: &ResolvedContext, args: &CreateArgs, json_output: bool) -> Result<()> {
     let name = resolve_name(args).map_err(user_error)?;
     let slug = resolve_slug(args, &name).map_err(user_error)?;
-    let mut definition =
-        build_scorer_definition(args, &ctx.project.id, &name, &slug).map_err(user_error)?;
+    let mut definition = build_scorer_definition(args, &ctx.project.id.to_string(), &name, &slug)
+        .map_err(user_error)?;
     if let Some(source) = args.preprocessor.as_deref() {
         definition["prompt_data"]["preprocessor"] =
             resolve_preprocessor(ctx, source, args.preprocessor_export.as_deref())
@@ -416,11 +416,23 @@ async fn resolve_preprocessor(
         PreprocessorSource::Saved(slug) => {
             let function = with_spinner(
                 "Resolving preprocessor...",
-                api::get_function_by_slug(&ctx.client, &ctx.project.id, slug, None, None),
+                api::get_function_by_slug(
+                    &ctx.client,
+                    &ctx.project.id.to_string(),
+                    slug,
+                    None,
+                    None,
+                ),
             )
             .await?
             .ok_or_else(|| anyhow!("preprocessor with slug '{slug}' not found"))?;
-            if function.function_type.as_deref() != Some("preprocessor") {
+            if function
+                .function_type
+                .as_ref()
+                .and_then(|v| v.as_ref())
+                .map(|v| v.as_str())
+                != Some("preprocessor")
+            {
                 bail!("function '{slug}' is not a preprocessor");
             }
             Ok(json!({ "type": "function", "id": function.id }))

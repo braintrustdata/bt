@@ -1,37 +1,11 @@
 use anyhow::Result;
-use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
 use crate::http::{ApiClient, BtqlOptions, BtqlResponse};
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct Prompt {
-    pub id: String,
-    pub name: String,
-    pub slug: String,
-    pub project_id: String,
-    #[serde(default)]
-    pub description: Option<String>,
-    #[serde(default)]
-    pub prompt_data: Option<serde_json::Value>,
-    #[serde(default)]
-    pub created: Option<String>,
-    #[serde(default)]
-    pub _xact_id: Option<String>,
-}
+pub use braintrust_api_client::types::Prompt;
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct EnvironmentObject {
-    pub id: String,
-    pub object_type: String,
-    pub object_id: String,
-    pub object_version: String,
-    pub environment_slug: String,
-    #[serde(default)]
-    pub environment_id: Option<String>,
-    #[serde(default)]
-    pub created: Option<String>,
-}
+pub use braintrust_api_client::backend::extensions::EnvironmentObject;
 
 pub async fn list_prompts(
     client: &ApiClient,
@@ -51,7 +25,7 @@ pub async fn list_prompts(
             request.send()
         })
         .await?;
-    crate::http::from_api(response.objects)
+    Ok(response.objects)
 }
 
 pub async fn get_prompt_by_slug(
@@ -81,7 +55,7 @@ pub async fn get_prompt_by_slug(
             request.send()
         })
         .await?;
-    crate::http::from_api(response.objects.into_iter().next())
+    Ok(response.objects.into_iter().next())
 }
 
 pub async fn list_prompt_versions(
@@ -151,18 +125,16 @@ pub async fn assign_prompt(
     environment: &str,
     object_version: &str,
 ) -> Result<EnvironmentObject> {
-    crate::http::from_api(
-        client
-            .assign_prompt(
-                prompt_id,
-                environment,
-                &braintrust_api_client::backend::extensions::EnvironmentAssignment {
-                    object_version: object_version.to_owned(),
-                    org_name: client.org_name().to_owned(),
-                },
-            )
-            .await?,
-    )
+    client
+        .assign_prompt(
+            prompt_id,
+            environment,
+            &braintrust_api_client::backend::extensions::EnvironmentAssignment {
+                object_version: object_version.to_owned(),
+                org_name: client.org_name().to_owned(),
+            },
+        )
+        .await
 }
 
 pub async fn unassign_prompt(
@@ -170,7 +142,7 @@ pub async fn unassign_prompt(
     prompt_id: &str,
     environment: &str,
 ) -> Result<EnvironmentObject> {
-    crate::http::from_api(client.unassign_prompt(prompt_id, environment).await?)
+    client.unassign_prompt(prompt_id, environment).await
 }
 
 pub async fn delete_prompt(client: &ApiClient, prompt_id: &str) -> Result<()> {

@@ -2767,7 +2767,7 @@ async fn resolve_named_projects(
 
     for project_name in named_projects {
         if let Some(project) = get_project_by_name(&auth_ctx.client, project_name).await? {
-            project_name_cache.insert(project_name.clone(), project.id);
+            project_name_cache.insert(project_name.clone(), project.id.to_string());
             continue;
         }
 
@@ -2779,12 +2779,12 @@ async fn resolve_named_projects(
         let project_group_name = project_group_names.get(project_name).map(String::as_str);
         match create_project(&auth_ctx.client, project_name, project_group_name).await {
             Ok(project) => {
-                project_name_cache.insert(project_name.clone(), project.id);
+                project_name_cache.insert(project_name.clone(), project.id.to_string());
             }
             Err(err) => {
                 // Another writer may have created the project concurrently.
                 if let Some(project) = get_project_by_name(&auth_ctx.client, project_name).await? {
-                    project_name_cache.insert(project_name.clone(), project.id);
+                    project_name_cache.insert(project_name.clone(), project.id.to_string());
                 } else {
                     bail!(
                         "failed to create project '{project_name}' in org '{}': {err:#}",
@@ -2815,7 +2815,7 @@ async fn validate_direct_project_ids(
     let projects = list_projects(&auth_ctx.client).await?;
     let known_project_ids = projects
         .into_iter()
-        .map(|project| project.id)
+        .map(|project| project.id.to_string())
         .collect::<BTreeSet<_>>();
 
     if let Some(inaccessible) = direct_project_ids
@@ -3008,8 +3008,8 @@ async fn resolve_project_name(
         return Err(anyhow!("project '{project_name}' not found"));
     };
 
-    project_name_cache.insert(project_name.to_string(), project.id.clone());
-    Ok(project.id)
+    project_name_cache.insert(project_name.to_string(), project.id.to_string());
+    Ok(project.id.to_string())
 }
 
 fn collect_project_name_placeholders_checked(

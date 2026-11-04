@@ -1,5 +1,5 @@
 use anyhow::{Context, Result};
-use serde::{Deserialize, Serialize};
+use serde::Deserialize;
 use serde_json::{json, Map, Value};
 
 use crate::http::{ApiClient, BtqlResponse, Pagination};
@@ -24,77 +24,31 @@ impl DatasetRowsPreviewLength {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct Dataset {
-    pub id: String,
-    pub name: String,
-    #[serde(default)]
-    pub project_id: Option<String>,
-    #[serde(default)]
-    pub description: Option<String>,
-    #[serde(default)]
-    pub created: Option<String>,
-    #[serde(default)]
-    pub created_at: Option<String>,
-    #[serde(default)]
-    pub metadata: Option<serde_json::Value>,
-}
-
+pub use braintrust_api_client::backend::extensions::SnapshotCreation as CreateDatasetSnapshotResult;
+pub use braintrust_api_client::types::{
+    Dataset, DatasetRestorePreviewResponse as DatasetRestorePreview,
+    DatasetRestoreResponse as DatasetRestoreResult, DatasetSnapshot,
+};
 pub type DatasetRow = Map<String, Value>;
 
-impl Dataset {
-    pub fn description_text(&self) -> Option<&str> {
-        self.description
-            .as_deref()
-            .filter(|description| !description.is_empty())
-            .or_else(|| {
-                self.metadata
-                    .as_ref()
-                    .and_then(|metadata| metadata.get("description"))
-                    .and_then(|description| description.as_str())
-                    .filter(|description| !description.is_empty())
-            })
-    }
-
-    pub fn created_text(&self) -> Option<&str> {
-        self.created
-            .as_deref()
-            .filter(|created| !created.is_empty())
-            .or_else(|| {
-                self.created_at
-                    .as_deref()
-                    .filter(|created| !created.is_empty())
-            })
-    }
+pub fn description_text(dataset: &Dataset) -> Option<&str> {
+    dataset
+        .description
+        .as_ref()
+        .and_then(|v| v.as_deref())
+        .filter(|v| !v.is_empty())
+        .or_else(|| {
+            dataset
+                .metadata
+                .as_ref()
+                .and_then(|v| v.as_ref())
+                .and_then(|v| v.additional_properties.get("description"))
+                .and_then(Value::as_str)
+                .filter(|v| !v.is_empty())
+        })
 }
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct DatasetSnapshot {
-    pub id: String,
-    pub name: String,
-    pub dataset_id: String,
-    pub description: Option<String>,
-    pub xact_id: String,
-    pub created: Option<String>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct CreateDatasetSnapshotResult {
-    pub dataset_snapshot: DatasetSnapshot,
-    pub found_existing: bool,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct DatasetRestorePreview {
-    pub rows_to_restore: usize,
-    pub rows_to_delete: usize,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct DatasetRestoreResult {
-    pub xact_id: Option<String>,
-    pub rows_restored: usize,
-    pub rows_deleted: usize,
+pub fn created_text(dataset: &Dataset) -> Option<String> {
+    dataset.created.flatten().map(|value| value.to_rfc3339())
 }
 
 #[derive(Debug, Deserialize)]
@@ -114,7 +68,7 @@ pub async fn list_datasets(client: &ApiClient, project_id: &str) -> Result<Vec<D
                 .send()
         })
         .await?;
-    crate::http::from_api(response.objects)
+    Ok(response.objects)
 }
 
 pub async fn get_dataset_by_name(
@@ -182,12 +136,13 @@ pub async fn create_dataset_with_metadata(
     request.description = description
         .filter(|v| !v.is_empty())
         .map(|v| Some(v.to_owned()));
-    request.metadata = metadata.map(crate::http::into_api).transpose()?.map(Some);
-    crate::http::from_api(
-        client
-            .run(|| client.generated().post_dataset(request.clone()))
-            .await?,
-    )
+    request.metadata = metadata
+        .map(braintrust_api_client::backend::resource_definition)
+        .transpose()?
+        .map(Some);
+    client
+        .run(|| client.generated().post_dataset(request.clone()))
+        .await
 }
 
 pub async fn delete_dataset(client: &ApiClient, dataset_id: &str) -> Result<()> {
@@ -201,7 +156,7 @@ pub async fn list_dataset_snapshots(
     client: &ApiClient,
     dataset_id: &str,
 ) -> Result<Vec<DatasetSnapshot>> {
-    crate::http::from_api(client.dataset_snapshots(dataset_id).await?.objects)
+    Ok(client.dataset_snapshots(dataset_id).await?.objects)
 }
 
 pub async fn create_dataset_snapshot(
@@ -217,7 +172,7 @@ pub async fn create_dataset_snapshot(
         xact_id.to_owned(),
     );
     request.description = description.map(|v| Some(v.to_owned()));
-    crate::http::from_api(client.create_dataset_snapshot(&request).await?)
+    client.create_dataset_snapshot(&request).await
 }
 
 pub async fn delete_dataset_snapshot(client: &ApiClient, snapshot_id: &str) -> Result<()> {
@@ -235,15 +190,13 @@ pub async fn preview_dataset_restore(
     let request = braintrust_api_client::types::DatasetRestoreRequest {
         version: xact_id.to_owned(),
     };
-    crate::http::from_api(
-        client
-            .run(|| {
-                client
-                    .generated()
-                    .post_dataset_id_restore_preview(dataset_id, request.clone())
-            })
-            .await?,
-    )
+    client
+        .run(|| {
+            client
+                .generated()
+                .post_dataset_id_restore_preview(dataset_id, request.clone())
+        })
+        .await
 }
 
 pub async fn restore_dataset(
@@ -251,7 +204,7 @@ pub async fn restore_dataset(
     dataset_id: &str,
     xact_id: &str,
 ) -> Result<DatasetRestoreResult> {
-    crate::http::from_api(client.restore_dataset(dataset_id, xact_id).await?)
+    client.restore_dataset(dataset_id, xact_id).await
 }
 
 pub async fn get_dataset_head_xact_id(
@@ -495,7 +448,10 @@ mod tests {
         }))
         .expect("deserialize snapshot");
 
-        assert_eq!(snapshot.dataset_id, "01926568-8088-7109-99ab-abcdef012345");
+        assert_eq!(
+            snapshot.dataset_id.to_string(),
+            "01926568-8088-7109-99ab-abcdef012345"
+        );
         assert_eq!(snapshot.name, "baseline");
         assert!(snapshot.description.is_none());
         assert_eq!(snapshot.xact_id, "1000192656880881099");

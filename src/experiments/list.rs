@@ -50,18 +50,20 @@ pub async fn run(ctx: &ResolvedContext, json: bool) -> Result<()> {
     for exp in &experiments {
         let desc = exp
             .description
-            .as_deref()
+            .as_ref()
+            .and_then(|value| value.as_deref())
             .filter(|s| !s.is_empty())
             .map(|s| truncate(s, 60))
             .unwrap_or_else(|| "-".to_string());
         let created = exp
             .created
-            .as_deref()
-            .map(|c| truncate(c, 10))
+            .flatten()
+            .map(|c| truncate(&c.to_rfc3339(), 10))
             .unwrap_or_else(|| "-".to_string());
         let commit = exp
             .commit
-            .as_deref()
+            .as_ref()
+            .and_then(|value| value.as_deref())
             .map(|c| truncate(c, 7))
             .unwrap_or_else(|| "-".to_string());
         table.add_row(vec![&exp.name, &desc, &created, &commit]);

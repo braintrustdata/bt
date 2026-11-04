@@ -264,7 +264,10 @@ mod tests {
         let CreateProjectOutcome::Existing(project) = outcome else {
             panic!("expected existing project outcome");
         };
-        assert_eq!(project.id, "00000000-0000-4000-8000-000000000001");
+        assert_eq!(
+            project.id.to_string(),
+            "00000000-0000-4000-8000-000000000001"
+        );
         assert_eq!(project.name, "existing-project");
 
         server.stop().await;
@@ -281,7 +284,10 @@ mod tests {
         let CreateProjectOutcome::Existing(project) = outcome else {
             panic!("expected existing project outcome after create conflict");
         };
-        assert_eq!(project.id, "00000000-0000-4000-8000-000000000002");
+        assert_eq!(
+            project.id.to_string(),
+            "00000000-0000-4000-8000-000000000002"
+        );
         assert_eq!(project.name, "race-project");
 
         server.stop().await;
@@ -298,7 +304,10 @@ mod tests {
         let CreateProjectOutcome::Created(project) = outcome else {
             panic!("expected created project outcome");
         };
-        assert_eq!(project.id, "00000000-0000-4000-8000-000000000003");
+        assert_eq!(
+            project.id.to_string(),
+            "00000000-0000-4000-8000-000000000003"
+        );
         assert_eq!(project.name, "new-project");
 
         server.stop().await;

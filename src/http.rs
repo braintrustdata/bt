@@ -6,7 +6,6 @@ pub use braintrust_api_client::backend::{
     BtqlResponse, OperationOptions, ResponseParseError, RetryReason,
 };
 use reqwest::ClientBuilder;
-use serde::{de::DeserializeOwned, Serialize};
 use std::time::Duration;
 pub const DEFAULT_HTTP_TIMEOUT: Duration = Duration::from_secs(30);
 pub const BT_USER_AGENT: &str = concat!("bt-cli/", env!("CARGO_PKG_VERSION"));
@@ -54,19 +53,9 @@ impl ApiClient {
     }
 }
 
-/// Project a typed API model into the CLI's display model.
-pub fn from_api<T: Serialize, R: DeserializeOwned>(value: T) -> Result<R> {
-    serde_json::from_value(serde_json::to_value(value)?)
-        .context("failed to project API data into CLI output")
-}
 pub use braintrust_api_client::backend::{
     api_error, build_api_client, put_signed_url, put_signed_url_with_headers,
 };
 
 #[cfg(test)]
 pub use braintrust_api_client::backend::HttpError;
-
-/// Validate a CLI definition against the API operation's request model.
-pub fn into_api<T: Serialize, R: DeserializeOwned + Serialize>(value: T) -> Result<R> {
-    braintrust_api_client::backend::resource_definition(value)
-}

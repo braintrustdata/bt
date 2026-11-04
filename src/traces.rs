@@ -322,11 +322,7 @@ struct ResolvedTraceCommandTarget {
     detail_view: DetailView,
 }
 
-#[derive(Debug, Clone, Deserialize)]
-struct ProjectInfo {
-    id: String,
-    name: String,
-}
+type ProjectInfo = crate::projects::api::Project;
 
 #[derive(Debug, Clone, Serialize)]
 struct TraceSummaryRow {
@@ -1195,7 +1191,7 @@ async fn run_thread_command(base: BaseArgs, client: ApiClient, args: ThreadArgs)
         "Loading thread...",
         fetch_thread_messages(
             &client,
-            &target.project.id,
+            &target.project.id.to_string(),
             &target.root_span_id,
             selector.print_queries,
         ),
@@ -1341,7 +1337,7 @@ async fn run_span_command(base: BaseArgs, client: ApiClient, args: SpanArgs) -> 
         } else {
             ParsedTraceUrl {
                 org: Some(client.org_name().to_string()),
-                project: Some(project.id.clone()),
+                project: Some(project.id.to_string()),
                 page: Some("logs".to_string()),
                 experiment: None,
                 comparison_experiment: None,
@@ -1386,7 +1382,8 @@ async fn run_span_command(base: BaseArgs, client: ApiClient, args: SpanArgs) -> 
             (parsed_startup_url.as_ref(), project_for_url.as_ref())
         {
             let experiments =
-                experiments_api::list_experiments_by_project_id(&client, &project.id).await?;
+                experiments_api::list_experiments_by_project_id(&client, &project.id.to_string())
+                    .await?;
             for selector in trace_url_experiment_selectors(parsed) {
                 let Ok(experiment) = find_experiment_by_selector(&experiments, selector, project)
                 else {
@@ -1394,7 +1391,7 @@ async fn run_span_command(base: BaseArgs, client: ApiClient, args: SpanArgs) -> 
                 };
                 let fallback_ref = ObjectRef {
                     object_type: "experiment".to_string(),
-                    object_name: experiment.id.clone(),
+                    object_name: experiment.id.to_string(),
                 };
                 if fallback_ref.object_type == object_ref.object_type
                     && fallback_ref.object_name == object_ref.object_name
@@ -1596,7 +1593,7 @@ async fn run_interactive_trace_target(
     let detail_view = detail_view.unwrap_or(target.detail_view);
     let startup_target = ParsedTraceUrl {
         org: Some(client.org_name().to_string()),
-        project: Some(target.project.id.clone()),
+        project: Some(target.project.id.to_string()),
         page: Some("logs".to_string()),
         experiment: None,
         comparison_experiment: None,
@@ -1666,7 +1663,7 @@ async fn resolve_object_ref_for_view(
         return Ok((
             ObjectRef {
                 object_type: "experiment".to_string(),
-                object_name: experiment.id,
+                object_name: experiment.id.to_string(),
             },
             Some(project),
         ));
@@ -1675,7 +1672,7 @@ async fn resolve_object_ref_for_view(
     Ok((
         ObjectRef {
             object_type: "project_logs".to_string(),
-            object_name: project.id.clone(),
+            object_name: project.id.to_string(),
         },
         Some(project),
     ))
@@ -1691,7 +1688,8 @@ pub(crate) async fn resolve_first_experiment_for_trace_url(
         bail!("trace URL does not include an experiment selector");
     }
 
-    let experiments = experiments_api::list_experiments_by_project_id(client, &project.id).await?;
+    let experiments =
+        experiments_api::list_experiments_by_project_id(client, &project.id.to_string()).await?;
     let mut last_error = None;
     for selector in selectors {
         match find_experiment_by_selector(&experiments, selector, project) {
@@ -1732,7 +1730,7 @@ fn find_experiment_by_selector<'a>(
 
     if let Some(experiment) = experiments
         .iter()
-        .find(|experiment| experiment.id == selector)
+        .find(|experiment| experiment.id.to_string() == selector)
     {
         return Ok(experiment);
     }
@@ -1801,7 +1799,7 @@ async fn resolve_project(
             .with_context(|| format!("project '{name}' not found"))?;
 
         return Ok(ProjectSelection {
-            id: project.id,
+            id: project.id.to_string(),
             name: Some(project.name),
         });
     }
@@ -1824,7 +1822,7 @@ async fn resolve_project(
         .clone();
 
     Ok(ProjectSelection {
-        id: project.id,
+        id: project.id.to_string(),
         name: Some(project.name),
     })
 }
@@ -1850,11 +1848,11 @@ fn select_project_selector<'a>(
 }
 
 async fn list_projects(client: &ApiClient) -> Result<Vec<ProjectInfo>> {
-    crate::http::from_api(crate::projects::api::list_projects(client).await?)
+    crate::projects::api::list_projects(client).await
 }
 
 async fn get_project_by_name(client: &ApiClient, name: &str) -> Result<Option<ProjectInfo>> {
-    crate::http::from_api(crate::projects::api::get_project_by_name(client, name).await?)
+    crate::projects::api::get_project_by_name(client, name).await
 }
 
 async fn run_interactive(args: InteractiveRunArgs, client: ApiClient) -> Result<()> {
@@ -2943,7 +2941,7 @@ fn start_trace_load_for_root_span(
 ) {
     let (tx, rx) = mpsc::channel();
     let client = client.clone();
-    let project_id = app.project.id.clone();
+    let project_id = app.project.id.to_string();
     let preview_length = app.preview_length;
     let print_queries = app.print_queries;
     let root_span_id_for_task = root_span_id.clone();
@@ -5223,7 +5221,7 @@ fn value_as_object_owned(value: Option<&Value>) -> Option<Map<String, Value>> {
 fn project_label(project: &ProjectSelection) -> String {
     match &project.name {
         Some(name) => format!("{} ({name})", project.id),
-        None => project.id.clone(),
+        None => project.id.to_string(),
     }
 }
 
@@ -5918,11 +5916,11 @@ pub(crate) async fn resolve_trace_ref(
             Some(project)
                 if default_project
                     .map(|default_project| {
-                        project == default_project.id || project == default_project.name
+                        project == default_project.id.to_string() || project == default_project.name
                     })
                     .unwrap_or(false) =>
             {
-                default_project.expect("checked above").id.clone()
+                default_project.expect("checked above").id.to_string()
             }
             Some(project) if project.len() == 36 && uuid::Uuid::try_parse(project).is_ok() => {
                 project.to_string()
@@ -5931,12 +5929,12 @@ pub(crate) async fn resolve_trace_ref(
                 get_project_by_name(client, project)
                     .await?
                     .ok_or_else(|| anyhow!("project '{project}' from trace URL not found"))?
-                    .id
+                    .id.to_string()
             }
             None => selector
                 .project_id
                 .map(ToOwned::to_owned)
-                .or_else(|| default_project.map(|project| project.id.clone()))
+                .or_else(|| default_project.map(|project| project.id.to_string()))
                 .ok_or_else(|| {
                     anyhow!(
                         "trace URL must include a project path like /app/<org>/p/<project>/... or a project must be supplied"
@@ -5956,7 +5954,7 @@ pub(crate) async fn resolve_trace_ref(
             };
             let experiment =
                 resolve_first_experiment_for_trace_url(client, &project, &parsed).await?;
-            ("experiment", experiment.id)
+            ("experiment", experiment.id.to_string())
         };
         let source_expr = format!("{object_type}({})", sql_quote(&object_id));
         let root_span_id = resolve_trace_root_span_id(
@@ -5980,7 +5978,7 @@ pub(crate) async fn resolve_trace_ref(
     let project_id = selector
         .project_id
         .map(ToOwned::to_owned)
-        .or_else(|| default_project.map(|project| project.id.clone()))
+        .or_else(|| default_project.map(|project| project.id.to_string()))
         .ok_or_else(|| {
             anyhow!("trace preview requires --project-id or --project when --trace-id is used")
         })?;
@@ -6027,7 +6025,7 @@ async fn resolve_project_target_for_url(
         .await?
         .with_context(|| format!("project '{url_project}' not found"))?;
     Ok(ProjectSelection {
-        id: project.id,
+        id: project.id.to_string(),
         name: Some(project.name),
     })
 }
@@ -6495,7 +6493,7 @@ fn start_full_span_load_for_row_id(
 ) {
     let (tx, rx) = mpsc::channel();
     let client = client.clone();
-    let project_id = app.project.id.clone();
+    let project_id = app.project.id.to_string();
     let print_queries = app.print_queries;
     let row_id_for_task = row_id.clone();
 
@@ -6666,7 +6664,7 @@ fn request_thread_messages_load(
 
     let (tx, rx) = mpsc::channel();
     let client = client.clone();
-    let project_id = app.project.id.clone();
+    let project_id = app.project.id.to_string();
     let print_queries = app.print_queries;
     handle.spawn(async move {
         let result =
@@ -6741,7 +6739,11 @@ fn poll_pending_thread_load(app: &mut TraceViewerApp) {
 }
 
 async fn execute_invoke(client: &ApiClient, request: &Value) -> Result<Value> {
-    client.invoke(&crate::http::into_api(request)?).await
+    client
+        .invoke(&braintrust_api_client::backend::resource_definition(
+            request,
+        )?)
+        .await
 }
 
 #[cfg(test)]

@@ -1388,10 +1388,20 @@ async fn run_setup_browser_auth(
         });
     let login = build_api_key_login_context(base, &completed.api_key, &org);
     let selected_project = crate::projects::api::Project {
-        id: completed.project_id.clone(),
+        id: completed
+            .project_id
+            .parse()
+            .context("invalid setup project ID")?,
         name: completed.project_name.clone(),
-        org_id: completed.org_id.clone(),
+        org_id: completed
+            .org_id
+            .parse()
+            .context("invalid setup organization ID")?,
         description: None,
+        created: None,
+        deleted_at: None,
+        settings: None,
+        user_id: None,
     };
     let stored_profiles = auth::list_profiles()?;
     let profile_name = setup_browser_profile_name(profile_name, &org.name, &stored_profiles);
@@ -2105,11 +2115,6 @@ async fn maybe_create_api_key_for_oauth(base: &BaseArgs, client: &ApiClient) -> 
         .unwrap_or_else(|| "user".to_string());
     let base_name = format!("{username}-created-by-bt-setup");
 
-    #[derive(serde::Deserialize)]
-    struct CreatedKey {
-        key: String,
-    }
-
     let org_id = client.org_id().trim();
     if org_id.is_empty() {
         bail!(
@@ -2135,12 +2140,11 @@ async fn maybe_create_api_key_for_oauth(base: &BaseArgs, client: &ApiClient) -> 
             .expect("name sequence is infinite")
     };
 
-    let body = serde_json::json!({ "name": name, "org_id": org_id });
-    let created: CreatedKey = crate::http::from_api(
-        client
-            .create_api_key(&crate::http::into_api(&body)?)
-            .await?,
-    )?;
+    let body = braintrust_api_client::backend::extensions::CreateApiKey {
+        name: name.clone(),
+        org_id: org_id.to_owned(),
+    };
+    let created = client.create_api_key(&body).await?;
 
     let explicitly_quiet = base.quiet && base.quiet_source.is_some();
     if std::io::stderr().is_terminal() && !explicitly_quiet {
@@ -2232,7 +2236,7 @@ fn maybe_init(org: &str, project: &crate::projects::api::Project) -> Result<()> 
         let existing = config::load_file(&config_path);
         let matches = existing.org.as_deref() == Some(org)
             && existing.project.as_deref() == Some(project.name.as_str());
-        if matches && existing.project_id.as_deref() == Some(project.id.as_str()) {
+        if matches && existing.project_id.as_deref() == Some(project.id.to_string().as_str()) {
             return Ok(());
         }
         existing
@@ -2242,7 +2246,7 @@ fn maybe_init(org: &str, project: &crate::projects::api::Project) -> Result<()> 
 
     cfg.org = Some(org.to_string());
     cfg.project = Some(project.name.clone());
-    cfg.project_id = Some(project.id.clone());
+    cfg.project_id = Some(project.id.to_string());
     config::save_local(&cfg, true)?;
     Ok(())
 }
@@ -6909,10 +6913,14 @@ mod tests {
         env::set_current_dir(&root).expect("cd root");
 
         let project = crate::projects::api::Project {
-            id: "project-id".to_string(),
+            id: "1a17b4f6-33ab-5acf-a53c-03f7a474fce3".parse().unwrap(),
             name: "new-project".to_string(),
-            org_id: "org-id".to_string(),
+            org_id: "27216650-d1df-5081-afb2-7d3ee020d75c".parse().unwrap(),
             description: None,
+            created: None,
+            deleted_at: None,
+            settings: None,
+            user_id: None,
         };
         maybe_init("new-org", &project).expect("maybe init");
 
@@ -6921,7 +6929,10 @@ mod tests {
         let saved = config::load_file(&bt_dir.join("config.json"));
         assert_eq!(saved.org.as_deref(), Some("new-org"));
         assert_eq!(saved.project.as_deref(), Some("new-project"));
-        assert_eq!(saved.project_id.as_deref(), Some("project-id"));
+        assert_eq!(
+            saved.project_id.as_deref(),
+            Some("1a17b4f6-33ab-5acf-a53c-03f7a474fce3")
+        );
         assert_eq!(
             saved.extra.get("custom_flag"),
             Some(&serde_json::Value::Bool(true))

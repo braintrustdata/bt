@@ -6,7 +6,6 @@ use std::{
 
 use anyhow::{anyhow, bail, Context, Result};
 use clap::{Arg, ArgAction, ArgMatches, Command, CommandFactory, FromArgMatches};
-use serde::{Deserialize, Serialize};
 use serde_json::{json, Map, Value};
 
 use crate::{args::BaseArgs, auth, Cli};
@@ -130,27 +129,16 @@ fn normalize_global_args(argv: &[OsString], args: &[Arg]) -> Vec<OsString> {
     normalized
 }
 
-#[derive(Debug, Clone, Deserialize, Serialize)]
-struct Tool {
-    name: String,
-    #[serde(default)]
-    description: Option<String>,
-    #[serde(default, rename = "inputSchema")]
-    input_schema: Value,
-}
+use braintrust_api_client::backend::mcp::{Tool, ToolResult};
 
-impl Tool {
-    fn required_arguments(&self) -> impl Iterator<Item = &str> {
-        self.input_schema
-            .get("required")
-            .and_then(Value::as_array)
-            .into_iter()
-            .flatten()
-            .filter_map(Value::as_str)
-            // The server accepts omitted telemetry even when its schema marks
-            // it required. Leave it absent rather than fabricating intent data.
-            .filter(|name| *name != "telemetry")
-    }
+fn required_arguments(tool: &Tool) -> impl Iterator<Item = &str> {
+    tool.input_schema
+        .get("required")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(Value::as_str)
+        .filter(|name| *name != "telemetry")
 }
 
 type ToolArgumentMap = BTreeMap<String, (String, Value)>;
@@ -331,7 +319,7 @@ fn tool_command(tool: &Tool, tool_index: usize) -> Result<(Command, ToolArgument
         .and_then(Value::as_object)
         .cloned()
         .unwrap_or_default();
-    let required: Vec<&str> = tool.required_arguments().collect();
+    let required: Vec<&str> = required_arguments(tool).collect();
     let mut arg_map = BTreeMap::new();
     let mut flags = BTreeSet::new();
     for (field_index, (name, schema)) in properties.iter().enumerate() {
@@ -441,7 +429,7 @@ fn validate_json_arguments(arguments: &Value, tool: &Tool) -> Result<()> {
         .input_schema
         .get("properties")
         .and_then(Value::as_object);
-    for name in tool.required_arguments() {
+    for name in required_arguments(tool) {
         if !arguments.contains_key(name) {
             bail!(
                 "missing required MCP argument `{name}` for tool `{}`",
@@ -657,7 +645,7 @@ fn value_matches_schema_type(value: &Value, types: &BTreeSet<String>) -> bool {
     types.contains(json_value_type(value)) || (value.is_number() && types.contains("number"))
 }
 
-fn format_tool_result(result: &Value, json_output: bool) -> Result<String> {
+fn format_tool_result(result: &ToolResult, json_output: bool) -> Result<String> {
     if json_output {
         return serde_json::to_string(result).context("failed to serialize MCP result");
     }
@@ -665,14 +653,15 @@ fn format_tool_result(result: &Value, json_output: bool) -> Result<String> {
     // Structured content is the authoritative result when the server returns
     // both it and a text rendering in content; printing both duplicates output.
     if let Some(structured) = result
-        .get("structuredContent")
+        .structured_content
+        .as_ref()
         .filter(|value| !value.is_null())
     {
         return serde_json::to_string_pretty(structured)
             .context("failed to serialize structured MCP result");
     }
 
-    if let Some(content) = result.get("content").and_then(Value::as_array) {
+    if let Some(content) = &result.content {
         return content
             .iter()
             .map(|item| {
@@ -703,10 +692,10 @@ impl McpClient {
         self.0.initialize().await
     }
     async fn list_tools(&mut self) -> Result<Vec<Tool>> {
-        crate::http::from_api(self.0.list_tools().await?)
+        self.0.list_tools().await
     }
-    async fn call_tool(&mut self, name: &str, arguments: Value) -> Result<Value> {
-        crate::http::from_api(self.0.call_tool(name, arguments).await?)
+    async fn call_tool(&mut self, name: &str, arguments: Value) -> Result<ToolResult> {
+        self.0.call_tool(name, arguments).await
     }
 }
 
@@ -775,7 +764,7 @@ mod tests {
             .call_tool("test-first", json!({"query":"test-query"}))
             .await
             .unwrap();
-        assert_eq!(result["structuredContent"]["ok"], true);
+        assert_eq!(result.structured_content.unwrap()["ok"], true);
         assert_eq!(calls.load(Ordering::SeqCst), 5);
         handle.stop(false).await;
     }
@@ -1068,28 +1057,30 @@ mod tests {
 
     #[test]
     fn structured_result_is_not_repeated_as_text_content() {
-        let result = json!({
+        let value = json!({
             "content": [{ "type": "text", "text": "{\"views\":[]}" }],
             "structuredContent": { "views": [] }
         });
+        let result: ToolResult = serde_json::from_value(value.clone()).unwrap();
         assert_eq!(
             format_tool_result(&result, false).unwrap(),
             "{\n  \"views\": []\n}"
         );
         assert_eq!(
             format_tool_result(&result, true).unwrap(),
-            result.to_string()
+            value.to_string()
         );
     }
 
     #[test]
     fn content_only_results_keep_text_and_non_text_items() {
-        let result = json!({
+        let value = json!({
             "content": [
                 { "type": "text", "text": "first" },
                 { "type": "image", "data": "ZmFrZQ==", "mimeType": "image/png" }
             ]
         });
+        let result: ToolResult = serde_json::from_value(value).unwrap();
         let rendered = format_tool_result(&result, false).unwrap();
         assert!(rendered.starts_with("first\n"));
         assert!(rendered.contains("\"type\":\"image\""));

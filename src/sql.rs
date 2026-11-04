@@ -237,7 +237,7 @@ async fn prepare_query(base: &BaseArgs, client: &ApiClient, query: &str) -> Resu
     let project = resolve_required_project(base, client, false)
         .await
         .context("`FROM logs` requires a project; pass --project <name> or run `bt switch`")?;
-    Ok(rewrite_logs_sources(query, &project.id))
+    Ok(rewrite_logs_sources(query, &project.id.to_string()))
 }
 
 fn has_logs_source(query: &str) -> bool {

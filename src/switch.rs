@@ -146,7 +146,7 @@ pub async fn run(base: BaseArgs, args: SwitchArgs) -> Result<()> {
         let payload = serde_json::json!({
             "org": org_name,
             "project": project.name,
-            "project_id": project.id,
+            "project_id": project.id.to_string(),
             "profile": config_profile,
             "scope": scope,
             "path": path.display().to_string(),
@@ -305,7 +305,7 @@ pub(crate) fn apply_switch_config(
     match project {
         Some(project) => {
             cfg.project = Some(project.name.clone());
-            cfg.project_id = Some(project.id.clone());
+            cfg.project_id = Some(project.id.to_string());
         }
         None => {
             cfg.project = None;
@@ -320,7 +320,7 @@ mod tests {
 
     fn available_org(name: &str) -> auth::AvailableOrg {
         auth::AvailableOrg {
-            id: format!("id-{name}"),
+            id: "org".to_string(),
             name: name.to_string(),
             api_url: None,
         }
@@ -452,10 +452,14 @@ mod tests {
     fn apply_switch_config_sets_project_id_with_project_name_and_org() {
         let mut cfg = config::Config::default();
         let project = api::Project {
-            id: "proj_123".to_string(),
+            id: "5798b6d2-c3a0-5684-be37-92f092770e19".parse().unwrap(),
             name: "my-project".to_string(),
-            org_id: "org_123".to_string(),
+            org_id: "1e4969a0-f0e2-588b-8a16-75dafc52cb0f".parse().unwrap(),
             description: None,
+            created: None,
+            deleted_at: None,
+            settings: None,
+            user_id: None,
         };
 
         apply_switch_config(&mut cfg, Some("work"), Some("acme-org"), Some(&project));
@@ -463,7 +467,10 @@ mod tests {
         assert_eq!(cfg.profile.as_deref(), Some("work"));
         assert_eq!(cfg.org.as_deref(), Some("acme-org"));
         assert_eq!(cfg.project.as_deref(), Some("my-project"));
-        assert_eq!(cfg.project_id.as_deref(), Some("proj_123"));
+        assert_eq!(
+            cfg.project_id.as_deref(),
+            Some("5798b6d2-c3a0-5684-be37-92f092770e19")
+        );
     }
 
     #[test]
@@ -473,10 +480,14 @@ mod tests {
             ..Default::default()
         };
         let project = api::Project {
-            id: "proj_456".to_string(),
+            id: "33535dcf-f890-57c3-9a9f-113505d7bb9e".parse().unwrap(),
             name: "next-project".to_string(),
-            org_id: "org_123".to_string(),
+            org_id: "1e4969a0-f0e2-588b-8a16-75dafc52cb0f".parse().unwrap(),
             description: None,
+            created: None,
+            deleted_at: None,
+            settings: None,
+            user_id: None,
         };
 
         apply_switch_config(&mut cfg, None, Some("acme-org"), Some(&project));

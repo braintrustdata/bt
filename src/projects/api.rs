@@ -1,16 +1,6 @@
-use anyhow::Result;
-use serde::{Deserialize, Serialize};
-
 use crate::http::ApiClient;
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct Project {
-    pub id: String,
-    pub name: String,
-    pub org_id: String,
-    #[serde(default)]
-    pub description: Option<String>,
-}
+use anyhow::Result;
+pub use braintrust_api_client::types::Project;
 
 pub async fn list_projects(client: &ApiClient) -> Result<Vec<Project>> {
     let response = client
@@ -22,7 +12,7 @@ pub async fn list_projects(client: &ApiClient) -> Result<Vec<Project>> {
                 .send()
         })
         .await?;
-    crate::http::from_api(response.objects)
+    Ok(response.objects)
 }
 
 pub async fn create_project(
@@ -33,11 +23,9 @@ pub async fn create_project(
     let mut request = braintrust_api_client::types::CreateProject::new(name.to_owned());
     request.org_name = Some(Some(client.org_name().to_owned()));
     request.project_group_name = project_group_name.map(|value| Some(value.to_owned()));
-    crate::http::from_api(
-        client
-            .run(|| client.generated().post_project(request.clone()))
-            .await?,
-    )
+    client
+        .run(|| client.generated().post_project(request.clone()))
+        .await
 }
 
 pub async fn delete_project(client: &ApiClient, project_id: &str) -> Result<()> {
@@ -58,5 +46,5 @@ pub async fn get_project_by_name(client: &ApiClient, name: &str) -> Result<Optio
                 .send()
         })
         .await?;
-    crate::http::from_api(response.objects.into_iter().next())
+    Ok(response.objects.into_iter().next())
 }
