@@ -574,7 +574,7 @@ dependencies = [
 [[package]]
 name = "braintrust-api-client"
 version = "0.1.0-alpha.2"
-source = "git+https://github.com/braintrustdata/braintrust-sdk-rust?rev=d9d351a040ebe3c85cdf965ca1849792e85d34cb#d9d351a040ebe3c85cdf965ca1849792e85d34cb"
+source = "git+https://github.com/braintrustdata/braintrust-sdk-rust?rev=0abaa00130b0c51314c5ac0dddd9977ac9cf675c#0abaa00130b0c51314c5ac0dddd9977ac9cf675c"
 dependencies = [
  "anyhow",
  "backoff",
@@ -600,35 +600,7 @@ dependencies = [
 [[package]]
 name = "braintrust-sdk-rust"
 version = "0.1.0-alpha.2"
-source = "git+https://github.com/braintrustdata/braintrust-sdk-rust?rev=45a2c88ca9d9ccc393ec0338ac438199fc3c5df2#45a2c88ca9d9ccc393ec0338ac438199fc3c5df2"
-dependencies = [
- "anyhow",
- "arc-swap",
- "async-trait",
- "backoff",
- "base64 0.23.1",
- "bon",
- "bytes",
- "chrono",
- "crossbeam",
- "futures",
- "indexmap 2.14.0",
- "regex",
- "reqwest 0.13.5",
- "serde",
- "serde_json 1.0.151",
- "serde_repr",
- "thiserror 2.0.19",
- "tokio",
- "tracing",
- "url",
- "uuid",
-]
-
-[[package]]
-name = "braintrust-sdk-rust"
-version = "0.1.0-alpha.2"
-source = "git+https://github.com/braintrustdata/braintrust-sdk-rust?rev=d9d351a040ebe3c85cdf965ca1849792e85d34cb#d9d351a040ebe3c85cdf965ca1849792e85d34cb"
+source = "git+https://github.com/braintrustdata/braintrust-sdk-rust?rev=0abaa00130b0c51314c5ac0dddd9977ac9cf675c#0abaa00130b0c51314c5ac0dddd9977ac9cf675c"
 dependencies = [
  "anyhow",
  "arc-swap",
@@ -645,6 +617,34 @@ dependencies = [
  "regex",
  "reqwest 0.13.5",
  "reqwest-middleware",
+ "serde",
+ "serde_json 1.0.151",
+ "serde_repr",
+ "thiserror 2.0.19",
+ "tokio",
+ "tracing",
+ "url",
+ "uuid",
+]
+
+[[package]]
+name = "braintrust-sdk-rust"
+version = "0.1.0-alpha.2"
+source = "git+https://github.com/braintrustdata/braintrust-sdk-rust?rev=45a2c88ca9d9ccc393ec0338ac438199fc3c5df2#45a2c88ca9d9ccc393ec0338ac438199fc3c5df2"
+dependencies = [
+ "anyhow",
+ "arc-swap",
+ "async-trait",
+ "backoff",
+ "base64 0.23.1",
+ "bon",
+ "bytes",
+ "chrono",
+ "crossbeam",
+ "futures",
+ "indexmap 2.14.0",
+ "regex",
+ "reqwest 0.13.5",
  "serde",
  "serde_json 1.0.151",
  "serde_repr",
@@ -706,7 +706,7 @@ dependencies = [
  "async-trait",
  "base64 0.22.1",
  "braintrust-api-client",
- "braintrust-sdk-rust 0.1.0-alpha.2 (git+https://github.com/braintrustdata/braintrust-sdk-rust?rev=d9d351a040ebe3c85cdf965ca1849792e85d34cb)",
+ "braintrust-sdk-rust 0.1.0-alpha.2 (git+https://github.com/braintrustdata/braintrust-sdk-rust?rev=0abaa00130b0c51314c5ac0dddd9977ac9cf675c)",
  "bt-daemon",
  "chrono",
  "clap",
