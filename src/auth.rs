@@ -37,6 +37,7 @@ use crate::{
     ui,
 };
 
+mod device;
 #[cfg(any(windows, test))]
 mod windows_store;
 
@@ -1592,58 +1593,73 @@ async fn run_login_oauth(base: &BaseArgs, args: LoginArgs) -> Result<()> {
         .unwrap_or_else(|| default_oauth_client_id(provisional_profile));
 
     let (pkce_challenge, pkce_verifier) = PkceCodeChallenge::new_random_sha256();
-    let state = generate_random_token(32)?;
-
-    let callback_server = bind_oauth_callback_server()?;
-    let redirect_uri = callback_server.redirect_uri();
-    let oauth_client = build_oauth_client(&api_url, &client_id, Some(&redirect_uri))?;
-    let (authorize_url, _) = oauth_client
-        .authorize_url(|| CsrfToken::new(state.clone()))
-        .add_scope(Scope::new(OAUTH_SCOPE.to_string()))
-        .set_pkce_challenge(pkce_challenge)
-        .url();
-    let authorize_url = authorize_url.to_string();
-
-    let quiet_requested = explicitly_quiet(base) || base.json;
-    if !quiet_requested {
-        eprintln!(
-            "{}",
-            oauth_authorization_message(&authorize_url, args.no_browser || is_ssh_session())
-        );
-    }
-    if !args.no_browser {
-        if let Err(err) = open::that(&authorize_url) {
-            eprintln!("warning: failed to open browser automatically: {err}");
-        }
-    }
-
-    let callback = collect_oauth_callback(
-        callback_server,
-        args.no_browser || is_ssh_session(),
-        quiet_requested,
-    )
-    .await?;
-    if let Some(error) = callback.error {
-        bail!("oauth authorization failed: {error}");
-    }
-    let auth_code = callback
-        .code
-        .ok_or_else(|| anyhow::anyhow!("no authorization code received"))?;
-    if callback.state.is_none() {
-        bail!("oauth callback missing state; paste the full callback URL (or code=...&state=...)");
-    }
-    if callback.state.as_deref() != Some(state.as_str()) {
-        bail!("oauth state mismatch; please try again");
-    }
-
-    let oauth_tokens = exchange_oauth_authorization_code(
-        &api_url,
+    let oauth_tokens = if let Some(tokens) = device::login(
+        &app_url,
         &client_id,
-        &redirect_uri,
-        &auth_code,
-        pkce_verifier,
+        &pkce_challenge,
+        &pkce_verifier,
+        args.no_browser || is_ssh_session(),
+        explicitly_quiet(base),
     )
-    .await?;
+    .await?
+    {
+        tokens
+    } else {
+        let state = generate_random_token(32)?;
+
+        let callback_server = bind_oauth_callback_server()?;
+        let redirect_uri = callback_server.redirect_uri();
+        let oauth_client = build_oauth_client(&api_url, &client_id, Some(&redirect_uri))?;
+        let (authorize_url, _) = oauth_client
+            .authorize_url(|| CsrfToken::new(state.clone()))
+            .add_scope(Scope::new(OAUTH_SCOPE.to_string()))
+            .set_pkce_challenge(pkce_challenge)
+            .url();
+        let authorize_url = authorize_url.to_string();
+
+        let quiet_requested = explicitly_quiet(base) || base.json;
+        if !quiet_requested {
+            eprintln!(
+                "{}",
+                oauth_authorization_message(&authorize_url, args.no_browser || is_ssh_session())
+            );
+        }
+        if !args.no_browser {
+            if let Err(err) = open::that(&authorize_url) {
+                eprintln!("warning: failed to open browser automatically: {err}");
+            }
+        }
+
+        let callback = collect_oauth_callback(
+            callback_server,
+            args.no_browser || is_ssh_session(),
+            quiet_requested,
+        )
+        .await?;
+        if let Some(error) = callback.error {
+            bail!("oauth authorization failed: {error}");
+        }
+        let auth_code = callback
+            .code
+            .ok_or_else(|| anyhow::anyhow!("no authorization code received"))?;
+        if callback.state.is_none() {
+            bail!(
+                "oauth callback missing state; paste the full callback URL (or code=...&state=...)"
+            );
+        }
+        if callback.state.as_deref() != Some(state.as_str()) {
+            bail!("oauth state mismatch; please try again");
+        }
+
+        exchange_oauth_authorization_code(
+            &api_url,
+            &client_id,
+            &redirect_uri,
+            &auth_code,
+            pkce_verifier,
+        )
+        .await?
+    };
     fetch_login_orgs(&oauth_tokens.access_token, &app_url).await?;
     let store = load_auth_store()?;
     let selected_org: Option<LoginOrgInfo> = None;
