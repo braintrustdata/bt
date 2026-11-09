@@ -1872,13 +1872,11 @@ async fn fetch_trace_rows(
         limit,
     );
     client
-        .btql_with_options::<BtqlResponse>(
-            &query,
-            BtqlOptions {
-                source: Some("bt_views_preview"),
-                ..Default::default()
-            },
-        )
+        .btql_with_options::<BtqlResponse>(&query, {
+            let mut options = BtqlOptions::default();
+            options.source = Some("bt_views_preview");
+            options
+        })
         .await
         .with_context(|| format!("BTQL query failed: {query}"))
         .map(|response| response.data)
@@ -1894,13 +1892,11 @@ async fn fetch_full_span_row(
         sql_quote(row_id),
     );
     client
-        .btql_with_options::<BtqlResponse>(
-            &query,
-            BtqlOptions {
-                source: Some("bt_views_preview"),
-                ..Default::default()
-            },
-        )
+        .btql_with_options::<BtqlResponse>(&query, {
+            let mut options = BtqlOptions::default();
+            options.source = Some("bt_views_preview");
+            options
+        })
         .await
         .with_context(|| format!("BTQL query failed: {query}"))
         .map(|response| response.data.into_iter().next())
@@ -2853,18 +2849,18 @@ export default customDatasetView(
         });
         // Results need not be returned in input order.
         let results = [
-            functions_api::InsertedFunctionResult {
-                id: "fn_test_new".to_string(),
-                project_id: "854ac738-d77f-5aca-88ae-113a8552665a".to_string(),
-                slug: "new-view".to_string(),
-                found_existing: false,
-            },
-            functions_api::InsertedFunctionResult {
-                id: "fn_test_existing".to_string(),
-                project_id: "854ac738-d77f-5aca-88ae-113a8552665a".to_string(),
-                slug: "existing-view".to_string(),
-                found_existing: true,
-            },
+            functions_api::InsertedFunctionResult::new(
+                "fn_test_new".to_string(),
+                "854ac738-d77f-5aca-88ae-113a8552665a".to_string(),
+                "new-view".to_string(),
+                false,
+            ),
+            functions_api::InsertedFunctionResult::new(
+                "fn_test_existing".to_string(),
+                "854ac738-d77f-5aca-88ae-113a8552665a".to_string(),
+                "existing-view".to_string(),
+                true,
+            ),
         ];
         for (mode, expected) in [(IfExistsMode::Ignore, 1), (IfExistsMode::Replace, 2)] {
             let pushed = resolve_pushed_views(

@@ -3916,14 +3916,15 @@ mod tests {
         updated_at: Option<&str>,
         created: Option<&str>,
     ) -> AiProviderSecret {
-        AiProviderSecret {
-            id: id.map(str::to_string),
-            name: name.to_string(),
-            r#type: secret_type.map(str::to_string),
-            preview_secret: preview_secret.map(str::to_string),
-            secret_updated_at: secret_updated_at.map(str::to_string),
-            updated_at: updated_at.map(str::to_string),
-            created: created.map(str::to_string),
+        {
+            let mut value = AiProviderSecret::new(name.to_string());
+            value.id = id.map(str::to_string);
+            value.r#type = secret_type.map(str::to_string);
+            value.preview_secret = preview_secret.map(str::to_string);
+            value.secret_updated_at = secret_updated_at.map(str::to_string);
+            value.updated_at = updated_at.map(str::to_string);
+            value.created = created.map(str::to_string);
+            value
         }
     }
 

@@ -146,19 +146,19 @@ fn build_invocation(
             other => bail!("unsupported invocation mode '{other}'"),
         })
         .transpose()?;
-    Ok(Invocation {
-        function: FunctionId::ProjectNameContent(ProjectNameContent {
+    Ok(Invocation::new(
+        FunctionId::ProjectNameContent(ProjectNameContent {
             project_name: project_name.to_owned(),
             slug,
             version: version.map(ToOwned::to_owned),
         }),
-        arguments: InvokeApi {
+        InvokeApi {
             input,
             messages,
             mode: mode.map(Some),
             ..Default::default()
         },
-    })
+    ))
 }
 
 #[cfg(test)]

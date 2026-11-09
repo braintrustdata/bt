@@ -488,6 +488,7 @@ impl BtqlRetryTracker {
         move |reason| match reason {
             RetryReason::Status(status) => tracker.record_status(status),
             RetryReason::Network => tracker.record_network(),
+            _ => tracker.record_network(),
         }
     }
 
@@ -957,18 +958,17 @@ async fn pull_spans_mode(
         |batch_limit, cursor| async move {
             let query = build_spans_query(source_expr, filter, batch_limit, cursor.as_deref());
             client
-                .with_options(OperationOptions {
-                    on_retry: Some(Arc::new(btql_retry_tracker.observer())),
-                    trace: verbose.then_some("spans").map(str::to_owned),
-                    ..Default::default()
+                .with_options({
+                    let mut options = OperationOptions::default();
+                    options.on_retry = Some(Arc::new(btql_retry_tracker.observer()));
+                    options.trace = verbose.then_some("spans").map(str::to_owned);
+                    options
                 })
-                .btql_with_options::<BtqlResponse>(
-                    &query,
-                    BtqlOptions {
-                        source: Some("bt_sync"),
-                        ..Default::default()
-                    },
-                )
+                .btql_with_options::<BtqlResponse>(&query, {
+                    let mut options = BtqlOptions::default();
+                    options.source = Some("bt_sync");
+                    options
+                })
                 .await
         },
     );
@@ -1202,18 +1202,17 @@ async fn pull_traces_mode(
                 discovery_cursor.as_deref(),
             );
             let response = client
-                .with_options(OperationOptions {
-                    on_retry: Some(Arc::new(btql_retry_tracker.observer())),
-                    trace: verbose.then_some("discover_roots").map(str::to_owned),
-                    ..Default::default()
+                .with_options({
+                    let mut options = OperationOptions::default();
+                    options.on_retry = Some(Arc::new(btql_retry_tracker.observer()));
+                    options.trace = verbose.then_some("discover_roots").map(str::to_owned);
+                    options
                 })
-                .btql_with_options::<BtqlResponse>(
-                    &query,
-                    BtqlOptions {
-                        source: Some("bt_sync"),
-                        ..Default::default()
-                    },
-                )
+                .btql_with_options::<BtqlResponse>(&query, {
+                    let mut options = BtqlOptions::default();
+                    options.source = Some("bt_sync");
+                    options
+                })
                 .await?;
             let row_count = response.data.len();
 
@@ -1510,18 +1509,17 @@ async fn process_trace_chunk(
             cursor.as_deref(),
         );
         let BtqlResponse { data, cursor, .. } = client
-            .with_options(OperationOptions {
-                on_retry: Some(Arc::new(btql_retry_tracker.observer())),
-                trace: verbose.then_some("fetch_roots").map(str::to_owned),
-                ..Default::default()
+            .with_options({
+                let mut options = OperationOptions::default();
+                options.on_retry = Some(Arc::new(btql_retry_tracker.observer()));
+                options.trace = verbose.then_some("fetch_roots").map(str::to_owned);
+                options
             })
-            .btql_with_options::<BtqlResponse>(
-                &query,
-                BtqlOptions {
-                    source: Some("bt_sync"),
-                    ..Default::default()
-                },
-            )
+            .btql_with_options::<BtqlResponse>(&query, {
+                let mut options = BtqlOptions::default();
+                options.source = Some("bt_sync");
+                options
+            })
             .await?;
         let mut rows = data;
         let batch_count = rows.len();
@@ -2330,18 +2328,17 @@ async fn discover_vector_specs_global(
     ]
     .join(" | ");
     let response = client
-        .with_options(OperationOptions {
-            on_retry: Some(Arc::new(btql_retry_tracker.observer())),
-            trace: verbose.then_some("vector_models").map(str::to_owned),
-            ..Default::default()
+        .with_options({
+            let mut options = OperationOptions::default();
+            options.on_retry = Some(Arc::new(btql_retry_tracker.observer()));
+            options.trace = verbose.then_some("vector_models").map(str::to_owned);
+            options
         })
-        .btql_with_options::<BtqlResponse>(
-            &query,
-            BtqlOptions {
-                source: Some("bt_sync"),
-                ..Default::default()
-            },
-        )
+        .btql_with_options::<BtqlResponse>(&query, {
+            let mut options = BtqlOptions::default();
+            options.source = Some("bt_sync");
+            options
+        })
         .await?;
 
     let mut specs = Vec::new();
@@ -2449,18 +2446,17 @@ async fn fetch_vector_columns_for_rows(
         id_literals.len().max(1)
     );
     let response = client
-        .with_options(OperationOptions {
-            on_retry: Some(Arc::new(btql_retry_tracker.observer())),
-            trace: verbose.then_some("vector_rows").map(str::to_owned),
-            ..Default::default()
+        .with_options({
+            let mut options = OperationOptions::default();
+            options.on_retry = Some(Arc::new(btql_retry_tracker.observer()));
+            options.trace = verbose.then_some("vector_rows").map(str::to_owned);
+            options
         })
-        .btql_with_options::<BtqlResponse>(
-            &query,
-            BtqlOptions {
-                source: Some("bt_sync"),
-                ..Default::default()
-            },
-        )
+        .btql_with_options::<BtqlResponse>(&query, {
+            let mut options = BtqlOptions::default();
+            options.source = Some("bt_sync");
+            options
+        })
         .await?;
 
     let mut by_xact = BTreeMap::new();

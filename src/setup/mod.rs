@@ -1305,6 +1305,7 @@ async fn poll_setup_wizard_completion_with_interval(
                     project_name,
                 });
             }
+            _ => bail!("unsupported browser setup session status"),
         }
     }
 }
@@ -2140,10 +2141,10 @@ async fn maybe_create_api_key_for_oauth(base: &BaseArgs, client: &ApiClient) -> 
             .expect("name sequence is infinite")
     };
 
-    let body = braintrust_api_client::backend::extensions::CreateApiKey {
-        name: name.clone(),
-        org_id: org_id.to_owned(),
-    };
+    let body = braintrust_api_client::backend::extensions::CreateApiKey::new(
+        name.clone(),
+        org_id.to_owned(),
+    );
     let created = client.create_api_key(&body).await?;
 
     let explicitly_quiet = base.quiet && base.quiet_source.is_some();

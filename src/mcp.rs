@@ -771,22 +771,25 @@ mod tests {
 
     #[test]
     fn telemetry_is_optional_without_fabricating_intent() {
-        let tool = Tool {
-            name: "test_tool".to_owned(),
-            description: None,
-            input_schema: json!({
-                "type": "object",
-                "properties": {
-                    "query": { "type": "string" },
-                    "telemetry": {
-                        "type": "object",
-                        "properties": { "intent": { "type": "string" } },
-                        "required": ["intent"]
-                    }
-                },
-                "required": ["query", "telemetry"],
-                "additionalProperties": false
-            }),
+        let tool = {
+            let mut value = Tool::new(
+                "test_tool".to_owned(),
+                json!({
+                    "type": "object",
+                    "properties": {
+                        "query": { "type": "string" },
+                        "telemetry": {
+                            "type": "object",
+                            "properties": { "intent": { "type": "string" } },
+                            "required": ["intent"]
+                        }
+                    },
+                    "required": ["query", "telemetry"],
+                    "additionalProperties": false
+                }),
+            );
+            value.description = None;
+            value
         };
         let (mut command, arg_map) = tool_command(&tool, 0).unwrap();
         command = command.arg(Arg::new("mcp_json_args").long("args"));
@@ -902,17 +905,20 @@ mod tests {
 
     #[test]
     fn generated_tool_flags_and_json_args_are_alternative_inputs() {
-        let tool = Tool {
-            name: "test_tool".to_owned(),
-            description: Some("Synthetic test tool".to_owned()),
-            input_schema: json!({
-                "type": "object",
-                "properties": {
-                    "args": { "type": "string" },
-                    "count": { "type": "integer" }
-                },
-                "required": ["args"]
-            }),
+        let tool = {
+            let mut value = Tool::new(
+                "test_tool".to_owned(),
+                json!({
+                    "type": "object",
+                    "properties": {
+                        "args": { "type": "string" },
+                        "count": { "type": "integer" }
+                    },
+                    "required": ["args"]
+                }),
+            );
+            value.description = Some("Synthetic test tool".to_owned());
+            value
         };
         let (tool_command, _) = tool_command(&tool, 0).unwrap();
         let run = Command::new("run")
@@ -967,15 +973,18 @@ mod tests {
 
     #[test]
     fn json_arguments_require_object_and_validate_schema() {
-        let tool = Tool {
-            name: "test_tool".to_owned(),
-            description: None,
-            input_schema: json!({
-                "type": "object",
-                "properties": { "count": { "type": "integer" } },
-                "required": ["count"],
-                "additionalProperties": false
-            }),
+        let tool = {
+            let mut value = Tool::new(
+                "test_tool".to_owned(),
+                json!({
+                    "type": "object",
+                    "properties": { "count": { "type": "integer" } },
+                    "required": ["count"],
+                    "additionalProperties": false
+                }),
+            );
+            value.description = None;
+            value
         };
         let arguments = parse_json_arguments(r#"{"count":2}"#).unwrap();
         validate_json_arguments(&arguments, &tool).unwrap();

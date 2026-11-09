@@ -361,10 +361,7 @@ pub async fn poke_topic_automations(ctx: &ProjectContext) -> Result<TopicsPokeRe
                 .and_then(|config| config.get("data_scope")),
         )?;
 
-        let body = UpsertObjectCursorRequest {
-            automation_id: automation_id.clone(),
-            object_id: object_id.clone(),
-        };
+        let body = UpsertObjectCursorRequest::new(automation_id.clone(), object_id.clone());
         ctx.client.upsert_automation_object_cursor(&body).await?;
 
         queued.push(TopicAutomationPokeResult {
@@ -471,39 +468,41 @@ pub async fn enable_topics_config(
         &embedding_model,
     )
     .await?;
-    let request = RegisterTopicAutomationRequest {
-        project_automation_name: create
+    let request = RegisterTopicAutomationRequest::new(
+        create
             .name
             .unwrap_or_else(|| DEFAULT_TOPIC_AUTOMATION_NAME.to_string()),
-        description: create
+        create
             .description
             .unwrap_or_else(|| DEFAULT_TOPIC_AUTOMATION_DESCRIPTION.to_string()),
-        project_id: ctx.project.id.to_string(),
-        config: RegisterTopicAutomationConfig {
-            event_type: "topic".into(),
-            sampling_rate,
-            facet_functions: facet_names
-                .iter()
-                .map(|facet_name| GlobalFacetFunctionRef {
-                    ref_type: "global".into(),
-                    name: facet_name.clone(),
-                    function_type: "facet".into(),
-                })
-                .collect(),
-            topic_map_functions,
-            scope: TraceScopeConfig {
-                scope_type: "trace".into(),
-                idle_seconds,
-            },
-            rerun_seconds,
-            backfill_time_range: format_duration_seconds(window_seconds),
-            btql_filter: create.btql_filter,
+        ctx.project.id.to_string(),
+        {
+            let mut value = RegisterTopicAutomationConfig::new(
+                "topic".into(),
+                sampling_rate,
+                facet_names
+                    .iter()
+                    .map(|facet_name| {
+                        GlobalFacetFunctionRef::new(
+                            "global".into(),
+                            facet_name.clone(),
+                            "facet".into(),
+                        )
+                    })
+                    .collect(),
+                topic_map_functions,
+                TraceScopeConfig::new("trace".into(), idle_seconds),
+                rerun_seconds,
+                format_duration_seconds(window_seconds),
+            );
+            value.btql_filter = create.btql_filter;
+            value
         },
-        update: true,
-    };
+        true,
+    );
 
     let response = ctx.client.register_topic_automation(&request).await?;
-    let automation_row = serde_json::to_value(registration_automation(response))?;
+    let automation_row = serde_json::to_value(registration_automation(response)?)?;
     seed_topic_automation_cursors(
         &ctx.client,
         &ctx.project.id.to_string(),
@@ -649,7 +648,7 @@ pub async fn update_topics_config(
             Value::Object(payload),
         )?)
         .await?;
-    let updated_row = serde_json::to_value(registration_automation(response))?;
+    let updated_row = serde_json::to_value(registration_automation(response)?)?;
     let mut function_cache = HashMap::new();
     build_topic_automation_config(&ctx.client, &updated_row, &mut function_cache).await
 }
@@ -810,9 +809,12 @@ pub async fn fetch_topic_map_report_url(
     function_id: &str,
     version: Option<&str>,
 ) -> Result<TopicMapReportUrl> {
-    let request = braintrust_api_client::backend::extensions::TopicMapAssetRequest {
-        function_id: function_id.to_owned(),
-        version: version.map(ToOwned::to_owned),
+    let request = {
+        let mut value = braintrust_api_client::backend::extensions::TopicMapAssetRequest::new(
+            function_id.to_owned(),
+        );
+        value.version = version.map(ToOwned::to_owned);
+        value
     };
     client.topic_map_report(&request).await
 }
@@ -822,9 +824,12 @@ pub async fn fetch_topic_map_btmap_url(
     function_id: &str,
     version: Option<&str>,
 ) -> Result<TopicMapReportUrl> {
-    let request = braintrust_api_client::backend::extensions::TopicMapAssetRequest {
-        function_id: function_id.to_owned(),
-        version: version.map(ToOwned::to_owned),
+    let request = {
+        let mut value = braintrust_api_client::backend::extensions::TopicMapAssetRequest::new(
+            function_id.to_owned(),
+        );
+        value.version = version.map(ToOwned::to_owned);
+        value
     };
     client.topic_map_bundle(&request).await
 }
@@ -847,10 +852,11 @@ fn topic_automation_object_id(project_id: &str, data_scope: Option<&Value>) -> R
     }
 }
 
-fn registration_automation(response: AutomationRegistration) -> ProjectAutomation {
+fn registration_automation(response: AutomationRegistration) -> Result<ProjectAutomation> {
     match response {
         AutomationRegistration::Wrapped { project_automation }
-        | AutomationRegistration::Direct(project_automation) => project_automation,
+        | AutomationRegistration::Direct(project_automation) => Ok(project_automation),
+        _ => anyhow::bail!("unsupported automation registration response"),
     }
 }
 
@@ -887,17 +893,14 @@ async fn seed_topic_automation_cursors(
             .saturating_sub(window_seconds.saturating_mul(1000)),
     );
 
-    let reset_body = ResetObjectCursorRequest {
-        automation_id: automation_id.clone(),
-        object_id: object_id.clone(),
-        start_xact_id: start_xact_id.clone(),
-    };
+    let reset_body = ResetObjectCursorRequest::new(
+        automation_id.clone(),
+        object_id.clone(),
+        start_xact_id.clone(),
+    );
     client.reset_automation_cursors(&reset_body).await?;
 
-    let upsert_body = UpsertObjectCursorRequest {
-        automation_id,
-        object_id: object_id.clone(),
-    };
+    let upsert_body = UpsertObjectCursorRequest::new(automation_id, object_id.clone());
     client.upsert_automation_object_cursor(&upsert_body).await?;
 
     Ok(SeededTopicAutomationCursors {
@@ -1122,14 +1125,15 @@ async fn create_topic_map_function_refs(
                 slugify_topic_map_name(facet_name),
             );
             definition.function_type = Some(Some(FunctionTypeEnumNullish::Classifier));
-            FunctionInsert {
-                definition,
-                if_exists: Some("ignore".into()),
+            {
+                let mut value = FunctionInsert::new(definition);
+                value.if_exists = Some("ignore".into());
+                value
             }
         })
         .collect();
     let response = client
-        .insert_functions(&InsertFunctionsRequest { functions })
+        .insert_functions(&InsertFunctionsRequest::new(functions))
         .await?;
     if response.functions.len() != facet_names.len() {
         bail!("failed to create topic map functions");
@@ -1137,11 +1141,8 @@ async fn create_topic_map_function_refs(
     Ok(response
         .functions
         .into_iter()
-        .map(|function| TopicMapFunctionRef {
-            function: FunctionIdRef {
-                ref_type: "function".into(),
-                id: function.id,
-            },
+        .map(|function| {
+            TopicMapFunctionRef::new(FunctionIdRef::new("function".into(), function.id))
         })
         .collect())
 }
@@ -1338,10 +1339,7 @@ async fn fetch_cursor_snapshot(
     project_id: &str,
     automation_id: &str,
 ) -> Result<AutomationCursorSnapshot> {
-    let body = AutomationProjectRequest {
-        automation_id: automation_id.to_string(),
-        project_id: project_id.to_string(),
-    };
+    let body = AutomationProjectRequest::new(automation_id.to_string(), project_id.to_string());
     let response = client.automation_cursors(&body).await?;
     Ok(AutomationCursorSnapshot {
         total_segments: response
@@ -1373,10 +1371,7 @@ async fn fetch_object_cursor_snapshot(
     project_id: &str,
     automation_id: &str,
 ) -> Result<ObjectAutomationCursorSnapshot> {
-    let body = AutomationProjectRequest {
-        automation_id: automation_id.to_string(),
-        project_id: project_id.to_string(),
-    };
+    let body = AutomationProjectRequest::new(automation_id.to_string(), project_id.to_string());
     let response = client.automation_object_cursors(&body).await?;
     Ok(ObjectAutomationCursorSnapshot {
         total_objects: response
@@ -1925,13 +1920,11 @@ async fn fetch_topic_automation_progress(
         "from: project_logs('{escaped_project_id}') spans | measures: count_distinct(root_span_id) as total_traces | filter: {time_filter_clause}"
     );
     let total_response = client
-        .btql_with_options::<Value>(
-            &total_query,
-            BtqlOptions {
-                realtime: Some(true),
-                ..Default::default()
-            },
-        )
+        .btql_with_options::<Value>(&total_query, {
+            let mut options = BtqlOptions::default();
+            options.realtime = Some(true);
+            options
+        })
         .await?;
     let total_row = first_btql_row(&total_response);
     let aggregate_row = if measure_expressions.is_empty() {
@@ -1942,13 +1935,11 @@ async fn fetch_topic_automation_progress(
             measure_expressions.join(", ")
         );
         let aggregate_response = client
-            .btql_with_options::<Value>(
-                &aggregate_query,
-                BtqlOptions {
-                    realtime: Some(true),
-                    ..Default::default()
-                },
-            )
+            .btql_with_options::<Value>(&aggregate_query, {
+                let mut options = BtqlOptions::default();
+                options.realtime = Some(true);
+                options
+            })
             .await?;
         first_btql_row(&aggregate_response).cloned()
     };
@@ -2348,21 +2339,23 @@ mod tests {
 
     #[test]
     fn topic_map_report_url_request_matches_endpoint_shape() {
-        let without_version = serde_json::to_value(
-            braintrust_api_client::backend::extensions::TopicMapAssetRequest {
-                function_id: "fn_123".into(),
-                version: None,
-            },
-        )
+        let without_version = serde_json::to_value({
+            let mut value = braintrust_api_client::backend::extensions::TopicMapAssetRequest::new(
+                "fn_123".into(),
+            );
+            value.version = None;
+            value
+        })
         .expect("serialize report url request");
         assert_eq!(without_version, json!({ "function_id": "fn_123" }));
 
-        let with_version = serde_json::to_value(
-            braintrust_api_client::backend::extensions::TopicMapAssetRequest {
-                function_id: "fn_123".into(),
-                version: Some("0000000000000001".into()),
-            },
-        )
+        let with_version = serde_json::to_value({
+            let mut value = braintrust_api_client::backend::extensions::TopicMapAssetRequest::new(
+                "fn_123".into(),
+            );
+            value.version = Some("0000000000000001".into());
+            value
+        })
         .expect("serialize report url request");
         assert_eq!(
             with_version,

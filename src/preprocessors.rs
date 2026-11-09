@@ -1209,7 +1209,7 @@ export default preprocessor;
             }]
         }))
         .expect("validation report");
-        let err = anyhow::Error::new(functions_api::FunctionValidationError { report });
+        let err = anyhow::Error::new(functions_api::FunctionValidationError::new(report));
         let message = format_preprocessors_insert_error(
             &[test_preprocessor("test-preprocessor")],
             IfExistsMode::Error,
@@ -1254,18 +1254,18 @@ export default preprocessor;
     fn push_reporting_distinguishes_ignored_preprocessors_from_replacements() {
         let preprocessors = ["existing-preprocessor", "new-preprocessor"].map(test_preprocessor);
         let results = [
-            functions_api::InsertedFunctionResult {
-                id: "fn_test_new".to_string(),
-                project_id: "854ac738-d77f-5aca-88ae-113a8552665a".to_string(),
-                slug: "new-preprocessor".to_string(),
-                found_existing: false,
-            },
-            functions_api::InsertedFunctionResult {
-                id: "fn_test_existing".to_string(),
-                project_id: "854ac738-d77f-5aca-88ae-113a8552665a".to_string(),
-                slug: "existing-preprocessor".to_string(),
-                found_existing: true,
-            },
+            functions_api::InsertedFunctionResult::new(
+                "fn_test_new".to_string(),
+                "854ac738-d77f-5aca-88ae-113a8552665a".to_string(),
+                "new-preprocessor".to_string(),
+                false,
+            ),
+            functions_api::InsertedFunctionResult::new(
+                "fn_test_existing".to_string(),
+                "854ac738-d77f-5aca-88ae-113a8552665a".to_string(),
+                "existing-preprocessor".to_string(),
+                true,
+            ),
         ];
         for (mode, expected) in [(IfExistsMode::Ignore, 1), (IfExistsMode::Replace, 2)] {
             let pushed =

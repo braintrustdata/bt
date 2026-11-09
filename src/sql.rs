@@ -515,14 +515,12 @@ fn format_response(response: &SqlResponse, json_output: bool) -> Result<String> 
 
 async fn execute_query(client: &ApiClient, query: &str, lint_mode: &str) -> Result<SqlResponse> {
     match client
-        .btql_with_options(
-            query,
-            BtqlOptions {
-                source: Some("bt_sql"),
-                lint_mode: Some(lint_mode),
-                ..Default::default()
-            },
-        )
+        .btql_with_options(query, {
+            let mut options = BtqlOptions::default();
+            options.source = Some("bt_sql");
+            options.lint_mode = Some(lint_mode);
+            options
+        })
         .await
     {
         Ok(response) => Ok(response),
@@ -589,9 +587,10 @@ async fn wait_for_async_query(
     let started = Instant::now();
     loop {
         let status: AsyncQueryStatusResponse = client
-            .with_options(OperationOptions {
-                retry: Some(true),
-                ..Default::default()
+            .with_options({
+                let mut options = OperationOptions::default();
+                options.retry = Some(true);
+                options
             })
             .query_status(automation_id)
             .await?;
@@ -621,9 +620,10 @@ async fn collect_async_query_result(
         .pages(None, page_size, |limit, cursor| async move {
             loop {
                 let page: AsyncQueryResultPage = client
-                    .with_options(OperationOptions {
-                        retry: Some(true),
-                        ..Default::default()
+                    .with_options({
+                        let mut options = OperationOptions::default();
+                        options.retry = Some(true);
+                        options
                     })
                     .query_page(automation_id, limit as u64, cursor.as_deref())
                     .await?;
@@ -643,11 +643,9 @@ async fn collect_async_query_result(
                         ))
                     );
                 }
-                return Ok(crate::http::BtqlResponse {
-                    data: page.rows,
-                    cursor: page.cursor,
-                    schema: None,
-                });
+                let mut response = crate::http::BtqlResponse::new(page.rows);
+                response.cursor = page.cursor;
+                return Ok(response);
             }
         })
         .try_fold(Vec::new(), |mut rows, page| async move {

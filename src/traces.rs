@@ -1459,13 +1459,11 @@ async fn fetch_span_item(
     maybe_print_query(print_queries, label, &query);
     let response = with_spinner("Loading span...", async {
         client
-            .btql_with_options::<BtqlResponse>(
-                &query,
-                BtqlOptions {
-                    source: Some("bt_traces"),
-                    ..Default::default()
-                },
-            )
+            .btql_with_options::<BtqlResponse>(&query, {
+                let mut options = BtqlOptions::default();
+                options.source = Some("bt_traces");
+                options
+            })
             .await
             .with_context(|| format!("BTQL query failed: {query}"))
     })
@@ -6038,13 +6036,11 @@ async fn lookup_root_span_id_for_query(
 ) -> Result<Option<String>> {
     maybe_print_query(print_queries, label, query);
     let response = client
-        .btql_with_options::<BtqlResponse>(
-            query,
-            BtqlOptions {
-                source: Some("bt_traces"),
-                ..Default::default()
-            },
-        )
+        .btql_with_options::<BtqlResponse>(query, {
+            let mut options = BtqlOptions::default();
+            options.source = Some("bt_traces");
+            options
+        })
         .await
         .with_context(|| format!("BTQL query failed: {query}"))?;
 
@@ -6291,13 +6287,11 @@ async fn fetch_summary_rows(
                 );
                 maybe_print_query(query_ctx.print_queries, "summary", &query);
                 client
-                    .btql_with_options::<BtqlResponse>(
-                        &query,
-                        BtqlOptions {
-                            source: Some("bt_traces"),
-                            ..Default::default()
-                        },
-                    )
+                    .btql_with_options::<BtqlResponse>(&query, {
+                        let mut options = BtqlOptions::default();
+                        options.source = Some("bt_traces");
+                        options
+                    })
                     .await
                     .with_context(|| format!("BTQL query failed: {query}"))
             },
@@ -6324,13 +6318,11 @@ async fn fetch_logs_page(
     );
     maybe_print_query(query_ctx.print_queries, "logs", &query);
     client
-        .btql_with_options::<BtqlResponse>(
-            &query,
-            BtqlOptions {
-                source: Some("bt_traces"),
-                ..Default::default()
-            },
-        )
+        .btql_with_options::<BtqlResponse>(&query, {
+            let mut options = BtqlOptions::default();
+            options.source = Some("bt_traces");
+            options
+        })
         .await
         .with_context(|| format!("BTQL query failed: {query}"))
 }
@@ -6347,13 +6339,11 @@ async fn fetch_trace_spans_page(
     let query = build_trace_spans_query(source_expr, root_span_id, preview_length, limit, cursor);
     maybe_print_query(print_queries, "trace", &query);
     client
-        .btql_with_options::<BtqlResponse>(
-            &query,
-            BtqlOptions {
-                source: Some("bt_traces"),
-                ..Default::default()
-            },
-        )
+        .btql_with_options::<BtqlResponse>(&query, {
+            let mut options = BtqlOptions::default();
+            options.source = Some("bt_traces");
+            options
+        })
         .await
         .with_context(|| format!("BTQL query failed: {query}"))
 }
@@ -6371,13 +6361,11 @@ async fn fetch_waterfall_spans_page(
         build_waterfall_spans_query(source_expr, root_span_id, preview_length, limit, cursor);
     maybe_print_query(print_queries, "waterfall", &query);
     client
-        .btql_with_options::<BtqlResponse>(
-            &query,
-            BtqlOptions {
-                source: Some("bt_traces"),
-                ..Default::default()
-            },
-        )
+        .btql_with_options::<BtqlResponse>(&query, {
+            let mut options = BtqlOptions::default();
+            options.source = Some("bt_traces");
+            options
+        })
         .await
         .with_context(|| format!("BTQL query failed: {query}"))
 }
@@ -6404,13 +6392,11 @@ async fn fetch_trace_span_rows_for_tree(
                 );
                 maybe_print_query(print_queries, "spans-tree", &query);
                 client
-                    .btql_with_options::<BtqlResponse>(
-                        &query,
-                        BtqlOptions {
-                            source: Some("bt_traces"),
-                            ..Default::default()
-                        },
-                    )
+                    .btql_with_options::<BtqlResponse>(&query, {
+                        let mut options = BtqlOptions::default();
+                        options.source = Some("bt_traces");
+                        options
+                    })
                     .await
                     .with_context(|| format!("BTQL query failed: {query}"))
             },
@@ -6429,13 +6415,11 @@ async fn fetch_full_span_row(
     maybe_print_query(print_queries, "span-full", &query);
 
     let response = client
-        .btql_with_options::<BtqlResponse>(
-            &query,
-            BtqlOptions {
-                source: Some("bt_traces"),
-                ..Default::default()
-            },
-        )
+        .btql_with_options::<BtqlResponse>(&query, {
+            let mut options = BtqlOptions::default();
+            options.source = Some("bt_traces");
+            options
+        })
         .await
         .with_context(|| format!("BTQL query failed: {query}"))?;
 

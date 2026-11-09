@@ -65,15 +65,13 @@ pub async fn list_prompt_versions(
 ) -> Result<Vec<String>> {
     let query = prompt_versions_query(project_id, prompt_id);
     let response: BtqlResponse<Value> = client
-        .btql_with_options(
-            &query,
-            BtqlOptions {
-                audit_log: Some(true),
-                use_columnstore: Some(false),
-                realtime: Some(true),
-                ..Default::default()
-            },
-        )
+        .btql_with_options(&query, {
+            let mut options = BtqlOptions::default();
+            options.audit_log = Some(true);
+            options.use_columnstore = Some(false);
+            options.realtime = Some(true);
+            options
+        })
         .await?;
 
     Ok(prompt_versions_from_rows(response.data))
@@ -129,10 +127,10 @@ pub async fn assign_prompt(
         .assign_prompt(
             prompt_id,
             environment,
-            &braintrust_api_client::backend::extensions::EnvironmentAssignment {
-                object_version: object_version.to_owned(),
-                org_name: client.org_name().to_owned(),
-            },
+            &braintrust_api_client::backend::extensions::EnvironmentAssignment::new(
+                object_version.to_owned(),
+                client.org_name().to_owned(),
+            ),
         )
         .await
 }

@@ -1680,12 +1680,12 @@ async fn upload_deferred_attachment(
     base_dir: Option<&Path>,
 ) -> Result<Value> {
     let key = uuid::Uuid::new_v4().to_string();
-    let request = braintrust_api_client::backend::extensions::AttachmentRequest {
-        key: key.clone(),
-        filename: spec.filename.clone(),
-        content_type: spec.content_type.clone(),
-        org_id: client.org_id().to_owned(),
-    };
+    let request = braintrust_api_client::backend::extensions::AttachmentRequest::new(
+        key.clone(),
+        spec.filename.clone(),
+        spec.content_type.clone(),
+        client.org_id().to_owned(),
+    );
     let metadata = client
         .request_attachment(&request)
         .await
@@ -1702,11 +1702,8 @@ async fn upload_deferred_attachment(
             error_message: err.to_string(),
         },
     };
-    let status_request = AttachmentStatusRequest {
-        key: key.clone(),
-        org_id: client.org_id().to_owned(),
-        status,
-    };
+    let status_request =
+        AttachmentStatusRequest::new(key.clone(), client.org_id().to_owned(), status);
     client
         .attachment_status(&status_request)
         .await

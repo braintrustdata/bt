@@ -95,12 +95,13 @@ pub async fn get_function_by_slug(
     version: Option<&str>,
     environment: Option<&str>,
 ) -> Result<Option<Function>> {
-    let query = FunctionListQuery {
-        project_id: Some(project_id.to_string()),
-        slug: Some(slug.to_string()),
-        version: version.map(ToOwned::to_owned),
-        environment: environment.map(ToOwned::to_owned),
-        ..Default::default()
+    let query = {
+        let mut options = FunctionListQuery::default();
+        options.project_id = Some(project_id.to_string());
+        options.slug = Some(slug.to_string());
+        options.version = version.map(ToOwned::to_owned);
+        options.environment = environment.map(ToOwned::to_owned);
+        options
     };
     let page = list_functions_page(client, &query).await?;
     let Some(raw) = page.objects.into_iter().next() else {
@@ -116,11 +117,12 @@ pub async fn get_function_by_id(
     version: Option<&str>,
     environment: Option<&str>,
 ) -> Result<Option<Function>> {
-    let query = FunctionListQuery {
-        id: Some(id.to_string()),
-        version: version.map(ToOwned::to_owned),
-        environment: environment.map(ToOwned::to_owned),
-        ..Default::default()
+    let query = {
+        let mut options = FunctionListQuery::default();
+        options.id = Some(id.to_string());
+        options.version = version.map(ToOwned::to_owned);
+        options.environment = environment.map(ToOwned::to_owned);
+        options
     };
     let page = list_functions_page(client, &query).await?;
     let Some(raw) = page.objects.into_iter().next() else {
@@ -135,9 +137,10 @@ pub async fn invoke_function(
     body: &braintrust_api_client::backend::extensions::Invocation,
 ) -> Result<serde_json::Value> {
     let result = client
-        .with_options(OperationOptions {
-            timeout: Some(std::time::Duration::from_secs(300)),
-            ..Default::default()
+        .with_options({
+            let mut options = OperationOptions::default();
+            options.timeout = Some(std::time::Duration::from_secs(300));
+            options
         })
         .invoke(body)
         .await;
@@ -174,9 +177,10 @@ pub async fn list_functions_page(
 
 /// List a project's functions using the public API's cursor contract.
 pub async fn list_all_functions(client: &ApiClient, project_id: &str) -> Result<Vec<Function>> {
-    let mut query = FunctionListQuery {
-        project_id: Some(project_id.to_string()),
-        ..Default::default()
+    let mut query = {
+        let mut options = FunctionListQuery::default();
+        options.project_id = Some(project_id.to_string());
+        options
     };
     let mut functions = Vec::new();
     let mut cursors = HashSet::new();
@@ -221,13 +225,13 @@ pub async fn request_code_upload_slot(
     runtime: &str,
     version: &str,
 ) -> Result<CodeUploadSlot> {
-    let request = braintrust_api_client::backend::extensions::CodeUploadRequest {
-        org_id: org_id.to_owned(),
-        runtime_context: braintrust_api_client::backend::extensions::RuntimeContext {
-            runtime: runtime.to_owned(),
-            version: version.to_owned(),
-        },
-    };
+    let request = braintrust_api_client::backend::extensions::CodeUploadRequest::new(
+        org_id.to_owned(),
+        braintrust_api_client::backend::extensions::RuntimeContext::new(
+            runtime.to_owned(),
+            version.to_owned(),
+        ),
+    );
     client.code_upload(&request).await
 }
 
@@ -307,22 +311,19 @@ mod tests {
 
     #[test]
     fn provider_auth_detection_requires_an_auth_status_and_provider_shape() {
-        let provider_error = HttpError {
-            status: reqwest::StatusCode::UNAUTHORIZED,
-            body: serde_json::json!({
+        let provider_error = HttpError::new(
+            reqwest::StatusCode::UNAUTHORIZED,
+            serde_json::json!({
                 "error": {
                     "message": "Incorrect API key provided: synthetic-key",
                     "code": "invalid_api_key"
                 }
             })
             .to_string(),
-        };
+        );
         assert!(is_provider_auth_response(&provider_error));
 
-        let bad_request = HttpError {
-            status: reqwest::StatusCode::BAD_REQUEST,
-            body: provider_error.body,
-        };
+        let bad_request = HttpError::new(reqwest::StatusCode::BAD_REQUEST, provider_error.body);
         assert!(!is_provider_auth_response(&bad_request));
     }
 

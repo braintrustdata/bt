@@ -529,6 +529,7 @@ fn classify_error(err: &anyhow::Error, missing_credential: bool) -> ExitCode {
             FailureKind::Authentication => ExitCode::Auth,
             FailureKind::InvalidInput => ExitCode::User,
             FailureKind::Unavailable => ExitCode::Network,
+            _ => ExitCode::Error,
         };
     }
 
@@ -562,6 +563,7 @@ fn classify_sdk_error(err: &anyhow::Error) -> Option<ExitCode> {
                 FailureKind::Authentication => ExitCode::Auth,
                 FailureKind::InvalidInput => ExitCode::User,
                 FailureKind::Unavailable => ExitCode::Network,
+                _ => ExitCode::Error,
             })
         }
         braintrust_sdk_rust::BraintrustError::Http(_)
@@ -857,9 +859,9 @@ mod tests {
 
     #[test]
     fn provider_credential_errors_are_not_classified_as_bt_auth_errors() {
-        let err = crate::error::user_error(anyhow::Error::new(crate::http::HttpError {
-            status: reqwest::StatusCode::UNAUTHORIZED,
-            body: serde_json::json!({
+        let err = crate::error::user_error(anyhow::Error::new(crate::http::HttpError::new(
+            reqwest::StatusCode::UNAUTHORIZED,
+            serde_json::json!({
                 "error": {
                     "message": "Incorrect API key provided: synthetic-key",
                     "type": "invalid_request_error",
@@ -868,7 +870,7 @@ mod tests {
                 "status": 401
             })
             .to_string(),
-        }));
+        )));
 
         assert_eq!(classify_error(&err, false), ExitCode::User);
         let payload = json_error_payload(&err);
@@ -884,10 +886,10 @@ mod tests {
 
     #[test]
     fn json_http_errors_use_a_stable_envelope() {
-        let err = anyhow::Error::new(crate::http::HttpError {
-            status: reqwest::StatusCode::BAD_REQUEST,
-            body: serde_json::json!(["synthetic", "details"]).to_string(),
-        });
+        let err = anyhow::Error::new(crate::http::HttpError::new(
+            reqwest::StatusCode::BAD_REQUEST,
+            serde_json::json!(["synthetic", "details"]).to_string(),
+        ));
 
         let payload = json_error_payload(&err);
         assert!(payload["error"]["message"].is_string());
@@ -908,10 +910,10 @@ mod tests {
                 }
             }),
         ] {
-            let err = anyhow::Error::new(crate::http::HttpError {
-                status: reqwest::StatusCode::UNAUTHORIZED,
-                body: body.to_string(),
-            });
+            let err = anyhow::Error::new(crate::http::HttpError::new(
+                reqwest::StatusCode::UNAUTHORIZED,
+                body.to_string(),
+            ));
 
             assert_eq!(classify_error(&err, false), ExitCode::Auth);
         }
