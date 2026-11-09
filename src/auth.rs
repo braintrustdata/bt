@@ -619,6 +619,21 @@ pub async fn login(base: &BaseArgs) -> Result<LoginContext> {
         .blocking_login(true)
         .api_key(api_key.clone());
 
+    if let Some(ca_cert) = base.ca_cert() {
+        if let Some(custom_ca_pem) = &base.custom_ca_pem {
+            let mut pem = std::fs::read(ca_cert)
+                .with_context(|| format!("failed to read CA bundle {}", ca_cert.display()))?;
+            let custom_ca_pem = custom_ca_pem
+                .to_str()
+                .context("BRAINTRUST_CUSTOM_CA_BUNDLE must contain valid UTF-8 PEM data")?;
+            pem.push(b'\n');
+            pem.extend_from_slice(custom_ca_pem.as_bytes());
+            builder = builder.custom_ca_bundle_pem(pem);
+        } else {
+            builder = builder.ca_bundle(ca_cert);
+        }
+    }
+
     if let Some(api_url) = &auth.api_url {
         builder = builder.api_url(api_url);
     }

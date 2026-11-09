@@ -340,10 +340,14 @@ fn handle_version_json(argv: &[OsString]) -> Result<bool> {
     Ok(true)
 }
 
-fn apply_runtime_env_overrides(base: &LoginBaseArgs) {
+fn apply_runtime_env_overrides(base: &mut LoginBaseArgs) {
     // Apply the CLI-owned override once so reqwest and inherited child
     // commands consistently observe BRAINTRUST_CA_CERT/--ca-cert precedence
     // over any ambient SSL_CERT_FILE.
+    base.custom_ca_pem = std::env::var_os("BRAINTRUST_CUSTOM_CA_BUNDLE");
+    if base.ca_cert.is_none() {
+        base.ca_cert = std::env::var_os("SSL_CERT_FILE").map(Into::into);
+    }
     if let Some(ca_cert) = base.ca_cert() {
         std::env::set_var("SSL_CERT_FILE", ca_cert);
     }
@@ -383,7 +387,7 @@ fn try_main() -> Result<()> {
         std::sync::atomic::Ordering::Relaxed,
     );
     configure_output(cli.command.base());
-    apply_runtime_env_overrides(cli.command.base());
+    apply_runtime_env_overrides(cli.command.base_mut());
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()

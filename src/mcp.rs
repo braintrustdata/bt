@@ -183,7 +183,7 @@ async fn run(argv: &[std::ffi::OsString]) -> Result<()> {
         base.login.verbose = false;
     }
     crate::configure_output(&base.login);
-    crate::apply_runtime_env_overrides(&base.login);
+    crate::apply_runtime_env_overrides(&mut base.login);
     let auth = auth::fast_login(&base).await?;
     let api_key = auth
         .login

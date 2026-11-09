@@ -574,7 +574,7 @@ dependencies = [
 [[package]]
 name = "braintrust-api-client"
 version = "0.1.0-alpha.2"
-source = "git+https://github.com/braintrustdata/braintrust-sdk-rust?rev=0abaa00130b0c51314c5ac0dddd9977ac9cf675c#0abaa00130b0c51314c5ac0dddd9977ac9cf675c"
+source = "git+https://github.com/braintrustdata/braintrust-sdk-rust?rev=8d5c8062ce3fd410aff65d8c7f8e2beb21c163d7#8d5c8062ce3fd410aff65d8c7f8e2beb21c163d7"
 dependencies = [
  "anyhow",
  "backoff",
@@ -600,7 +600,35 @@ dependencies = [
 [[package]]
 name = "braintrust-sdk-rust"
 version = "0.1.0-alpha.2"
-source = "git+https://github.com/braintrustdata/braintrust-sdk-rust?rev=0abaa00130b0c51314c5ac0dddd9977ac9cf675c#0abaa00130b0c51314c5ac0dddd9977ac9cf675c"
+source = "git+https://github.com/braintrustdata/braintrust-sdk-rust?rev=45a2c88ca9d9ccc393ec0338ac438199fc3c5df2#45a2c88ca9d9ccc393ec0338ac438199fc3c5df2"
+dependencies = [
+ "anyhow",
+ "arc-swap",
+ "async-trait",
+ "backoff",
+ "base64 0.23.1",
+ "bon",
+ "bytes",
+ "chrono",
+ "crossbeam",
+ "futures",
+ "indexmap 2.14.0",
+ "regex",
+ "reqwest 0.13.5",
+ "serde",
+ "serde_json 1.0.151",
+ "serde_repr",
+ "thiserror 2.0.19",
+ "tokio",
+ "tracing",
+ "url",
+ "uuid",
+]
+
+[[package]]
+name = "braintrust-sdk-rust"
+version = "0.1.0-alpha.2"
+source = "git+https://github.com/braintrustdata/braintrust-sdk-rust?rev=8d5c8062ce3fd410aff65d8c7f8e2beb21c163d7#8d5c8062ce3fd410aff65d8c7f8e2beb21c163d7"
 dependencies = [
  "anyhow",
  "arc-swap",
@@ -617,34 +645,6 @@ dependencies = [
  "regex",
  "reqwest 0.13.5",
  "reqwest-middleware",
- "serde",
- "serde_json 1.0.151",
- "serde_repr",
- "thiserror 2.0.19",
- "tokio",
- "tracing",
- "url",
- "uuid",
-]
-
-[[package]]
-name = "braintrust-sdk-rust"
-version = "0.1.0-alpha.2"
-source = "git+https://github.com/braintrustdata/braintrust-sdk-rust?rev=45a2c88ca9d9ccc393ec0338ac438199fc3c5df2#45a2c88ca9d9ccc393ec0338ac438199fc3c5df2"
-dependencies = [
- "anyhow",
- "arc-swap",
- "async-trait",
- "backoff",
- "base64 0.23.1",
- "bon",
- "bytes",
- "chrono",
- "crossbeam",
- "futures",
- "indexmap 2.14.0",
- "regex",
- "reqwest 0.13.5",
  "serde",
  "serde_json 1.0.151",
  "serde_repr",
@@ -706,7 +706,7 @@ dependencies = [
  "async-trait",
  "base64 0.22.1",
  "braintrust-api-client",
- "braintrust-sdk-rust 0.1.0-alpha.2 (git+https://github.com/braintrustdata/braintrust-sdk-rust?rev=0abaa00130b0c51314c5ac0dddd9977ac9cf675c)",
+ "braintrust-sdk-rust 0.1.0-alpha.2 (git+https://github.com/braintrustdata/braintrust-sdk-rust?rev=8d5c8062ce3fd410aff65d8c7f8e2beb21c163d7)",
  "bt-daemon",
  "chrono",
  "clap",
@@ -729,6 +729,7 @@ dependencies = [
  "pathdiff",
  "predicates",
  "ratatui",
+ "rcgen",
  "regex",
  "reqwest 0.13.5",
  "rustls-native-certs",
@@ -747,6 +748,7 @@ dependencies = [
  "swc_ecma_transforms_typescript",
  "tempfile",
  "tokio",
+ "tokio-rustls",
  "toml",
  "tracing-subscriber",
  "unicode-width 0.1.14",
@@ -1480,7 +1482,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "39cab71617ae0d63f51a36d69f866391735b51691dbda63cf6f96d042b63efeb"
 dependencies = [
  "libc",
- "windows-sys 0.61.2",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]
@@ -2726,7 +2728,7 @@ version = "0.50.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7957b9740744892f114936ab4a57b3f487491bbeafaf8083688b16841a4240e5"
 dependencies = [
- "windows-sys 0.61.2",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]
@@ -2983,6 +2985,16 @@ dependencies = [
  "prost",
  "prost-build",
  "serde",
+]
+
+[[package]]
+name = "pem"
+version = "3.0.6"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "1d30c53c26bc5b31a98cd02d20f25a7c8567146caf63ed593a9d87b2775291be"
+dependencies = [
+ "base64 0.22.1",
+ "serde_core",
 ]
 
 [[package]]
@@ -3302,7 +3314,7 @@ dependencies = [
  "once_cell",
  "socket2 0.5.10",
  "tracing",
- "windows-sys 0.61.2",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]
@@ -3487,6 +3499,19 @@ dependencies = [
  "time",
  "unicode-segmentation",
  "unicode-width 0.2.2",
+]
+
+[[package]]
+name = "rcgen"
+version = "0.13.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "75e669e5202259b5314d1ea5397316ad400819437857b90861765f24c4cf80a2"
+dependencies = [
+ "pem",
+ "ring",
+ "rustls-pki-types",
+ "time",
+ "yasna",
 ]
 
 [[package]]
@@ -3779,7 +3804,7 @@ dependencies = [
  "errno",
  "libc",
  "linux-raw-sys 0.12.1",
- "windows-sys 0.61.2",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]
@@ -3789,6 +3814,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "48e13bd8c0e9365c43cfa5c9e8f9ad49d3c8444926c9aac819e0e4dc503c8fdf"
 dependencies = [
  "aws-lc-rs",
+ "log",
  "once_cell",
  "ring",
  "rustls-pki-types",
@@ -4816,7 +4842,7 @@ dependencies = [
  "getrandom 0.3.4",
  "once_cell",
  "rustix 1.1.4",
- "windows-sys 0.61.2",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]
@@ -5660,7 +5686,7 @@ version = "0.1.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c2a7b1c03c876122aa43f3020e6c3c3ee5c05081c9a00739faf7503aeba10d22"
 dependencies = [
- "windows-sys 0.61.2",
+ "windows-sys 0.48.0",
 ]
 
 [[package]]
@@ -5917,6 +5943,15 @@ dependencies = [
  "libyaml-rs",
  "ryu",
  "serde",
+]
+
+[[package]]
+name = "yasna"
+version = "0.5.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e17bb3549cc1321ae1296b9cdc2698e2b6cb1992adfa19a8c72e5b7a738f44cd"
+dependencies = [
+ "time",
 ]
 
 [[package]]

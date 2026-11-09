@@ -97,6 +97,10 @@ pub struct LoginBaseArgs {
     )]
     pub ca_cert: Option<PathBuf>,
 
+    // The SDK's raw PEM setting can be combined with the CLI's CA file.
+    #[arg(skip)]
+    pub custom_ca_pem: Option<OsString>,
+
     /// Path to a .env file to load before running commands.
     #[arg(
         long,

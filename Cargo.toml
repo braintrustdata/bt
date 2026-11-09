@@ -17,7 +17,7 @@ eula = false
 [dependencies]
 actix-web = "4.11.0"
 anyhow = "1.0.89"
-braintrust-sdk-rust = { git = "https://github.com/braintrustdata/braintrust-sdk-rust", rev = "0abaa00130b0c51314c5ac0dddd9977ac9cf675c" }
+braintrust-sdk-rust = { git = "https://github.com/braintrustdata/braintrust-sdk-rust", rev = "8d5c8062ce3fd410aff65d8c7f8e2beb21c163d7" }
 bt-daemon = { git = "https://github.com/braintrustdata/braintrust-coding-agent-plugins", rev = "055eedf7868eb773a576931ab131290d86913820" }
 async-trait = "0.1"
 clap = { version = "4.5.20", features = ["derive", "env", "string"] }
@@ -26,7 +26,7 @@ futures-util = "0.3.31"
 indicatif = "0.17.8"
 ratatui = "0.30.2"
 reqwest = { version = "0.13", default-features = false, features = ["json", "rustls"] }
-braintrust-api-client = { git = "https://github.com/braintrustdata/braintrust-sdk-rust", rev = "0abaa00130b0c51314c5ac0dddd9977ac9cf675c" }
+braintrust-api-client = { git = "https://github.com/braintrustdata/braintrust-sdk-rust", rev = "8d5c8062ce3fd410aff65d8c7f8e2beb21c163d7" }
 rustls-native-certs = "0.8"
 serde = { version = "1.0.210", features = ["derive"] }
 serde_json = "1.0.128"
@@ -78,6 +78,8 @@ members = ["."]
 [dev-dependencies]
 assert_cmd = "2.2.0"
 predicates = "3.1.4"
+rcgen = "0.13"
+tokio-rustls = "0.26"
 
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.61.2", features = [
