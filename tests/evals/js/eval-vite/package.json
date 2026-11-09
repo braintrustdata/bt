@@ -14,5 +14,11 @@
   },
   "devDependencies": {
     "tsx": "^4.23.15"
+  },
+  "pnpm": {
+    "overrides": {
+      "rimraf>glob": "^14.0.4",
+      "braintrust>minimatch": "^11.0.5"
+    }
   }
 }
