@@ -143,6 +143,13 @@ jobs:
         with:
           targets: ${{ join(matrix.targets, ',') }}
 
+      # Share dependency builds with stable releases, keeping each target isolated.
+      # Only main writes caches so branch canaries do not evict release caches.
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          shared-key: dist-${{ matrix.runner }}-${{ join(matrix.targets, '-') }}
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+
       - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
           node-version: "22.15.0"
@@ -513,7 +520,7 @@ jobs:
       - plan
       - announce
     if: ${{ needs.announce.result == 'success' && vars.BT_ENABLE_MACOS_SMOKE == '1' }}
-    runs-on: macos-13
+    runs-on: macos-15-intel
     env:
       CANARY_TAG: ${{ needs.plan.outputs.canary-tag }}
       REPO: ${{ github.repository }}
