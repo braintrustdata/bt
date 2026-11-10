@@ -167,7 +167,7 @@ fn write_run_agent(path: &Path) {
     let probe = codex_probe_script(path, true);
     fs::write(
         path,
-        format!("#!/bin/sh\n{probe}{}", "printf '%s\\n' \"$*\" > \"$AGENT_RUN_LOG\"\nprintf '%s\\n' \"$BT_TRACE_INVOCATION_SETTINGS\" > \"$AGENT_RUN_SETTINGS\"\nif [ -n \"$AGENT_RUN_DAEMON_ENV\" ]; then printf '%s\\n%s\\n' \"$BT_DAEMON_SOCKET\" \"$BT_DAEMON_DATA_DIR\" > \"$AGENT_RUN_DAEMON_ENV\"; fi\nif [ -n \"$AGENT_RUN_CONFIG\" ]; then printf '%s\\n' \"$OPENCODE_CONFIG_CONTENT\" > \"$AGENT_RUN_CONFIG\"; fi\n"),
+        format!("#!/bin/sh\n{probe}{}", "if [ \"$1\" = --version ] && [ -n \"$AGENT_RUN_VERSION\" ]; then printf '%s\\n' \"$AGENT_RUN_VERSION\"; fi\nprintf '%s\\n' \"$*\" > \"$AGENT_RUN_LOG\"\nprintf '%s\\n' \"$BT_TRACE_INVOCATION_SETTINGS\" > \"$AGENT_RUN_SETTINGS\"\nif [ -n \"$AGENT_RUN_DAEMON_ENV\" ]; then printf '%s\\n%s\\n' \"$BT_DAEMON_SOCKET\" \"$BT_DAEMON_DATA_DIR\" > \"$AGENT_RUN_DAEMON_ENV\"; fi\nif [ -n \"$AGENT_RUN_CONFIG\" ]; then printf '%s\\n' \"$OPENCODE_CONFIG_CONTENT\" > \"$AGENT_RUN_CONFIG\"; fi\n"),
     )
     .expect("write fake run agent");
     use std::os::unix::fs::PermissionsExt;
@@ -1330,8 +1330,11 @@ fn trace_enable_persists_environment_auth_and_completes_setup() {
 }
 
 #[cfg(unix)]
-#[test]
-fn trace_run_opencode_injects_the_npm_plugin_without_changing_global_config() {
+fn assert_trace_run_opencode_injects_plugin(
+    version: &str,
+    expected_plugin: &str,
+    expected_args: &str,
+) {
     let home = tempfile::tempdir().expect("home tempdir");
     let config_home = tempfile::tempdir().expect("config tempdir");
     let bin_dir = tempfile::tempdir().expect("bin tempdir");
@@ -1351,6 +1354,7 @@ fn trace_run_opencode_injects_the_npm_plugin_without_changing_global_config() {
         .env("AGENT_RUN_LOG", &run_log)
         .env("AGENT_RUN_SETTINGS", &run_settings)
         .env("AGENT_RUN_CONFIG", &run_config)
+        .env("AGENT_RUN_VERSION", version)
         .args([
             "trace",
             "run",
@@ -1366,9 +1370,10 @@ fn trace_run_opencode_injects_the_npm_plugin_without_changing_global_config() {
     let inline: serde_json::Value =
         serde_json::from_slice(&fs::read(run_config).expect("read OpenCode inline config"))
             .expect("parse OpenCode inline config");
+    assert_eq!(inline["plugin"], serde_json::json!([expected_plugin]));
     assert_eq!(
-        inline["plugin"],
-        serde_json::json!(["@braintrust/trace-opencode/tracing"])
+        fs::read_to_string(run_log).expect("read OpenCode invocation"),
+        expected_args
     );
     let settings: serde_json::Value =
         serde_json::from_slice(&fs::read(run_settings).expect("read invocation settings"))
@@ -1380,6 +1385,26 @@ fn trace_run_opencode_injects_the_npm_plugin_without_changing_global_config() {
     assert_eq!(
         fs::read_to_string(global_config).expect("read global config"),
         r#"{"trace_to_braintrust":true}"#
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn trace_run_opencode_v1_injects_the_tracing_plugin_without_changing_global_config() {
+    assert_trace_run_opencode_injects_plugin(
+        "opencode 1.18.4",
+        "@braintrust/trace-opencode/tracing",
+        "--version\n",
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn trace_run_opencode_v2_injects_the_server_plugin_in_standalone_mode() {
+    assert_trace_run_opencode_injects_plugin(
+        "2.0.0",
+        "@braintrust/trace-opencode",
+        "--standalone --version\n",
     );
 }
 
