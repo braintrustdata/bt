@@ -413,6 +413,83 @@ fn status_verbose_explicitly_shows_unset_profile() {
 }
 
 #[test]
+fn status_only_reports_project_id_for_the_saved_organization() {
+    let home = tempfile::tempdir().expect("home tempdir");
+    let config_home = tempfile::tempdir().expect("config tempdir");
+    let work = tempfile::tempdir().expect("work tempdir");
+    fs::create_dir_all(work.path().join(".bt")).expect("create local config dir");
+    fs::write(
+        work.path().join(".bt/config.json"),
+        r#"{"org":"test-org","project":"shared-project","project_id":"test-project-id"}"#,
+    )
+    .expect("write local config");
+
+    for (org, expected_id) in [("test-org", Some("test-project-id")), ("other-org", None)] {
+        let mut cmd = bt_command();
+        clear_braintrust_auth_env(&mut cmd);
+        let stdout = cmd
+            .current_dir(work.path())
+            .env("HOME", home.path())
+            .env("XDG_CONFIG_HOME", config_home.path())
+            .args([
+                "status",
+                "--org",
+                org,
+                "--project",
+                "shared-project",
+                "--json",
+            ])
+            .assert()
+            .success()
+            .get_output()
+            .stdout
+            .clone();
+        let output: serde_json::Value = serde_json::from_slice(&stdout).expect("status emits JSON");
+        assert_eq!(output["org"], org);
+        assert_eq!(output["project"], "shared-project");
+        assert_eq!(
+            output.get("project_id").and_then(|id| id.as_str()),
+            expected_id
+        );
+    }
+}
+
+#[test]
+fn status_drops_project_id_when_local_config_changes_organization() {
+    let home = tempfile::tempdir().expect("home tempdir");
+    let config_home = tempfile::tempdir().expect("config tempdir");
+    let work = tempfile::tempdir().expect("work tempdir");
+    fs::create_dir_all(config_home.path().join("bt")).expect("create global config dir");
+    fs::write(
+        config_home.path().join("bt/config.json"),
+        r#"{"org":"test-org","project":"shared-project","project_id":"test-project-id"}"#,
+    )
+    .expect("write global config");
+    fs::create_dir_all(work.path().join(".bt")).expect("create local config dir");
+    fs::write(
+        work.path().join(".bt/config.json"),
+        r#"{"org":"other-org"}"#,
+    )
+    .expect("write local config");
+
+    let mut cmd = bt_command();
+    clear_braintrust_auth_env(&mut cmd);
+    let stdout = cmd
+        .current_dir(work.path())
+        .env("HOME", home.path())
+        .env("XDG_CONFIG_HOME", config_home.path())
+        .args(["status", "--json"])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let output: serde_json::Value = serde_json::from_slice(&stdout).expect("status emits JSON");
+    assert_eq!(output["org"], "other-org");
+    assert_eq!(output.get("project_id").and_then(|id| id.as_str()), None);
+}
+
+#[test]
 fn bare_status_does_not_render_the_all_profiles_report() {
     let home = tempfile::tempdir().expect("home tempdir");
     let config_home = tempfile::tempdir().expect("config tempdir");
