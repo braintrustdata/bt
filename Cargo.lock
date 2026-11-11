@@ -600,7 +600,7 @@ dependencies = [
 [[package]]
 name = "braintrust-sdk-rust"
 version = "0.1.0-alpha.2"
-source = "git+https://github.com/braintrustdata/braintrust-sdk-rust?rev=45a2c88ca9d9ccc393ec0338ac438199fc3c5df2#45a2c88ca9d9ccc393ec0338ac438199fc3c5df2"
+source = "git+https://github.com/braintrustdata/braintrust-sdk-rust?rev=27f6721e56611d776e12e4cfc81dd1ad5ecd7af4#27f6721e56611d776e12e4cfc81dd1ad5ecd7af4"
 dependencies = [
  "anyhow",
  "arc-swap",
@@ -698,7 +698,7 @@ dependencies = [
 
 [[package]]
 name = "bt"
-version = "0.29.0"
+version = "0.31.0"
 dependencies = [
  "actix-web",
  "anyhow",
@@ -762,7 +762,7 @@ dependencies = [
 [[package]]
 name = "bt-daemon"
 version = "0.1.0"
-source = "git+https://github.com/braintrustdata/braintrust-coding-agent-plugins?rev=055eedf7868eb773a576931ab131290d86913820#055eedf7868eb773a576931ab131290d86913820"
+source = "git+https://github.com/braintrustdata/braintrust-coding-agent-plugins?rev=f7a7ddef57514c51df52e253aeada310dcc3316e#f7a7ddef57514c51df52e253aeada310dcc3316e"
 dependencies = [
  "anyhow",
  "async-trait",

@@ -1,6 +1,6 @@
 [package]
 name = "bt"
-version = "0.29.0"
+version = "0.31.0"
 edition = "2021"
 rust-version = "1.97.0"
 authors = ["Braintrust engineering <eng@braintrust.dev>"]
@@ -18,7 +18,7 @@ eula = false
 actix-web = "4.11.0"
 anyhow = "1.0.89"
 braintrust-sdk-rust = { git = "https://github.com/braintrustdata/braintrust-sdk-rust", rev = "59bb941fdf33519a2cb79592c342635b1eedf39e" }
-bt-daemon = { git = "https://github.com/braintrustdata/braintrust-coding-agent-plugins", rev = "055eedf7868eb773a576931ab131290d86913820" }
+bt-daemon = { git = "https://github.com/braintrustdata/braintrust-coding-agent-plugins", rev = "f7a7ddef57514c51df52e253aeada310dcc3316e" }
 async-trait = "0.1"
 clap = { version = "4.5.20", features = ["derive", "env", "string"] }
 crossterm = "0.28.1"
