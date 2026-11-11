@@ -48,7 +48,11 @@ pub fn description_text(dataset: &Dataset) -> Option<&str> {
         })
 }
 pub fn created_text(dataset: &Dataset) -> Option<String> {
-    dataset.created.flatten().map(|value| value.to_rfc3339())
+    dataset
+        .created
+        .flatten()
+        .or(dataset.created_at.flatten())
+        .map(|value| value.to_rfc3339())
 }
 
 #[derive(Debug, Deserialize)]
@@ -433,6 +437,26 @@ mod tests {
         assert_eq!(
             query.pointer("/from/args/0/value").and_then(Value::as_str),
             Some("dataset'with-quote")
+        );
+    }
+
+    #[test]
+    fn dataset_creation_date_uses_legacy_fallback() {
+        let mut dataset: Dataset = serde_json::from_value(serde_json::json!({
+            "id": "00000000-0000-4000-8000-000000000001",
+            "project_id": "00000000-0000-4000-8000-000000000002",
+            "name": "test-dataset", "url_slug": "test-dataset",
+            "created_at": "2024-01-02T03:04:05Z"
+        }))
+        .unwrap();
+        assert_eq!(
+            created_text(&dataset).as_deref(),
+            Some("2024-01-02T03:04:05+00:00")
+        );
+        dataset.created = Some(Some("2024-02-03T04:05:06Z".parse().unwrap()));
+        assert_eq!(
+            created_text(&dataset).as_deref(),
+            Some("2024-02-03T04:05:06+00:00")
         );
     }
 

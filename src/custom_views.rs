@@ -2788,6 +2788,7 @@ export default customDatasetView(
                 project_id: "854ac738-d77f-5aca-88ae-113a8552665a".parse().unwrap(),
                 description: None,
                 created: None,
+                created_at: None,
                 metadata: None,
                 deleted_at: None,
                 tags: None,
