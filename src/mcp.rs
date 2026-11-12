@@ -129,7 +129,7 @@ fn normalize_global_args(argv: &[OsString], args: &[Arg]) -> Vec<OsString> {
     normalized
 }
 
-use braintrust_api_client::backend::mcp::{Tool, ToolResult};
+use braintrust_api_client::backend::mcp::{McpSession, Tool, ToolResult};
 
 fn required_arguments(tool: &Tool) -> impl Iterator<Item = &str> {
     tool.input_schema
@@ -142,8 +142,6 @@ fn required_arguments(tool: &Tool) -> impl Iterator<Item = &str> {
 }
 
 type ToolArgumentMap = BTreeMap<String, (String, Value)>;
-
-struct McpClient(braintrust_api_client::backend::mcp::McpSession);
 
 pub fn try_main(argv: &[std::ffi::OsString]) -> Result<()> {
     let runtime = tokio::runtime::Builder::new_multi_thread()
@@ -189,7 +187,7 @@ async fn run(argv: &[std::ffi::OsString]) -> Result<()> {
         .login
         .api_key()
         .context("login state missing API key")?;
-    let mut client = McpClient::new(&auth.api_url, &api_key)?;
+    let mut client = McpSession::new(&auth.api_url, &api_key, "bt", env!("CARGO_PKG_VERSION"))?;
     client.initialize().await?;
     let tools = client.list_tools().await?;
 
@@ -679,26 +677,6 @@ fn format_tool_result(result: &ToolResult, json_output: bool) -> Result<String> 
     serde_json::to_string_pretty(result).context("failed to serialize MCP result")
 }
 
-impl McpClient {
-    fn new(endpoint: &str, api_key: &str) -> Result<Self> {
-        Ok(Self(braintrust_api_client::backend::mcp::McpSession::new(
-            endpoint,
-            api_key,
-            "bt",
-            env!("CARGO_PKG_VERSION"),
-        )?))
-    }
-    async fn initialize(&mut self) -> Result<()> {
-        self.0.initialize().await
-    }
-    async fn list_tools(&mut self) -> Result<Vec<Tool>> {
-        self.0.list_tools().await
-    }
-    async fn call_tool(&mut self, name: &str, arguments: Value) -> Result<ToolResult> {
-        self.0.call_tool(name, arguments).await
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -750,7 +728,8 @@ mod tests {
         }).workers(1).listen(listener).unwrap().run();
         let handle = server.handle();
         tokio::spawn(server);
-        let mut client = McpClient::new(&endpoint, "test-key").unwrap();
+        let mut client =
+            McpSession::new(&endpoint, "test-key", "bt", env!("CARGO_PKG_VERSION")).unwrap();
         client.initialize().await.unwrap();
         let tools = client.list_tools().await.unwrap();
         assert_eq!(
