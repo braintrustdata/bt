@@ -86,11 +86,18 @@ pub(crate) fn from_remote(
 ) -> Result<ActiveObservabilityTemplate> {
     let by_id = functions
         .iter()
-        .map(|function| (function.id.as_str(), function))
+        .map(|function| (function.id.to_string(), function))
         .collect::<HashMap<_, _>>();
     let facets = functions
         .iter()
-        .filter(|function| function.function_type.as_deref() == Some("facet"))
+        .filter(|function| {
+            function
+                .function_type
+                .as_ref()
+                .and_then(|v| v.as_ref())
+                .map(|v| v.as_str())
+                == Some("facet")
+        })
         .collect::<Vec<_>>();
     let topics = topics_by_facet(&facets, &by_id, automations)?;
 
@@ -100,7 +107,7 @@ pub(crate) fn from_remote(
             facet_from_remote(
                 facet,
                 topics
-                    .get(&facet.id)
+                    .get(&facet.id.to_string())
                     .map(|automation| automation.name.clone()),
                 &by_id,
             )
@@ -112,13 +119,17 @@ pub(crate) fn from_remote(
 
     let mut loop_templates = automations
         .iter()
-        .filter(|automation| is_loop_config(&automation.config))
+        .filter(|automation| is_loop_automation(automation))
         .map(|automation| {
-            let mut config = object(&automation.config, "Loop automation config")?.clone();
+            let mut config = object(
+                &serde_json::to_value(&automation.config)?,
+                "Loop automation config",
+            )?
+            .clone();
             config.remove("actions");
             Ok(AutomationTemplate {
                 name: automation.name.clone(),
-                description: automation.description.clone(),
+                description: automation.description.clone().flatten(),
                 config: Value::Object(config),
             })
         })
@@ -137,12 +148,9 @@ pub(crate) fn from_remote(
 fn facet_from_remote(
     facet: &Function,
     topics_automation: Option<String>,
-    by_id: &HashMap<&str, &Function>,
+    by_id: &HashMap<String, &Function>,
 ) -> Result<FacetTemplate> {
-    let mut function_data = facet
-        .function_data
-        .clone()
-        .ok_or_else(|| anyhow!("facet '{}' is missing function_data", facet.name))?;
+    let mut function_data = serde_json::to_value(&facet.function_data)?;
     if function_data.get("type").and_then(Value::as_str) != Some("facet") {
         bail!(
             "function '{}' has facet type but non-facet function_data",
@@ -155,18 +163,28 @@ fn facet_from_remote(
         name: facet.name.clone(),
         slug: facet.slug.clone(),
         topics_automation,
-        description: facet.description.clone(),
+        description: facet.description.clone().flatten(),
         preprocessor,
         function_data,
-        prompt_data: facet.prompt_data.clone(),
-        tags: facet.tags.clone(),
-        function_schema: facet.function_schema.clone(),
+        prompt_data: facet
+            .prompt_data
+            .clone()
+            .flatten()
+            .map(serde_json::to_value)
+            .transpose()?,
+        tags: facet.tags.clone().flatten(),
+        function_schema: facet
+            .function_schema
+            .clone()
+            .flatten()
+            .map(serde_json::to_value)
+            .transpose()?,
     })
 }
 
 fn saved_preprocessor(
     function_data: &mut Value,
-    by_id: &HashMap<&str, &Function>,
+    by_id: &HashMap<String, &Function>,
 ) -> Result<Option<PortableFunction>> {
     let Some(reference) = function_data
         .get_mut("preprocessor")
@@ -182,7 +200,13 @@ fn saved_preprocessor(
     let function = by_id
         .get(id)
         .ok_or_else(|| anyhow!("facet references missing preprocessor function '{id}'"))?;
-    if function.function_type.as_deref() != Some("preprocessor") {
+    if function
+        .function_type
+        .as_ref()
+        .and_then(|v| v.as_ref())
+        .map(|v| v.as_str())
+        != Some("preprocessor")
+    {
         bail!("facet preprocessor reference '{id}' is not a preprocessor function");
     }
     let portable = PortableFunction::from_remote(function)?;
@@ -195,25 +219,28 @@ fn saved_preprocessor(
 
 fn topics_by_facet<'a>(
     facets: &[&Function],
-    by_id: &HashMap<&str, &Function>,
+    by_id: &HashMap<String, &Function>,
     automations: &'a [ProjectAutomation],
 ) -> Result<HashMap<String, &'a ProjectAutomation>> {
-    let mut bindings: HashMap<String, HashMap<&str, &ProjectAutomation>> = HashMap::new();
+    let mut bindings: HashMap<String, HashMap<String, &ProjectAutomation>> = HashMap::new();
     for automation in automations
         .iter()
-        .filter(|automation| is_topics(&automation.config))
+        .filter(|automation| is_topics_automation(automation))
     {
-        for id in topic_map_ids(&automation.config) {
+        for id in automation_topic_map_ids(automation) {
             let Some(topic_map) = by_id.get(id) else {
                 continue;
             };
-            if topic_map.function_type.as_deref() != Some("classifier")
-                || topic_map
-                    .function_data
-                    .as_ref()
-                    .and_then(|data| data.get("type"))
-                    .and_then(Value::as_str)
-                    != Some("topic_map")
+            if topic_map
+                .function_type
+                .as_ref()
+                .and_then(|v| v.as_ref())
+                .map(|v| v.as_str())
+                != Some("classifier")
+                || !matches!(
+                    topic_map.function_data,
+                    braintrust_api_client::types::FunctionData::TopicMap(_)
+                )
             {
                 continue;
             }
@@ -223,9 +250,9 @@ fn topics_by_facet<'a>(
                 .filter(|facet| topic_map_matches(topic_map, facet))
             {
                 bindings
-                    .entry(facet.id.clone())
+                    .entry(facet.id.to_string())
                     .or_default()
-                    .insert(automation.id.as_str(), automation);
+                    .insert(automation.id.to_string(), automation);
             }
         }
     }
@@ -254,12 +281,12 @@ fn bundled_topics_settings<'a>(
 ) -> Result<Vec<AutomationTemplate>> {
     let mut ids = HashSet::new();
     let mut settings = automations
-        .filter(|automation| ids.insert(automation.id.as_str()))
+        .filter(|automation| ids.insert(automation.id.to_string()))
         .map(|automation| {
             Ok(AutomationTemplate {
                 name: automation.name.clone(),
-                description: automation.description.clone(),
-                config: topics_settings(&automation.config)?,
+                description: automation.description.clone().flatten(),
+                config: topics_settings(&serde_json::to_value(&automation.config)?)?,
             })
         })
         .collect::<Result<Vec<_>>>()?;
@@ -268,7 +295,7 @@ fn bundled_topics_settings<'a>(
 }
 
 pub(crate) fn topic_map_matches(topic_map: &Function, facet: &Function) -> bool {
-    let Some(data) = topic_map.function_data.as_ref() else {
+    let Ok(data) = serde_json::to_value(&topic_map.function_data) else {
         return false;
     };
     match data
@@ -278,7 +305,7 @@ pub(crate) fn topic_map_matches(topic_map: &Function, facet: &Function) -> bool 
         .and_then(|reference| reference.get("id"))
         .and_then(Value::as_str)
     {
-        Some(id) => id == facet.id,
+        Some(id) => id == facet.id.to_string(),
         None => data
             .get("source_facet")
             .and_then(Value::as_str)
@@ -431,13 +458,18 @@ pub(crate) fn retain_topics_settings(
     let facets = functions
         .iter()
         .filter(|function| {
-            function.function_type.as_deref() == Some("facet")
+            function
+                .function_type
+                .as_ref()
+                .and_then(|v| v.as_ref())
+                .map(|v| v.as_str())
+                == Some("facet")
                 && slugs.contains(function.slug.as_str())
         })
         .collect::<Vec<_>>();
     let by_id = functions
         .iter()
-        .map(|function| (function.id.as_str(), function))
+        .map(|function| (function.id.to_string(), function))
         .collect::<HashMap<_, _>>();
     let topics = topics_by_facet(&facets, &by_id, automations)?;
     template.topics_automations = bundled_topics_settings(topics.into_values())?;
@@ -489,14 +521,21 @@ impl PortableFunction {
         Ok(Self {
             name: function.name.clone(),
             slug: function.slug.clone(),
-            description: function.description.clone(),
-            function_data: function
-                .function_data
+            description: function.description.clone().flatten(),
+            function_data: serde_json::to_value(&function.function_data)?,
+            prompt_data: function
+                .prompt_data
                 .clone()
-                .ok_or_else(|| anyhow!("function '{}' is missing function_data", function.name))?,
-            prompt_data: function.prompt_data.clone(),
-            tags: function.tags.clone(),
-            function_schema: function.function_schema.clone(),
+                .flatten()
+                .map(serde_json::to_value)
+                .transpose()?,
+            tags: function.tags.clone().flatten(),
+            function_schema: function
+                .function_schema
+                .clone()
+                .flatten()
+                .map(serde_json::to_value)
+                .transpose()?,
         })
     }
 
@@ -607,14 +646,8 @@ pub(crate) fn reconciled_topic_map_request(
     facet: &FacetTemplate,
     facet_id: &str,
 ) -> Result<Value> {
-    let mut data = object(
-        existing
-            .function_data
-            .as_ref()
-            .ok_or_else(|| anyhow!("topic map '{}' is missing function_data", existing.slug))?,
-        "topic map function_data",
-    )?
-    .clone();
+    let function_data = serde_json::to_value(&existing.function_data)?;
+    let mut data = object(&function_data, "topic map function_data")?.clone();
     data.insert(
         "source_facet".to_string(),
         Value::String(facet.name.clone()),
@@ -624,15 +657,27 @@ pub(crate) fn reconciled_topic_map_request(
         json!({"type": "function", "id": facet_id}),
     );
     Ok(json!(PortableFunctionRequest {
-        project_id: &existing.project_id,
+        project_id: &existing.project_id.to_string(),
         name: &facet.name,
         slug: &existing.slug,
-        description: existing.description.as_deref(),
+        description: existing.description.as_ref().and_then(|v| v.as_deref()),
         function_type: "classifier",
         function_data: &Value::Object(data),
-        prompt_data: existing.prompt_data.as_ref(),
-        tags: existing.tags.as_deref(),
-        function_schema: existing.function_schema.as_ref(),
+        prompt_data: existing
+            .prompt_data
+            .clone()
+            .flatten()
+            .map(serde_json::to_value)
+            .transpose()?
+            .as_ref(),
+        tags: existing.tags.as_ref().and_then(|v| v.as_deref()),
+        function_schema: existing
+            .function_schema
+            .clone()
+            .flatten()
+            .map(serde_json::to_value)
+            .transpose()?
+            .as_ref(),
     }))
 }
 
@@ -647,6 +692,33 @@ pub(crate) fn deduplicate_preprocessors(facets: &mut [FacetTemplate]) {
             facet.preprocessor = None;
         }
     }
+}
+
+pub(crate) fn is_topics_automation(automation: &ProjectAutomation) -> bool {
+    matches!(
+        &automation.config,
+        braintrust_api_client::types::ProjectAutomationConfig::TopicAutomationConfig(_)
+    )
+}
+pub(crate) fn is_loop_automation(automation: &ProjectAutomation) -> bool {
+    matches!(&automation.config, braintrust_api_client::types::ProjectAutomationConfig::WindowedAutomationConfig(config) if config.r#loop.is_some())
+}
+pub(crate) fn automation_topic_map_ids(
+    automation: &ProjectAutomation,
+) -> impl Iterator<Item = &str> {
+    use braintrust_api_client::types::{
+        ProjectAutomationConfig, TopicMapFunctionAutomationFunction,
+    };
+    let values = match &automation.config {
+        ProjectAutomationConfig::TopicAutomationConfig(config) => {
+            config.topic_map_functions.as_slice()
+        }
+        _ => &[],
+    };
+    values.iter().filter_map(|item| match &item.function {
+        TopicMapFunctionAutomationFunction::Function(id) => Some(id.id.as_str()),
+        _ => None,
+    })
 }
 
 pub(crate) fn is_topics(config: &Value) -> bool {
@@ -746,25 +818,19 @@ pub(crate) fn remove_topics_functions(
 
 pub(crate) fn embedding_model(
     automation: &ProjectAutomation,
-    functions_by_id: &HashMap<&str, &Function>,
+    functions_by_id: &HashMap<String, &Function>,
 ) -> String {
-    topic_map_ids(&automation.config)
+    automation_topic_map_ids(automation)
         .filter_map(|id| functions_by_id.get(id))
-        .filter_map(|function| function.function_data.as_ref())
-        .filter_map(|data| data.get("embedding_model").and_then(Value::as_str))
+        .filter_map(|function| match &function.function_data {
+            braintrust_api_client::types::FunctionData::TopicMap(data) => {
+                Some(data.embedding_model.as_str())
+            }
+            _ => None,
+        })
         .find(|model| !model.trim().is_empty())
         .unwrap_or(DEFAULT_EMBEDDING_MODEL)
         .to_string()
-}
-
-pub(crate) fn topic_map_ids(config: &Value) -> impl Iterator<Item = &str> {
-    config
-        .get("topic_map_functions")
-        .and_then(Value::as_array)
-        .into_iter()
-        .flatten()
-        .filter_map(|entry| entry.get("function"))
-        .filter_map(function_ref_id)
 }
 
 fn function_ref_id(reference: &Value) -> Option<&str> {
@@ -796,32 +862,92 @@ impl AutomationTemplate {
 #[cfg(test)]
 mod tests {
     use super::*;
+    fn test_id(value: &str) -> uuid::Uuid {
+        use std::hash::{Hash, Hasher};
+        if let Ok(id) = value.parse() {
+            return id;
+        }
+        let mut hash = std::collections::hash_map::DefaultHasher::new();
+        value.hash(&mut hash);
+        uuid::Uuid::from_u128(hash.finish() as u128)
+    }
+    fn test_automation_config(
+        mut config: Value,
+    ) -> braintrust_api_client::types::ProjectAutomationConfig {
+        if let Some(map) = config.as_object_mut() {
+            if map.get("event_type").and_then(Value::as_str) == Some("topic") {
+                map.entry("sampling_rate").or_insert(json!(1.0));
+                map.entry("facet_functions").or_insert(json!([]));
+                map.entry("topic_map_functions").or_insert(json!([]));
+            }
+        }
+        serde_json::from_value(config).expect("valid automation config")
+    }
+    fn set_automation_field(automation: &mut ProjectAutomation, key: &str, value: Value) {
+        let mut config = serde_json::to_value(&automation.config).unwrap();
+        config[key] = value;
+        automation.config = test_automation_config(config);
+    }
+    fn test_function_data(mut data: Value) -> braintrust_api_client::types::FunctionData {
+        if let Some(map) = data.as_object_mut() {
+            match map.get("type").and_then(Value::as_str) {
+                Some("topic_map") => {
+                    map.entry("source_facet").or_insert(json!("test-facet"));
+                    map.entry("embedding_model").or_insert(json!("test-model"));
+                    if let Some(settings) = map
+                        .get_mut("generation_settings")
+                        .and_then(Value::as_object_mut)
+                    {
+                        settings.entry("algorithm").or_insert(json!("hdbscan"));
+                        settings
+                            .entry("dimension_reduction")
+                            .or_insert(json!("umap"));
+                    }
+                }
+                Some("facet") => {
+                    map.entry("prompt").or_insert(json!("Classify this trace"));
+                }
+                Some("code") => {
+                    let data = map
+                        .entry("data")
+                        .or_insert(json!({"type":"inline", "code":"return input"}));
+                    if let Some(data) = data.as_object_mut() {
+                        data.entry("runtime_context")
+                            .or_insert(json!({"runtime":"node", "version":"20"}));
+                    }
+                }
+                _ => {}
+            }
+        }
+        serde_json::from_value(data).expect("valid function data")
+    }
 
     fn function(id: &str, slug: &str, function_type: &str, data: Value) -> Function {
-        Function {
-            id: id.to_string(),
-            name: slug.to_string(),
-            slug: slug.to_string(),
-            project_id: "test-project-id".to_string(),
-            description: None,
-            function_type: Some(function_type.to_string()),
-            prompt_data: None,
-            function_data: Some(data),
-            tags: None,
-            function_schema: None,
-            metadata: None,
-            created: None,
-            _xact_id: None,
+        {
+            let mut model = Function::new(
+                "1".into(),
+                test_function_data(data),
+                test_id(id),
+                Default::default(),
+                slug.to_string(),
+                uuid::Uuid::nil(),
+                uuid::Uuid::nil(),
+                slug.to_string(),
+            );
+            model.function_type = Some(Some(serde_json::from_value(json!(function_type)).unwrap()));
+            model
         }
     }
 
     fn automation(name: &str, config: Value) -> ProjectAutomation {
-        ProjectAutomation {
-            id: format!("test-{name}-id"),
-            project_id: "test-project-id".to_string(),
-            name: name.to_string(),
-            description: None,
-            config,
+        {
+            let model = ProjectAutomation::new(
+                test_automation_config(config),
+                test_id(&format!("test-{name}-id")),
+                name.to_string(),
+                uuid::Uuid::nil(),
+            );
+            model
         }
     }
 
@@ -829,29 +955,29 @@ mod tests {
     fn active_observability_pull_is_portable_and_maps_topics() {
         let functions = vec![
             function(
-                "fn-test-preprocessor",
+                "0ce54c0a-cbd0-5488-b4a8-c7f194e8200d",
                 "test-preprocessor",
                 "preprocessor",
                 json!({"type": "code", "data": {"type": "inline", "code": "return input"}}),
             ),
             function(
-                "fn-test-facet",
+                "9ed41bbf-ffec-55ea-a0ee-2bc8076e0573",
                 "test-facet",
                 "facet",
                 json!({
                     "type": "facet",
                     "prompt": "Classify this trace",
-                    "preprocessor": {"type": "function", "id": "fn-test-preprocessor"}
+                    "preprocessor": {"type": "function", "id": "0ce54c0a-cbd0-5488-b4a8-c7f194e8200d"}
                 }),
             ),
             function(
-                "fn-test-topic-map",
+                "ac795200-414c-59f5-b083-7912dd57d27a",
                 "test-facet-topic-map",
                 "classifier",
                 json!({
                     "type": "topic_map",
                     "source_facet": "legacy-name",
-                    "source_facet_function": {"type": "function", "id": "fn-test-facet"},
+                    "source_facet_function": {"type": "function", "id": "9ed41bbf-ffec-55ea-a0ee-2bc8076e0573"},
                     "embedding_model": "test-embedding-model"
                 }),
             ),
@@ -861,16 +987,16 @@ mod tests {
                 "Topics",
                 json!({
                     "event_type": "topic",
-                    "topic_map_functions": [{"function": {"type": "function", "id": "fn-test-topic-map"}}]
+                    "topic_map_functions": [{"function": {"type": "function", "id": "ac795200-414c-59f5-b083-7912dd57d27a"}}]
                 }),
             ),
             automation(
                 "Test Loop",
                 json!({
                     "event_type": "windowed",
-                    "window": {},
-                    "loop": {},
-                    "actions": [{"type": "webhook", "url": "https://example.invalid/hook"}]
+                    "window": {"evaluation_delay_seconds":0,"window_seconds":3600,"schedule":{"type":"interval","evaluation_interval_seconds":3600}},
+                    "loop": {"agent_slug":"test-agent","prompt":"test"},
+                    "actions": []
                 }),
             ),
         ];
@@ -897,7 +1023,7 @@ mod tests {
     #[test]
     fn active_observability_topic_map_reconciliation_preserves_customization() {
         let topic_map = function(
-            "fn-test-topic-map",
+            "ac795200-414c-59f5-b083-7912dd57d27a",
             "test-facet-topic-map",
             "classifier",
             json!({
@@ -911,7 +1037,12 @@ mod tests {
         let facet: FacetTemplate = serde_json::from_value(json!({
             "name": "Test facet", "slug": "test-facet", "function_data": {"type": "facet", "prompt": "Test"}
         })).unwrap();
-        let request = reconciled_topic_map_request(&topic_map, &facet, "fn-test-facet").unwrap();
+        let request = reconciled_topic_map_request(
+            &topic_map,
+            &facet,
+            "9ed41bbf-ffec-55ea-a0ee-2bc8076e0573",
+        )
+        .unwrap();
         assert_eq!(request["function_data"]["embedding_model"], "custom-model");
         assert_eq!(
             request["function_data"]["generation_settings"]["algorithm"],
@@ -921,7 +1052,7 @@ mod tests {
         assert_eq!(request["function_data"]["source_facet"], "Test facet");
         assert_eq!(
             request["function_data"]["source_facet_function"],
-            json!({"type": "function", "id": "fn-test-facet"})
+            json!({"type": "function", "id": "9ed41bbf-ffec-55ea-a0ee-2bc8076e0573"})
         );
     }
 
@@ -940,10 +1071,13 @@ mod tests {
         let config = json!({
             "event_type": "topic",
             "custom": {"keep": true},
-            "facet_functions": [{"type": "function", "id": "fn-test-facet"}],
+            "facet_functions": [{"type": "function", "id": "9ed41bbf-ffec-55ea-a0ee-2bc8076e0573"}],
             "topic_map_functions": []
         });
-        let pairs = vec![("fn-test-facet".to_string(), "fn-test-topic-map".to_string())];
+        let pairs = vec![(
+            "9ed41bbf-ffec-55ea-a0ee-2bc8076e0573".to_string(),
+            "ac795200-414c-59f5-b083-7912dd57d27a".to_string(),
+        )];
         let once = add_topics_functions(&config, &pairs).unwrap();
         let twice = add_topics_functions(&once, &pairs).unwrap();
         assert_eq!(once, twice);
@@ -955,13 +1089,13 @@ mod tests {
     #[test]
     fn active_observability_pull_uses_bound_automation_id() {
         let facet = function(
-            "fn-test-facet",
+            "9ed41bbf-ffec-55ea-a0ee-2bc8076e0573",
             "test-facet",
             "facet",
             json!({"type": "facet"}),
         );
         let map = function(
-            "fn-test-map",
+            "88b4398e-7fcd-5a15-8595-9f66239ed881",
             "test-map",
             "classifier",
             json!({"type": "topic_map", "source_facet_function": {"type": "function", "id": facet.id}}),
@@ -976,13 +1110,13 @@ mod tests {
                 ]
             }),
         );
-        bound.id = "auto-test-bound".to_string();
-        bound.description = Some("Test bound settings".to_string());
+        bound.id = test_id("26173662-0fae-5a0b-a441-0c580e431b35");
+        bound.description = Some(Some("Test bound settings".to_string()));
         let mut unrelated = automation(
             "Test Topics",
             json!({"event_type": "topic", "scope": {"type": "trace"}}),
         );
-        unrelated.id = "auto-test-unrelated".to_string();
+        unrelated.id = test_id("0691e892-6516-5c10-8ff1-d630322a4f6c");
 
         for automations in [
             vec![bound.clone(), unrelated.clone()],
@@ -996,11 +1130,11 @@ mod tests {
             assert_eq!(template.topics_automations[0].name, bound.name);
             assert_eq!(
                 template.topics_automations[0].description,
-                bound.description
+                bound.description.clone().flatten()
             );
             assert_eq!(
                 template.topics_automations[0].config,
-                topics_settings(&bound.config).unwrap()
+                topics_settings(&serde_json::to_value(&bound.config).unwrap()).unwrap()
             );
             assert_eq!(
                 template.facets[0].topics_automation.as_deref(),
@@ -1009,15 +1143,18 @@ mod tests {
         }
 
         let mut other_facet = facet.clone();
-        other_facet.id = "fn-test-other-facet".to_string();
+        other_facet.id = test_id("db44faba-c265-5e33-b01b-1c2e9f050e0f");
         other_facet.slug = "test-other-facet".to_string();
         let mut other_map = map.clone();
-        other_map.id = "fn-test-other-map".to_string();
-        other_map.function_data = Some(
+        other_map.id = test_id("6b015af7-d7b8-5ff9-b9b7-d3029c6dfe7e");
+        other_map.function_data = test_function_data(
             json!({"type": "topic_map", "source_facet_function": {"type": "function", "id": other_facet.id}}),
         );
-        unrelated.config["topic_map_functions"] =
-            json!([{"function": {"type": "function", "id": other_map.id}}]);
+        set_automation_field(
+            &mut unrelated,
+            "topic_map_functions",
+            json!([{"function": {"type": "function", "id": other_map.id}}]),
+        );
         let functions = vec![facet.clone(), map.clone(), other_facet, other_map];
         let automations = vec![unrelated.clone(), bound.clone()];
         let mut template = from_remote(&functions, &automations).unwrap();
@@ -1030,7 +1167,7 @@ mod tests {
         assert_eq!(template.topics_automations.len(), 1);
         assert_eq!(
             template.topics_automations[0].description,
-            bound.description
+            bound.description.clone().flatten()
         );
 
         unrelated.config = bound.config.clone();

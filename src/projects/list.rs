@@ -32,7 +32,8 @@ pub async fn run(client: &ApiClient, org_name: &str, json: bool) -> Result<()> {
         for project in &projects {
             let desc = project
                 .description
-                .as_deref()
+                .as_ref()
+                .and_then(|value| value.as_deref())
                 .filter(|s| !s.is_empty())
                 .map(|s| truncate(s, 60))
                 .unwrap_or_else(|| "-".to_string());

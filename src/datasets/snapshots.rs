@@ -321,7 +321,7 @@ async fn run_list(ctx: &ResolvedContext, args: &SnapshotListArgs, json: bool) ->
 
     let mut snapshots = with_spinner(
         "Loading dataset snapshots...",
-        api::list_dataset_snapshots(&ctx.client, &dataset.id),
+        api::list_dataset_snapshots(&ctx.client, &dataset.id.to_string()),
     )
     .await?;
     sort_snapshots_for_display(&mut snapshots);
@@ -393,8 +393,7 @@ fn print_snapshot_list(
         let xact_id = &snapshot.xact_id;
         let created = snapshot
             .created
-            .as_deref()
-            .map(|created| truncate(created, 10))
+            .map(|created| truncate(&created.to_rfc3339(), 10))
             .unwrap_or_else(|| "-".to_string());
         table.add_row(vec![&snapshot.name, &description, &xact_id, &created]);
     }
@@ -424,7 +423,7 @@ async fn run_create(
         "Creating dataset snapshot...",
         api::create_dataset_snapshot(
             &ctx.client,
-            &dataset.id,
+            &dataset.id.to_string(),
             &snapshot_name,
             description.as_deref(),
             &xact_id,
@@ -597,7 +596,7 @@ async fn run_restore(
 
     let preview = match with_spinner_visible(
         "Previewing dataset restore...",
-        api::preview_dataset_restore(&ctx.client, &dataset.id, &target.xact_id),
+        api::preview_dataset_restore(&ctx.client, &dataset.id.to_string(), &target.xact_id),
         Duration::from_millis(300),
     )
     .await
@@ -707,7 +706,7 @@ async fn run_restore_execute(
 ) -> Result<DatasetRestoreResult> {
     let result = match with_spinner_visible(
         "Restoring dataset...",
-        api::restore_dataset(&ctx.client, &dataset.id, &target.xact_id),
+        api::restore_dataset(&ctx.client, &dataset.id.to_string(), &target.xact_id),
         Duration::from_millis(300),
     )
     .await
@@ -755,7 +754,7 @@ async fn resolve_existing_dataset(
     match name.map(str::trim).filter(|value| !value.is_empty()) {
         Some(name) => with_spinner(
             "Loading dataset...",
-            api::get_dataset_by_name(&ctx.client, &ctx.project.id, name),
+            api::get_dataset_by_name(&ctx.client, &ctx.project.id.to_string(), name),
         )
         .await?
         .ok_or_else(|| anyhow!("dataset '{name}' not found"))
@@ -764,7 +763,7 @@ async fn resolve_existing_dataset(
             if !is_interactive() {
                 bail!("dataset name required. Use: bt datasets {command} <dataset>");
             }
-            super::select_dataset_interactive(&ctx.client, &ctx.project.id).await
+            super::select_dataset_interactive(&ctx.client, &ctx.project.id.to_string()).await
         }
     }
 }
@@ -778,7 +777,7 @@ async fn resolve_list_dataset(
         None => {
             let mut datasets = with_spinner(
                 "Loading datasets...",
-                api::list_datasets(&ctx.client, &ctx.project.id),
+                api::list_datasets(&ctx.client, &ctx.project.id.to_string()),
             )
             .await?;
 
@@ -808,7 +807,7 @@ async fn resolve_delete_target(
 ) -> Result<DeleteTarget> {
     let snapshots = with_spinner(
         "Loading dataset snapshots...",
-        api::list_dataset_snapshots(&ctx.client, &dataset.id),
+        api::list_dataset_snapshots(&ctx.client, &dataset.id.to_string()),
     )
     .await?;
 
@@ -858,7 +857,7 @@ async fn resolve_snapshot_xact_id(
 
     let head_xact_id = with_spinner(
         "Resolving dataset head xact...",
-        api::get_dataset_head_xact_id(&ctx.client, &dataset.id),
+        api::get_dataset_head_xact_id(&ctx.client, &dataset.id.to_string()),
     )
     .await?;
 
@@ -887,7 +886,7 @@ async fn resolve_restore_target(
 
     let snapshots = with_spinner(
         "Loading dataset snapshots...",
-        api::list_dataset_snapshots(&ctx.client, &dataset.id),
+        api::list_dataset_snapshots(&ctx.client, &dataset.id.to_string()),
     )
     .await?;
     if let Some(snapshot_name) = args
@@ -937,8 +936,7 @@ fn select_restore_target_interactive(
 fn restore_snapshot_label(snapshot: &DatasetSnapshot) -> String {
     let created = snapshot
         .created
-        .as_deref()
-        .map(|created| truncate(created, 10))
+        .map(|created| truncate(&created.to_rfc3339(), 10))
         .unwrap_or_else(|| "-".to_string());
 
     match snapshot
@@ -969,7 +967,7 @@ fn restore_target_from_snapshot(snapshot: &DatasetSnapshot) -> Result<RestoreTar
 
 fn delete_target_from_snapshot(snapshot: &DatasetSnapshot) -> DeleteTarget {
     DeleteTarget {
-        id: snapshot.id.clone(),
+        id: snapshot.id.to_string(),
         name: snapshot.name.clone(),
         xact_id: snapshot.xact_id.clone(),
     }
@@ -1123,14 +1121,18 @@ mod tests {
         created: &str,
         description: Option<&str>,
     ) -> DatasetSnapshot {
-        DatasetSnapshot {
-            id: format!("snapshot_{name}"),
-            dataset_id: "dataset_1".to_string(),
-            name: name.to_string(),
-            description: description.map(ToOwned::to_owned),
-            xact_id: xact_id.to_string(),
-            created: Some(created.to_string()),
-        }
+        DatasetSnapshot::new(
+            Some(
+                DateTime::parse_from_rfc3339(created)
+                    .unwrap()
+                    .with_timezone(&Utc),
+            ),
+            uuid::Uuid::nil(),
+            description.map(ToOwned::to_owned),
+            uuid::Uuid::new_v4(),
+            name.to_string(),
+            xact_id.to_string(),
+        )
     }
 
     #[test]
@@ -1206,7 +1208,7 @@ mod tests {
 
         let target =
             resolve_delete_target_by_name(&snapshots, "my-dataset", "baseline").expect("target");
-        assert_eq!(target.id, "snapshot_baseline");
+        assert_eq!(target.id, snapshots[0].id.to_string());
         assert_eq!(target.name, "baseline");
         assert_eq!(target.xact_id, "1000192656880881099");
     }
@@ -1231,7 +1233,7 @@ mod tests {
         let target =
             resolve_delete_target_by_xact_id(&snapshots, "my-dataset", "1000192656880881100")
                 .expect("target");
-        assert_eq!(target.id, "snapshot_release");
+        assert_eq!(target.id, snapshots[1].id.to_string());
         assert_eq!(target.name, "release");
         assert_eq!(target.xact_id, "1000192656880881100");
     }

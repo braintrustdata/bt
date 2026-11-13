@@ -78,7 +78,7 @@ jobs:
         run: cargo test --locked --bin bt
       - name: Run integration tests
         run: |
-          cargo test --locked --test cli --test datasets --test setup_cli --test self_update --test sync
+          cargo test --locked --test cli --test custom_ca --test datasets --test setup_cli --test self_update --test sync
           node --test scripts/custom-views-preview.test.mjs
 
   windows-auth-tests:
@@ -101,6 +101,8 @@ jobs:
           auth::windows_store::
           auth::tests::login_read_only_cached_project_id_and_active_profile_uses_explicit_api_url_fast_path
           auth::tests::resolve_auth_api_key_override_
+      - name: Test custom CA support
+        run: cargo test --locked --test custom_ca
       - name: Build production Windows CLI
         run: cargo build --locked --bin bt
       - name: Exercise shared auth through a real MSIX package

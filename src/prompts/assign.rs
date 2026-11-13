@@ -48,21 +48,28 @@ pub async fn run(
 
     let association = match action {
         Action::Assign { .. } => {
-            let object_version = prompt._xact_id.as_deref().ok_or_else(|| {
-                anyhow!(
+            let object_version = Some(prompt.xact_id.as_str())
+                .filter(|value| !value.is_empty())
+                .ok_or_else(|| {
+                    anyhow!(
                     "prompt version response did not include a transaction version; cannot assign"
                 )
-            })?;
+                })?;
             with_spinner(
                 "Assigning prompt...",
-                api::assign_prompt(&ctx.client, &prompt.id, environment, object_version),
+                api::assign_prompt(
+                    &ctx.client,
+                    &prompt.id.to_string(),
+                    environment,
+                    object_version,
+                ),
             )
             .await?
         }
         Action::Unassign => {
             with_spinner(
                 "Unassigning prompt...",
-                api::unassign_prompt(&ctx.client, &prompt.id, environment),
+                api::unassign_prompt(&ctx.client, &prompt.id.to_string(), environment),
             )
             .await?
         }
