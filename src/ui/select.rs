@@ -391,16 +391,7 @@ mod tests {
     use crate::projects::api::Project;
 
     fn project(name: &str) -> Project {
-        Project {
-            id: uuid::Uuid::nil(),
-            name: name.to_string(),
-            org_id: uuid::Uuid::nil(),
-            description: None,
-            created: None,
-            deleted_at: None,
-            settings: None,
-            user_id: None,
-        }
+        Project::new(uuid::Uuid::nil(), name.to_string(), uuid::Uuid::nil())
     }
 
     #[test]

@@ -850,16 +850,11 @@ mod tests {
     use super::*;
 
     fn test_project() -> Project {
-        Project {
-            id: "854ac738-d77f-5aca-88ae-113a8552665a".parse().unwrap(),
-            name: "test-project".to_string(),
-            org_id: "a62dfe69-c4f4-5cce-8915-66ba56903b53".parse().unwrap(),
-            description: None,
-            created: None,
-            deleted_at: None,
-            settings: None,
-            user_id: None,
-        }
+        Project::new(
+            "854ac738-d77f-5aca-88ae-113a8552665a".parse().unwrap(),
+            "test-project".to_string(),
+            "a62dfe69-c4f4-5cce-8915-66ba56903b53".parse().unwrap(),
+        )
     }
 
     fn test_preprocessor(slug: &str) -> PreparedPreprocessor {

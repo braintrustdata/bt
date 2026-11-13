@@ -451,16 +451,11 @@ mod tests {
     #[test]
     fn apply_switch_config_sets_project_id_with_project_name_and_org() {
         let mut cfg = config::Config::default();
-        let project = api::Project {
-            id: "5798b6d2-c3a0-5684-be37-92f092770e19".parse().unwrap(),
-            name: "my-project".to_string(),
-            org_id: "1e4969a0-f0e2-588b-8a16-75dafc52cb0f".parse().unwrap(),
-            description: None,
-            created: None,
-            deleted_at: None,
-            settings: None,
-            user_id: None,
-        };
+        let project = api::Project::new(
+            "5798b6d2-c3a0-5684-be37-92f092770e19".parse().unwrap(),
+            "my-project".to_string(),
+            "1e4969a0-f0e2-588b-8a16-75dafc52cb0f".parse().unwrap(),
+        );
 
         apply_switch_config(&mut cfg, Some("work"), Some("acme-org"), Some(&project));
 
@@ -479,16 +474,11 @@ mod tests {
             profile: Some("work".to_string()),
             ..Default::default()
         };
-        let project = api::Project {
-            id: "33535dcf-f890-57c3-9a9f-113505d7bb9e".parse().unwrap(),
-            name: "next-project".to_string(),
-            org_id: "1e4969a0-f0e2-588b-8a16-75dafc52cb0f".parse().unwrap(),
-            description: None,
-            created: None,
-            deleted_at: None,
-            settings: None,
-            user_id: None,
-        };
+        let project = api::Project::new(
+            "33535dcf-f890-57c3-9a9f-113505d7bb9e".parse().unwrap(),
+            "next-project".to_string(),
+            "1e4969a0-f0e2-588b-8a16-75dafc52cb0f".parse().unwrap(),
+        );
 
         apply_switch_config(&mut cfg, None, Some("acme-org"), Some(&project));
 

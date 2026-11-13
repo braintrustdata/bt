@@ -5123,26 +5123,16 @@ mod tests {
     #[test]
     fn find_project_by_selector_supports_id_and_name() -> Result<()> {
         let projects = vec![
-            Project {
-                id: "638729dd-2774-5508-826c-288c6882afc4".parse().unwrap(),
-                name: "Alpha".to_string(),
-                org_id: "f44e2da1-57d6-5667-8640-7c2a5bd965e9".parse().unwrap(),
-                description: None,
-                created: None,
-                deleted_at: None,
-                settings: None,
-                user_id: None,
-            },
-            Project {
-                id: "48785758-ab06-574d-ac64-78f6fc97396c".parse().unwrap(),
-                name: "Beta".to_string(),
-                org_id: "f44e2da1-57d6-5667-8640-7c2a5bd965e9".parse().unwrap(),
-                description: None,
-                created: None,
-                deleted_at: None,
-                settings: None,
-                user_id: None,
-            },
+            Project::new(
+                "638729dd-2774-5508-826c-288c6882afc4".parse().unwrap(),
+                "Alpha".to_string(),
+                "f44e2da1-57d6-5667-8640-7c2a5bd965e9".parse().unwrap(),
+            ),
+            Project::new(
+                "48785758-ab06-574d-ac64-78f6fc97396c".parse().unwrap(),
+                "Beta".to_string(),
+                "f44e2da1-57d6-5667-8640-7c2a5bd965e9".parse().unwrap(),
+            ),
         ];
 
         assert_eq!(
@@ -5159,26 +5149,16 @@ mod tests {
     #[test]
     fn find_project_by_selector_rejects_ambiguous_casefold_match() {
         let projects = vec![
-            Project {
-                id: "638729dd-2774-5508-826c-288c6882afc4".parse().unwrap(),
-                name: "Alpha".to_string(),
-                org_id: "f44e2da1-57d6-5667-8640-7c2a5bd965e9".parse().unwrap(),
-                description: None,
-                created: None,
-                deleted_at: None,
-                settings: None,
-                user_id: None,
-            },
-            Project {
-                id: "48785758-ab06-574d-ac64-78f6fc97396c".parse().unwrap(),
-                name: "ALPHA".to_string(),
-                org_id: "f44e2da1-57d6-5667-8640-7c2a5bd965e9".parse().unwrap(),
-                description: None,
-                created: None,
-                deleted_at: None,
-                settings: None,
-                user_id: None,
-            },
+            Project::new(
+                "638729dd-2774-5508-826c-288c6882afc4".parse().unwrap(),
+                "Alpha".to_string(),
+                "f44e2da1-57d6-5667-8640-7c2a5bd965e9".parse().unwrap(),
+            ),
+            Project::new(
+                "48785758-ab06-574d-ac64-78f6fc97396c".parse().unwrap(),
+                "ALPHA".to_string(),
+                "f44e2da1-57d6-5667-8640-7c2a5bd965e9".parse().unwrap(),
+            ),
         ];
 
         let err = find_project_by_selector(&projects, "alpha").unwrap_err();

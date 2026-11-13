@@ -191,9 +191,7 @@ pub async fn preview_dataset_restore(
     dataset_id: &str,
     xact_id: &str,
 ) -> Result<DatasetRestorePreview> {
-    let request = braintrust_api_client::types::DatasetRestoreRequest {
-        version: xact_id.to_owned(),
-    };
+    let request = braintrust_api_client::types::DatasetRestoreRequest::new(xact_id.to_owned());
     client
         .run(|| {
             client

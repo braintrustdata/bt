@@ -1103,21 +1103,11 @@ async fn create_topic_map_function_refs(
     let functions = facet_names
         .iter()
         .map(|facet_name| {
-            let data = TopicMapData {
-                source_facet: facet_name.clone(),
-                embedding_model: embedding_model.to_owned(),
-                automation_btql_filter: None,
-                btql_filter: None,
-                bundle_key: None,
-                disable_reconciliation: None,
-                distance_threshold: None,
-                generation_settings: None,
-                reconcile_mode: None,
-                report_key: None,
-                source_facet_function: None,
-                topic_names: None,
-                r#type: Default::default(),
-            };
+            let data = TopicMapData::new(
+                embedding_model.to_owned(),
+                facet_name.clone(),
+                Default::default(),
+            );
             let mut definition = CreateFunction::new(
                 FunctionData::TopicMap(data),
                 facet_name.clone(),

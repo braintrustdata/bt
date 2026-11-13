@@ -536,43 +536,25 @@ mod tests {
     use super::*;
 
     fn test_experiment(name: &str) -> api::Experiment {
-        api::Experiment {
-            id: uuid::Uuid::new_v4(),
-            name: name.to_string(),
-            project_id: uuid::Uuid::nil(),
-            public: false,
-            description: None,
-            created: None,
-            dataset_id: None,
-            dataset_version: None,
-            base_exp_id: None,
-            commit: None,
-            user_id: None,
-            tags: None,
-            metadata: None,
-            deleted_at: None,
-            internal_metadata: None,
-            parameters_id: None,
-            repo_info: None,
-            parameters_version: None,
-        }
+        api::Experiment::new(
+            uuid::Uuid::new_v4(),
+            name.to_string(),
+            uuid::Uuid::nil(),
+            false,
+        )
     }
 
     #[test]
     fn score_rows_use_endpoint_diff_for_comparison_delta() {
-        let base = api::ScoreSummary {
-            name: "quality".to_string(),
-            score: 0.6,
-            diff: Some(0.0),
-            improvements: 0,
-            regressions: 0,
+        let base = {
+            let mut model = api::ScoreSummary::new(0, "quality".to_string(), 0, 0.6);
+            model.diff = Some(0.0);
+            model
         };
-        let comparison = api::ScoreSummary {
-            name: "quality".to_string(),
-            score: 0.75,
-            diff: Some(0.15),
-            improvements: 3,
-            regressions: 1,
+        let comparison = {
+            let mut model = api::ScoreSummary::new(3, "quality".to_string(), 1, 0.75);
+            model.diff = Some(0.15);
+            model
         };
 
         let row = score_row(
@@ -593,13 +575,16 @@ mod tests {
 
     #[test]
     fn metric_rows_treat_time_to_first_token_as_seconds() {
-        let metric = api::MetricSummary {
-            name: "time_to_first_token".to_string(),
-            metric: 1.23,
-            unit: "tok".to_string(),
-            diff: Some(0.1),
-            improvements: 2,
-            regressions: 1,
+        let metric = {
+            let mut model = api::MetricSummary::new(
+                2,
+                1.23,
+                "time_to_first_token".to_string(),
+                1,
+                "tok".to_string(),
+            );
+            model.diff = Some(0.1);
+            model
         };
 
         let row = metric_row(
@@ -615,114 +600,99 @@ mod tests {
 
     #[test]
     fn build_rows_includes_base_and_each_comparison() {
-        let base = api::ExperimentSummary {
-            project_name: "test-project".to_string(),
-            experiment_name: "baseline".to_string(),
-            project_url: "https://www.example.test/app/test-org/p/test-project"
-                .parse()
-                .unwrap(),
-            experiment_url:
+        let base = {
+            let mut model = api::ExperimentSummary::new(
+                "baseline".to_string(),
                 "https://www.example.test/app/test-org/p/test-project/experiments/baseline"
                     .parse()
                     .unwrap(),
-            comparison_experiment_name: Some(Some("baseline".to_string())),
-            scores: Some(Some(
-                braintrust_api_client::types::SummarizeExperimentResponseScores {
-                    additional_properties: BTreeMap::from([(
-                        "score_a".to_string(),
-                        api::ScoreSummary {
-                            name: "score_a".to_string(),
-                            score: 0.5,
-                            diff: Some(0.0),
-                            improvements: 0,
-                            regressions: 0,
-                        },
-                    )]),
-                },
-            )),
-            metrics: Some(Some(
-                braintrust_api_client::types::SummarizeExperimentResponseMetrics {
-                    additional_properties: BTreeMap::from([(
-                        "duration".to_string(),
-                        api::MetricSummary {
-                            name: "duration".to_string(),
-                            metric: 2.0,
-                            unit: "s".to_string(),
-                            diff: Some(0.0),
-                            improvements: 0,
-                            regressions: 0,
-                        },
-                    )]),
-                },
-            )),
+                "test-project".to_string(),
+                "https://www.example.test/app/test-org/p/test-project"
+                    .parse()
+                    .unwrap(),
+            );
+            model.comparison_experiment_name = Some(Some("baseline".to_string()));
+            model.scores = Some(Some({
+                let mut model =
+                    braintrust_api_client::types::SummarizeExperimentResponseScores::default();
+                model.additional_properties = BTreeMap::from([("score_a".to_string(), {
+                    let mut model = api::ScoreSummary::new(0, "score_a".to_string(), 0, 0.5);
+                    model.diff = Some(0.0);
+                    model
+                })]);
+                model
+            }));
+            model.metrics = Some(Some({
+                let mut model =
+                    braintrust_api_client::types::SummarizeExperimentResponseMetrics::default();
+                model.additional_properties = BTreeMap::from([("duration".to_string(), {
+                    let mut model =
+                        api::MetricSummary::new(0, 2.0, "duration".to_string(), 0, "s".to_string());
+                    model.diff = Some(0.0);
+                    model
+                })]);
+                model
+            }));
+            model
         };
-        let challenger_a = api::ExperimentSummary {
-            project_name: "test-project".to_string(),
-            experiment_name: "challenger-a".to_string(),
-            project_url: "https://www.example.test/app/test-org/p/test-project"
-                .parse()
-                .unwrap(),
-            experiment_url:
+        let challenger_a = {
+            let mut model = api::ExperimentSummary::new(
+                "challenger-a".to_string(),
                 "https://www.example.test/app/test-org/p/test-project/experiments/challenger-a"
                     .parse()
                     .unwrap(),
-            comparison_experiment_name: Some(Some("baseline".to_string())),
-            scores: Some(Some(
-                braintrust_api_client::types::SummarizeExperimentResponseScores {
-                    additional_properties: BTreeMap::from([(
-                        "score_a".to_string(),
-                        api::ScoreSummary {
-                            name: "score_a".to_string(),
-                            score: 0.75,
-                            diff: Some(0.25),
-                            improvements: 1,
-                            regressions: 0,
-                        },
-                    )]),
-                },
-            )),
-            metrics: Some(Some(
-                braintrust_api_client::types::SummarizeExperimentResponseMetrics {
-                    additional_properties: BTreeMap::from([(
-                        "duration".to_string(),
-                        api::MetricSummary {
-                            name: "duration".to_string(),
-                            metric: 3.0,
-                            unit: "s".to_string(),
-                            diff: Some(1.0),
-                            improvements: 0,
-                            regressions: 1,
-                        },
-                    )]),
-                },
-            )),
+                "test-project".to_string(),
+                "https://www.example.test/app/test-org/p/test-project"
+                    .parse()
+                    .unwrap(),
+            );
+            model.comparison_experiment_name = Some(Some("baseline".to_string()));
+            model.scores = Some(Some({
+                let mut model =
+                    braintrust_api_client::types::SummarizeExperimentResponseScores::default();
+                model.additional_properties = BTreeMap::from([("score_a".to_string(), {
+                    let mut model = api::ScoreSummary::new(1, "score_a".to_string(), 0, 0.75);
+                    model.diff = Some(0.25);
+                    model
+                })]);
+                model
+            }));
+            model.metrics = Some(Some({
+                let mut model =
+                    braintrust_api_client::types::SummarizeExperimentResponseMetrics::default();
+                model.additional_properties = BTreeMap::from([("duration".to_string(), {
+                    let mut model =
+                        api::MetricSummary::new(0, 3.0, "duration".to_string(), 1, "s".to_string());
+                    model.diff = Some(1.0);
+                    model
+                })]);
+                model
+            }));
+            model
         };
-        let challenger_b = api::ExperimentSummary {
-            project_name: "test-project".to_string(),
-            experiment_name: "challenger-b".to_string(),
-            project_url: "https://www.example.test/app/test-org/p/test-project"
-                .parse()
-                .unwrap(),
-            experiment_url:
+        let challenger_b = {
+            let mut model = api::ExperimentSummary::new(
+                "challenger-b".to_string(),
                 "https://www.example.test/app/test-org/p/test-project/experiments/challenger-b"
                     .parse()
                     .unwrap(),
-            comparison_experiment_name: Some(Some("baseline".to_string())),
-            scores: Some(Some(
-                braintrust_api_client::types::SummarizeExperimentResponseScores {
-                    additional_properties: BTreeMap::from([(
-                        "score_b".to_string(),
-                        api::ScoreSummary {
-                            name: "score_b".to_string(),
-                            score: 0.8,
-                            diff: Some(0.8),
-                            improvements: 2,
-                            regressions: 0,
-                        },
-                    )]),
-                },
-            )),
-            metrics: None,
+                "test-project".to_string(),
+                "https://www.example.test/app/test-org/p/test-project"
+                    .parse()
+                    .unwrap(),
+            );
+            model.comparison_experiment_name = Some(Some("baseline".to_string()));
+            model.scores = Some(Some({
+                let mut model =
+                    braintrust_api_client::types::SummarizeExperimentResponseScores::default();
+                model.additional_properties = BTreeMap::from([("score_b".to_string(), {
+                    let mut model = api::ScoreSummary::new(2, "score_b".to_string(), 0, 0.8);
+                    model.diff = Some(0.8);
+                    model
+                })]);
+                model
+            }));
+            model
         };
 
         let rows = build_rows(

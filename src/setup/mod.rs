@@ -1388,22 +1388,17 @@ async fn run_setup_browser_auth(
             api_url: base.api_url.clone(),
         });
     let login = build_api_key_login_context(base, &completed.api_key, &org);
-    let selected_project = crate::projects::api::Project {
-        id: completed
+    let selected_project = crate::projects::api::Project::new(
+        completed
             .project_id
             .parse()
             .context("invalid setup project ID")?,
-        name: completed.project_name.clone(),
-        org_id: completed
+        completed.project_name.clone(),
+        completed
             .org_id
             .parse()
             .context("invalid setup organization ID")?,
-        description: None,
-        created: None,
-        deleted_at: None,
-        settings: None,
-        user_id: None,
-    };
+    );
     let stored_profiles = auth::list_profiles()?;
     let profile_name = setup_browser_profile_name(profile_name, &org.name, &stored_profiles);
     let org_constraint = (completed.api_key.trim().starts_with("sk-") && available_orgs.len() == 1)
@@ -6913,16 +6908,11 @@ mod tests {
         let old = env::current_dir().expect("cwd");
         env::set_current_dir(&root).expect("cd root");
 
-        let project = crate::projects::api::Project {
-            id: "1a17b4f6-33ab-5acf-a53c-03f7a474fce3".parse().unwrap(),
-            name: "new-project".to_string(),
-            org_id: "27216650-d1df-5081-afb2-7d3ee020d75c".parse().unwrap(),
-            description: None,
-            created: None,
-            deleted_at: None,
-            settings: None,
-            user_id: None,
-        };
+        let project = crate::projects::api::Project::new(
+            "1a17b4f6-33ab-5acf-a53c-03f7a474fce3".parse().unwrap(),
+            "new-project".to_string(),
+            "27216650-d1df-5081-afb2-7d3ee020d75c".parse().unwrap(),
+        );
         maybe_init("new-org", &project).expect("maybe init");
 
         env::set_current_dir(old).expect("restore cwd");

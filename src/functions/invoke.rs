@@ -129,10 +129,10 @@ fn build_invocation(
         messages
             .iter()
             .map(|message| {
-                ChatCompletionMessageParam::User(ContentBlockInline {
-                    content: Some(ContentBlockInlineContent::String(message.clone())),
-                    name: None,
-                    role: ContentBlockInlineRole::User,
+                ChatCompletionMessageParam::User({
+                    let mut model = ContentBlockInline::new(ContentBlockInlineRole::User);
+                    model.content = Some(ContentBlockInlineContent::String(message.clone()));
+                    model
                 })
             })
             .collect()
@@ -147,16 +147,17 @@ fn build_invocation(
         })
         .transpose()?;
     Ok(Invocation::new(
-        FunctionId::ProjectNameContent(ProjectNameContent {
-            project_name: project_name.to_owned(),
-            slug,
-            version: version.map(ToOwned::to_owned),
+        FunctionId::ProjectNameContent({
+            let mut model = ProjectNameContent::new(project_name.to_owned(), slug);
+            model.version = version.map(ToOwned::to_owned);
+            model
         }),
-        InvokeApi {
-            input,
-            messages,
-            mode: mode.map(Some),
-            ..Default::default()
+        {
+            let mut model = InvokeApi::default();
+            model.input = input;
+            model.messages = messages;
+            model.mode = mode.map(Some);
+            model
         },
     ))
 }

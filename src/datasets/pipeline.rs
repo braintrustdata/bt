@@ -1783,19 +1783,14 @@ async fn resolve_target_project(
     target: &PipelineTargetInspect,
 ) -> Result<Project> {
     if let Some(project_id) = target.project_id.as_deref() {
-        return Ok(Project {
-            id: project_id.parse().context("invalid project ID")?,
-            name: target
+        return Ok(Project::new(
+            project_id.parse().context("invalid project ID")?,
+            target
                 .project_name
                 .clone()
                 .unwrap_or_else(|| project_id.to_string()),
-            org_id: uuid::Uuid::nil(),
-            description: None,
-            created: None,
-            deleted_at: None,
-            settings: None,
-            user_id: None,
-        });
+            uuid::Uuid::nil(),
+        ));
     }
     let project_name = target
         .project_name
@@ -1956,19 +1951,14 @@ async fn resolve_source_project(
     source: &PipelineSourceInspect,
 ) -> Result<Project> {
     if let Some(project_id) = source.project_id.as_deref() {
-        return Ok(Project {
-            id: project_id.parse().context("invalid project ID")?,
-            name: source
+        return Ok(Project::new(
+            project_id.parse().context("invalid project ID")?,
+            source
                 .project_name
                 .clone()
                 .unwrap_or_else(|| project_id.to_string()),
-            org_id: uuid::Uuid::nil(),
-            description: None,
-            created: None,
-            deleted_at: None,
-            settings: None,
-            user_id: None,
-        });
+            uuid::Uuid::nil(),
+        ));
     }
     let configured_project = crate::config::configured_project_for_context(Some(client.org_name()));
     let project_name = source
@@ -2456,16 +2446,11 @@ mod tests {
             filter: Some("span_attributes.type = 'llm'".to_string()),
             scope: Some(PipelineScope::Span),
         };
-        let project = Project {
-            id: "1a17b4f6-33ab-5acf-a53c-03f7a474fce3".parse().unwrap(),
-            name: "Loop".to_string(),
-            org_id: "27216650-d1df-5081-afb2-7d3ee020d75c".parse().unwrap(),
-            description: None,
-            created: None,
-            deleted_at: None,
-            settings: None,
-            user_id: None,
-        };
+        let project = Project::new(
+            "1a17b4f6-33ab-5acf-a53c-03f7a474fce3".parse().unwrap(),
+            "Loop".to_string(),
+            "27216650-d1df-5081-afb2-7d3ee020d75c".parse().unwrap(),
+        );
 
         let resolved = source_with_resolved_project(&source, &project, "braintrustdata.com");
 

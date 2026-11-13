@@ -826,40 +826,32 @@ mod tests {
     }
 
     fn automation(id: &str, name: &str, event_type: &str) -> ProjectAutomation {
-        ProjectAutomation {
-            id: test_id(id),
-            project_id: uuid::Uuid::nil(),
-            name: name.to_string(),
-            description: None,
-            created: None,
-            runtime_block: None,
-            user_id: None,
-            config: test_automation_config(json!({
+        ProjectAutomation::new(
+            test_automation_config(json!({
                 "event_type": event_type,
                 "facet_functions": [],
                 "topic_map_functions": []
             })),
-        }
+            test_id(id),
+            name.to_string(),
+            uuid::Uuid::nil(),
+        )
     }
 
     fn existing_function(slug: &str, function_type: &str, data_type: &str) -> Function {
-        Function {
-            id: test_id(&format!("fn-{slug}")),
-            name: slug.to_string(),
-            slug: slug.to_string(),
-            project_id: uuid::Uuid::nil(),
-            description: None,
-            function_type: Some(Some(serde_json::from_value(json!(function_type)).unwrap())),
-            prompt_data: None,
-            function_data: test_function_data(json!({"type": data_type})),
-            tags: None,
-            function_schema: None,
-            metadata: None,
-            created: None,
-            xact_id: "1".into(),
-            log_id: Default::default(),
-            org_id: uuid::Uuid::nil(),
-            origin: None,
+        {
+            let mut model = Function::new(
+                "1".into(),
+                test_function_data(json!({"type": data_type})),
+                test_id(&format!("fn-{slug}")),
+                Default::default(),
+                slug.to_string(),
+                uuid::Uuid::nil(),
+                uuid::Uuid::nil(),
+                slug.to_string(),
+            );
+            model.function_type = Some(Some(serde_json::from_value(json!(function_type)).unwrap()));
+            model
         }
     }
 

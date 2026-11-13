@@ -214,11 +214,11 @@ async fn create(client: &ApiClient, args: CreateArgs, json: bool) -> Result<()> 
         "environment name required. Use: bt environments create --name <name>",
     )?;
     let slug = create_slug(args.slug.as_deref(), &name)?;
-    let body = api::CreateEnvironment {
-        name: name.clone(),
-        slug: slug.clone(),
-        description: args.description.clone().map(Some),
-        org_name: Some(Some(client.org_name().to_owned())),
+    let body = {
+        let mut model = api::CreateEnvironment::new(name.clone(), slug.clone());
+        model.description = args.description.clone().map(Some);
+        model.org_name = Some(Some(client.org_name().to_owned()));
+        model
     };
     let environment = with_spinner("Creating environment...", api::create(client, &body)).await?;
     output_result(&environment, json, "Created")
@@ -233,14 +233,16 @@ async fn update(client: &ApiClient, args: UpdateArgs, json: bool) -> Result<()> 
         bail!("at least one update is required. Use --name, --new-slug, --description, or --clear-description");
     }
     let environment = resolve(client, args.selector.value(), "update").await?;
-    let body = api::UpdateEnvironment {
-        name: args.name.clone().map(Some),
-        slug: args.new_slug.clone().map(Some),
-        description: if args.clear_description {
+    let body = {
+        let mut model = api::UpdateEnvironment::default();
+        model.name = args.name.clone().map(Some);
+        model.slug = args.new_slug.clone().map(Some);
+        model.description = if args.clear_description {
             Some(None)
         } else {
             args.description.clone().map(Some)
-        },
+        };
+        model
     };
     let environment = with_spinner(
         "Updating environment...",

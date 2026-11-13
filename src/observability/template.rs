@@ -923,36 +923,31 @@ mod tests {
     }
 
     fn function(id: &str, slug: &str, function_type: &str, data: Value) -> Function {
-        Function {
-            id: test_id(id),
-            name: slug.to_string(),
-            slug: slug.to_string(),
-            project_id: uuid::Uuid::nil(),
-            description: None,
-            function_type: Some(Some(serde_json::from_value(json!(function_type)).unwrap())),
-            prompt_data: None,
-            function_data: test_function_data(data),
-            tags: None,
-            function_schema: None,
-            metadata: None,
-            created: None,
-            xact_id: "1".into(),
-            log_id: Default::default(),
-            org_id: uuid::Uuid::nil(),
-            origin: None,
+        {
+            let mut model = Function::new(
+                "1".into(),
+                test_function_data(data),
+                test_id(id),
+                Default::default(),
+                slug.to_string(),
+                uuid::Uuid::nil(),
+                uuid::Uuid::nil(),
+                slug.to_string(),
+            );
+            model.function_type = Some(Some(serde_json::from_value(json!(function_type)).unwrap()));
+            model
         }
     }
 
     fn automation(name: &str, config: Value) -> ProjectAutomation {
-        ProjectAutomation {
-            id: test_id(&format!("test-{name}-id")),
-            project_id: uuid::Uuid::nil(),
-            name: name.to_string(),
-            description: None,
-            created: None,
-            runtime_block: None,
-            user_id: None,
-            config: test_automation_config(config),
+        {
+            let model = ProjectAutomation::new(
+                test_automation_config(config),
+                test_id(&format!("test-{name}-id")),
+                name.to_string(),
+                uuid::Uuid::nil(),
+            );
+            model
         }
     }
 

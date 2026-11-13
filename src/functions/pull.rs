@@ -1676,16 +1676,11 @@ mod tests {
             "_xact_id": null,
         }));
 
-        let projects = vec![crate::projects::api::Project {
-            id: "638729dd-2774-5508-826c-288c6882afc4".parse().unwrap(),
-            name: "Woohoo".to_string(),
-            org_id: "f44e2da1-57d6-5667-8640-7c2a5bd965e9".parse().unwrap(),
-            description: None,
-            created: None,
-            deleted_at: None,
-            settings: None,
-            user_id: None,
-        }];
+        let projects = vec![crate::projects::api::Project::new(
+            "638729dd-2774-5508-826c-288c6882afc4".parse().unwrap(),
+            "Woohoo".to_string(),
+            "f44e2da1-57d6-5667-8640-7c2a5bd965e9".parse().unwrap(),
+        )];
 
         let names = resolve_project_names(&[row], &projects).expect("resolved names");
         assert_eq!(

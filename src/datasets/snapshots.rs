@@ -1121,18 +1121,18 @@ mod tests {
         created: &str,
         description: Option<&str>,
     ) -> DatasetSnapshot {
-        DatasetSnapshot {
-            id: uuid::Uuid::new_v4(),
-            dataset_id: uuid::Uuid::nil(),
-            name: name.to_string(),
-            description: description.map(ToOwned::to_owned),
-            xact_id: xact_id.to_string(),
-            created: Some(
+        DatasetSnapshot::new(
+            Some(
                 DateTime::parse_from_rfc3339(created)
                     .unwrap()
                     .with_timezone(&Utc),
             ),
-        }
+            uuid::Uuid::nil(),
+            description.map(ToOwned::to_owned),
+            uuid::Uuid::new_v4(),
+            name.to_string(),
+            xact_id.to_string(),
+        )
     }
 
     #[test]

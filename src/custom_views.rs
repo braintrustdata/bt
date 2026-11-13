@@ -2131,16 +2131,11 @@ mod tests {
     }
 
     fn test_project() -> Project {
-        Project {
-            id: "854ac738-d77f-5aca-88ae-113a8552665a".parse().unwrap(),
-            name: "test-project".to_string(),
-            org_id: "a62dfe69-c4f4-5cce-8915-66ba56903b53".parse().unwrap(),
-            description: None,
-            created: None,
-            deleted_at: None,
-            settings: None,
-            user_id: None,
-        }
+        Project::new(
+            "854ac738-d77f-5aca-88ae-113a8552665a".parse().unwrap(),
+            "test-project".to_string(),
+            "a62dfe69-c4f4-5cce-8915-66ba56903b53".parse().unwrap(),
+        )
     }
 
     #[test]
@@ -2782,19 +2777,12 @@ export default customDatasetView(
                 dataset_name: None,
             },
             project: test_project(),
-            dataset: Some(datasets_api::Dataset {
-                id: "00000000-0000-4000-8000-000000000101".parse().unwrap(),
-                name: "test-dataset".to_string(),
-                project_id: "854ac738-d77f-5aca-88ae-113a8552665a".parse().unwrap(),
-                description: None,
-                created: None,
-                created_at: None,
-                metadata: None,
-                deleted_at: None,
-                tags: None,
-                url_slug: "test-dataset".into(),
-                user_id: None,
-            }),
+            dataset: Some(datasets_api::Dataset::new(
+                "00000000-0000-4000-8000-000000000101".parse().unwrap(),
+                "test-dataset".to_string(),
+                "854ac738-d77f-5aca-88ae-113a8552665a".parse().unwrap(),
+                "test-dataset".into(),
+            )),
         };
         let dataset_event = build_insert_event(&dataset_view, IfExistsMode::Error);
         assert_eq!(dataset_event["origin"]["object_type"], "dataset");
