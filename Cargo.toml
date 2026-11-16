@@ -17,7 +17,7 @@ eula = false
 [dependencies]
 actix-web = "4.11.0"
 anyhow = "1.0.89"
-braintrust-sdk-rust = { git = "https://github.com/braintrustdata/braintrust-sdk-rust", rev = "eed4b3a148ed51d49c0c23c36f3968361f14f916" }
+braintrust-sdk-rust = { git = "https://github.com/braintrustdata/braintrust-sdk-rust", rev = "bbce73e8207136453583dbdbb476365e295971ab" }
 bt-daemon = { git = "https://github.com/braintrustdata/braintrust-coding-agent-plugins", rev = "f7a7ddef57514c51df52e253aeada310dcc3316e" }
 async-trait = "0.1"
 clap = { version = "4.5.20", features = ["derive", "env", "string"] }
@@ -26,7 +26,7 @@ futures-util = "0.3.31"
 indicatif = "0.17.8"
 ratatui = "0.30.2"
 reqwest = { version = "0.13", default-features = false, features = ["json", "rustls"] }
-braintrust-api-client = { git = "https://github.com/braintrustdata/braintrust-sdk-rust", rev = "eed4b3a148ed51d49c0c23c36f3968361f14f916" }
+braintrust-api-client = { git = "https://github.com/braintrustdata/braintrust-sdk-rust", rev = "bbce73e8207136453583dbdbb476365e295971ab" }
 rustls-native-certs = "0.8"
 serde = { version = "1.0.210", features = ["derive"] }
 serde_json = "1.0.128"

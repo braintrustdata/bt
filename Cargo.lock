@@ -574,7 +574,7 @@ dependencies = [
 [[package]]
 name = "braintrust-api-client"
 version = "0.1.0-alpha.2"
-source = "git+https://github.com/braintrustdata/braintrust-sdk-rust?rev=eed4b3a148ed51d49c0c23c36f3968361f14f916#eed4b3a148ed51d49c0c23c36f3968361f14f916"
+source = "git+https://github.com/braintrustdata/braintrust-sdk-rust?rev=bbce73e8207136453583dbdbb476365e295971ab#bbce73e8207136453583dbdbb476365e295971ab"
 dependencies = [
  "anyhow",
  "backoff",
@@ -628,7 +628,7 @@ dependencies = [
 [[package]]
 name = "braintrust-sdk-rust"
 version = "0.1.0-alpha.2"
-source = "git+https://github.com/braintrustdata/braintrust-sdk-rust?rev=eed4b3a148ed51d49c0c23c36f3968361f14f916#eed4b3a148ed51d49c0c23c36f3968361f14f916"
+source = "git+https://github.com/braintrustdata/braintrust-sdk-rust?rev=bbce73e8207136453583dbdbb476365e295971ab#bbce73e8207136453583dbdbb476365e295971ab"
 dependencies = [
  "anyhow",
  "arc-swap",
@@ -706,7 +706,7 @@ dependencies = [
  "async-trait",
  "base64 0.22.1",
  "braintrust-api-client",
- "braintrust-sdk-rust 0.1.0-alpha.2 (git+https://github.com/braintrustdata/braintrust-sdk-rust?rev=eed4b3a148ed51d49c0c23c36f3968361f14f916)",
+ "braintrust-sdk-rust 0.1.0-alpha.2 (git+https://github.com/braintrustdata/braintrust-sdk-rust?rev=bbce73e8207136453583dbdbb476365e295971ab)",
  "bt-daemon",
  "chrono",
  "clap",
