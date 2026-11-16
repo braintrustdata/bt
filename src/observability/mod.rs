@@ -151,10 +151,11 @@ async fn run_push(base: BaseArgs, args: PushArgs) -> Result<()> {
     template::validate(&template)?;
 
     let ctx = resolve_project_command_context_with_auth_mode(&base, false).await?;
+    let project_id = ctx.project.id.to_string();
     let snapshot = with_spinner("Checking target resources...", async {
         let (functions, automations) = tokio::try_join!(
-            list_all_functions(&ctx.client, &ctx.project.id),
-            list_project_automations(&ctx.client, &ctx.project.id),
+            list_all_functions(&ctx.client, &project_id),
+            list_project_automations(&ctx.client, &project_id),
         )?;
         Ok::<_, anyhow::Error>(Snapshot {
             functions,
@@ -177,7 +178,7 @@ async fn run_push(base: BaseArgs, args: PushArgs) -> Result<()> {
 
     let result = with_spinner(
         "Pushing active observability template...",
-        push::execute(&ctx.client, &ctx.project.id, plan),
+        push::execute(&ctx.client, &ctx.project.id.to_string(), plan),
     )
     .await?;
 

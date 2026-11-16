@@ -85,7 +85,7 @@ pub async fn run(base: BaseArgs, _args: InitArgs) -> Result<()> {
             "status": "created",
             "org": org,
             "project": project.name,
-            "project_id": project.id,
+            "project_id": project.id.to_string(),
             "path": written_path.display().to_string(),
         });
         println!("{}", serde_json::to_string(&payload)?);

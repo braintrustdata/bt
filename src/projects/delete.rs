@@ -48,7 +48,7 @@ pub async fn run(client: &ApiClient, name: Option<&str>, force: bool, json: bool
 
     match with_spinner(
         "Deleting project...",
-        api::delete_project(client, &project.id),
+        api::delete_project(client, &project.id.to_string()),
     )
     .await
     {

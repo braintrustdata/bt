@@ -8,7 +8,6 @@ use std::time::Duration;
 use anyhow::{anyhow, bail, Context, Result};
 use dialoguer::console::style;
 use indicatif::{ProgressBar, ProgressStyle};
-use serde::Deserialize;
 use serde_json::Value;
 
 use crate::args::BaseArgs;
@@ -29,27 +28,7 @@ use crate::ui::{animations_enabled, is_quiet};
 const PAGINATION_PAGE_LIMIT: usize = 10_000;
 const OUTPUT_LOCK_FILE: &str = ".bt-functions-pull.lock";
 
-#[derive(Debug, Clone, Deserialize)]
-struct PullFunctionRow {
-    id: String,
-    name: String,
-    slug: String,
-    project_id: String,
-    #[serde(default)]
-    project_name: Option<String>,
-    #[serde(default)]
-    description: Option<String>,
-    #[serde(default)]
-    prompt_data: Option<Value>,
-    #[serde(default)]
-    function_data: Option<Value>,
-    #[serde(default)]
-    function_type: Option<String>,
-    #[serde(default)]
-    created: Option<String>,
-    #[serde(default)]
-    _xact_id: Option<String>,
-}
+use braintrust_api_client::types::Function as PullFunctionRow;
 
 #[derive(Debug, Clone)]
 struct NormalizedPrompt {
@@ -146,7 +125,7 @@ pub async fn run(base: BaseArgs, args: PullArgs) -> Result<()> {
         };
         if let Some(project) = project {
             resolved_project_name = Some(project.name.clone());
-            query.project_id = Some(project.id);
+            query.project_id = Some(project.id.to_string());
         }
     }
 
@@ -202,22 +181,7 @@ pub async fn run(base: BaseArgs, args: PullArgs) -> Result<()> {
     summary.functions_seen = fetched.rows.len();
     summary.warnings.extend(fetched.warnings);
 
-    let mut parsed_rows = Vec::new();
-    for raw_row in fetched.rows {
-        match serde_json::from_value::<PullFunctionRow>(raw_row) {
-            Ok(row) => parsed_rows.push(row),
-            Err(err) => {
-                summary.malformed_records_skipped += 1;
-                summary.files.push(PullFileReport {
-                    output_file: String::new(),
-                    status: FileStatus::Skipped,
-                    skipped_reason: Some(SoftSkipReason::MalformedRecord),
-                    error_reason: None,
-                    message: Some(format!("skipped malformed function row: {err}")),
-                });
-            }
-        }
-    }
+    let parsed_rows = fetched.rows;
 
     let narrowed_rows = match apply_selector_narrowing(parsed_rows, &args) {
         Ok(rows) => rows,
@@ -241,7 +205,13 @@ pub async fn run(base: BaseArgs, args: PullArgs) -> Result<()> {
         } else {
             summary.unsupported_records_skipped += 1;
             if base.verbose {
-                if row.function_type.as_deref() == Some("preprocessor") {
+                if row
+                    .function_type
+                    .as_ref()
+                    .and_then(|v| v.as_ref())
+                    .map(|v| v.as_str())
+                    == Some("preprocessor")
+                {
                     eprintln!(
                         "{} skipping '{}' because it is a preprocessor; use `bt preprocessors view {}`",
                         style("warning:").yellow(),
@@ -357,7 +327,7 @@ pub async fn run(base: BaseArgs, args: PullArgs) -> Result<()> {
 
     let mut grouped_by_project = BTreeMap::<(String, String), Vec<PullFunctionRow>>::new();
     for row in materializable {
-        let Some(project_name) = project_names.get(&row.project_id).cloned() else {
+        let Some(project_name) = project_names.get(&row.project_id.to_string()).cloned() else {
             return fail_pull(
                 &base,
                 &mut summary,
@@ -369,7 +339,7 @@ pub async fn run(base: BaseArgs, args: PullArgs) -> Result<()> {
             );
         };
         grouped_by_project
-            .entry((row.project_id.clone(), project_name))
+            .entry((row.project_id.to_string(), project_name))
             .or_default()
             .push(row);
     }
@@ -447,7 +417,7 @@ async fn get_projects_cached<'a>(
 }
 
 struct FetchRowsResult {
-    rows: Vec<Value>,
+    rows: Vec<PullFunctionRow>,
     warnings: Vec<ReportWarning>,
 }
 
@@ -521,7 +491,7 @@ fn apply_selector_narrowing(
 
     let narrowed = rows
         .into_iter()
-        .filter(|row| args.id.as_ref().is_none_or(|id| row.id == *id))
+        .filter(|row| args.id.as_ref().is_none_or(|id| row.id.to_string() == *id))
         .filter(|row| !has_slug_selector || slug_set.contains(row.slug.as_str()))
         .collect::<Vec<_>>();
 
@@ -539,7 +509,7 @@ fn select_winner_rows(
     let mut winners: BTreeMap<(String, String), PullFunctionRow> = BTreeMap::new();
 
     for row in rows {
-        let key = (row.project_id.clone(), row.slug.clone());
+        let key = (row.project_id.to_string(), row.slug.clone());
         if let Some(existing) = winners.get_mut(&key) {
             summary.files_skipped += 1;
             if compare_rows_desc(&row, existing) == Ordering::Less {
@@ -554,22 +524,17 @@ fn select_winner_rows(
 }
 
 fn is_prompt_row(row: &PullFunctionRow) -> bool {
-    row.function_data
-        .as_ref()
-        .and_then(|data| data.get("type"))
-        .and_then(Value::as_str)
-        == Some("prompt")
+    matches!(
+        row.function_data,
+        braintrust_api_client::types::FunctionData::Prompt(_)
+    )
 }
 
 fn compare_rows_desc(left: &PullFunctionRow, right: &PullFunctionRow) -> Ordering {
-    let left_xact = left
-        ._xact_id
-        .as_deref()
+    let left_xact = Some(left.xact_id.as_str())
         .and_then(|value| value.parse::<u128>().ok())
         .unwrap_or(0);
-    let right_xact = right
-        ._xact_id
-        .as_deref()
+    let right_xact = Some(right.xact_id.as_str())
         .and_then(|value| value.parse::<u128>().ok())
         .unwrap_or(0);
 
@@ -596,24 +561,11 @@ fn resolve_project_names(
     }
 
     for project in projects {
-        names_by_id.insert(project.id.clone(), project.name.clone());
+        names_by_id.insert(project.id.to_string(), project.name.clone());
     }
 
     for row in rows {
-        if let Some(project_name) = row
-            .project_name
-            .as_deref()
-            .map(str::trim)
-            .filter(|value| !value.is_empty())
-        {
-            names_by_id
-                .entry(row.project_id.clone())
-                .or_insert_with(|| project_name.to_string());
-        }
-    }
-
-    for row in rows {
-        if !names_by_id.contains_key(&row.project_id) {
+        if !names_by_id.contains_key(&row.project_id.to_string()) {
             bail!(
                 "failed to resolve project name for project id '{}'",
                 row.project_id
@@ -1013,7 +965,8 @@ fn compare_rows_for_render(left: &PullFunctionRow, right: &PullFunctionRow) -> O
 fn normalize_prompt_row(row: &PullFunctionRow) -> Result<NormalizedPrompt> {
     let description = row
         .description
-        .as_deref()
+        .as_ref()
+        .and_then(|value| value.as_deref())
         .map(str::trim)
         .filter(|value| !value.is_empty())
         .map(ToOwned::to_owned);
@@ -1021,7 +974,9 @@ fn normalize_prompt_row(row: &PullFunctionRow) -> Result<NormalizedPrompt> {
     let prompt_data = row
         .prompt_data
         .as_ref()
+        .and_then(|value| value.as_ref())
         .ok_or_else(|| anyhow!("prompt row '{}' missing prompt_data", row.slug))?;
+    let prompt_data = serde_json::to_value(prompt_data)?;
     let prompt_block = prompt_data
         .get("prompt")
         .ok_or_else(|| anyhow!("prompt row '{}' missing prompt_data.prompt", row.slug))?;
@@ -1076,15 +1031,12 @@ fn normalize_prompt_row(row: &PullFunctionRow) -> Result<NormalizedPrompt> {
         .get("tool_functions")
         .filter(|value| !is_empty_render_value(value))
         .cloned();
-    let version = row
-        ._xact_id
-        .as_deref()
-        .map(str::trim)
+    let version = Some(str::trim(row.xact_id.as_str()))
         .filter(|value| !value.is_empty())
         .map(ToOwned::to_owned);
 
     Ok(NormalizedPrompt {
-        id: row.id.clone(),
+        id: row.id.to_string(),
         version,
         variable_seed: row.slug.clone(),
         name: row.name.clone(),
@@ -1566,6 +1518,23 @@ fn record_pull_file_failure(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_json::json;
+    fn test_function_row(mut row: Value) -> PullFunctionRow {
+        let object = row.as_object_mut().unwrap();
+        object.remove("project_name");
+        object.insert(
+            "org_id".into(),
+            json!("00000000-0000-4000-8000-000000000010"),
+        );
+        object.insert("log_id".into(), json!("p"));
+        if object.get("_xact_id").is_none_or(Value::is_null) {
+            object.insert("_xact_id".into(), json!("0"));
+        }
+        if object.get("function_data").is_none_or(Value::is_null) {
+            object.insert("function_data".into(), json!({"type":"prompt"}));
+        }
+        serde_json::from_value(row).expect("valid generated function")
+    }
 
     #[test]
     fn sanitize_identifier_helpers() {
@@ -1602,19 +1571,19 @@ mod tests {
 
     #[test]
     fn selector_narrowing_enforces_presence() {
-        let row = PullFunctionRow {
-            id: "f1".to_string(),
-            name: "Prompt".to_string(),
-            slug: "prompt".to_string(),
-            project_id: "p1".to_string(),
-            project_name: Some("Proj".to_string()),
-            description: None,
-            prompt_data: None,
-            function_data: None,
-            function_type: None,
-            created: None,
-            _xact_id: None,
-        };
+        let row = test_function_row(serde_json::json!({
+            "id": "75e59da2-8764-5f09-bf97-e534e34d7c9f".to_string(),
+            "name": "Prompt".to_string(),
+            "slug": "prompt".to_string(),
+            "project_id": "638729dd-2774-5508-826c-288c6882afc4".to_string(),
+            "project_name": Some("Proj".to_string()),
+            "description": null,
+            "prompt_data": null,
+            "function_data": null,
+            "function_type": null,
+            "created": null,
+            "_xact_id": null,
+        }));
         let args = PullArgs {
             slugs: vec![],
             slug_flag: vec![],
@@ -1633,45 +1602,45 @@ mod tests {
     #[test]
     fn multi_slug_narrowing_filters_to_matching() {
         let rows = vec![
-            PullFunctionRow {
-                id: "f1".to_string(),
-                name: "A".to_string(),
-                slug: "alpha".to_string(),
-                project_id: "p1".to_string(),
-                project_name: Some("Proj".to_string()),
-                description: None,
-                prompt_data: None,
-                function_data: None,
-                function_type: None,
-                created: None,
-                _xact_id: None,
-            },
-            PullFunctionRow {
-                id: "f2".to_string(),
-                name: "B".to_string(),
-                slug: "beta".to_string(),
-                project_id: "p1".to_string(),
-                project_name: Some("Proj".to_string()),
-                description: None,
-                prompt_data: None,
-                function_data: None,
-                function_type: None,
-                created: None,
-                _xact_id: None,
-            },
-            PullFunctionRow {
-                id: "f3".to_string(),
-                name: "G".to_string(),
-                slug: "gamma".to_string(),
-                project_id: "p1".to_string(),
-                project_name: Some("Proj".to_string()),
-                description: None,
-                prompt_data: None,
-                function_data: None,
-                function_type: None,
-                created: None,
-                _xact_id: None,
-            },
+            test_function_row(serde_json::json!({
+                "id": "75e59da2-8764-5f09-bf97-e534e34d7c9f".to_string(),
+                "name": "A".to_string(),
+                "slug": "alpha".to_string(),
+                "project_id": "638729dd-2774-5508-826c-288c6882afc4".to_string(),
+                "project_name": Some("Proj".to_string()),
+                "description": null,
+                "prompt_data": null,
+                "function_data": null,
+                "function_type": null,
+                "created": null,
+                "_xact_id": null,
+            })),
+            test_function_row(serde_json::json!({
+                "id": "4d1512d5-a061-5db1-95a4-50aa3980e7e7".to_string(),
+                "name": "B".to_string(),
+                "slug": "beta".to_string(),
+                "project_id": "638729dd-2774-5508-826c-288c6882afc4".to_string(),
+                "project_name": Some("Proj".to_string()),
+                "description": null,
+                "prompt_data": null,
+                "function_data": null,
+                "function_type": null,
+                "created": null,
+                "_xact_id": null,
+            })),
+            test_function_row(serde_json::json!({
+                "id": "da80d6b1-b700-5ae8-801f-83522ded7e36".to_string(),
+                "name": "G".to_string(),
+                "slug": "gamma".to_string(),
+                "project_id": "638729dd-2774-5508-826c-288c6882afc4".to_string(),
+                "project_name": Some("Proj".to_string()),
+                "description": null,
+                "prompt_data": null,
+                "function_data": null,
+                "function_type": null,
+                "created": null,
+                "_xact_id": null,
+            })),
         ];
         let args = PullArgs {
             slugs: vec!["alpha".to_string()],
@@ -1693,46 +1662,50 @@ mod tests {
 
     #[test]
     fn resolve_project_names_uses_project_lookup() {
-        let row = PullFunctionRow {
-            id: "f1".to_string(),
-            name: "Prompt".to_string(),
-            slug: "prompt".to_string(),
-            project_id: "p1".to_string(),
-            project_name: None,
-            description: None,
-            prompt_data: None,
-            function_data: None,
-            function_type: None,
-            created: None,
-            _xact_id: None,
-        };
+        let row = test_function_row(serde_json::json!({
+            "id": "75e59da2-8764-5f09-bf97-e534e34d7c9f".to_string(),
+            "name": "Prompt".to_string(),
+            "slug": "prompt".to_string(),
+            "project_id": "638729dd-2774-5508-826c-288c6882afc4".to_string(),
+            "project_name": null,
+            "description": null,
+            "prompt_data": null,
+            "function_data": null,
+            "function_type": null,
+            "created": null,
+            "_xact_id": null,
+        }));
 
-        let projects = vec![crate::projects::api::Project {
-            id: "p1".to_string(),
-            name: "Woohoo".to_string(),
-            org_id: "o1".to_string(),
-            description: None,
-        }];
+        let projects = vec![crate::projects::api::Project::new(
+            "638729dd-2774-5508-826c-288c6882afc4".parse().unwrap(),
+            "Woohoo".to_string(),
+            "f44e2da1-57d6-5667-8640-7c2a5bd965e9".parse().unwrap(),
+        )];
 
         let names = resolve_project_names(&[row], &projects).expect("resolved names");
-        assert_eq!(names.get("p1").map(String::as_str), Some("Woohoo"));
+        assert_eq!(
+            names
+                .get("638729dd-2774-5508-826c-288c6882afc4")
+                .map(String::as_str),
+            Some("Woohoo")
+        );
     }
 
     #[test]
     fn resolve_project_names_fails_when_missing() {
-        let row = PullFunctionRow {
-            id: "f1".to_string(),
-            name: "Prompt".to_string(),
-            slug: "prompt".to_string(),
-            project_id: "p1".to_string(),
-            project_name: None,
-            description: None,
-            prompt_data: None,
-            function_data: None,
-            function_type: None,
-            created: None,
-            _xact_id: None,
-        };
+        let row = test_function_row(serde_json::json!({
+            "id": "75e59da2-8764-5f09-bf97-e534e34d7c9f".to_string(),
+            "name": "Prompt".to_string(),
+            "slug": "prompt".to_string(),
+            "project_id": "638729dd-2774-5508-826c-288c6882afc4".to_string(),
+            "project_name": null,
+            "description": null,
+            "prompt_data": null,
+            "function_data": null,
+            "function_type": null,
+            "created": null,
+            "_xact_id": null,
+        }));
 
         let err = resolve_project_names(&[row], &[]).expect_err("should fail");
         assert!(err.to_string().contains("failed to resolve project name"));
@@ -1779,14 +1752,14 @@ mod tests {
 
     #[test]
     fn render_project_file_python_shape() {
-        let row = PullFunctionRow {
-            id: "f1".to_string(),
-            name: "Doc Search".to_string(),
-            slug: "doc-search".to_string(),
-            project_id: "p1".to_string(),
-            project_name: Some("woohoo".to_string()),
-            description: Some("find docs".to_string()),
-            prompt_data: Some(serde_json::json!({
+        let row = test_function_row(serde_json::json!({
+            "id": "75e59da2-8764-5f09-bf97-e534e34d7c9f".to_string(),
+            "name": "Doc Search".to_string(),
+            "slug": "doc-search".to_string(),
+            "project_id": "638729dd-2774-5508-826c-288c6882afc4".to_string(),
+            "project_name": Some("woohoo".to_string()),
+            "description": Some("find docs".to_string()),
+            "prompt_data": Some(serde_json::json!({
                 "prompt": {
                     "type": "chat",
                     "messages": [
@@ -1801,15 +1774,15 @@ mod tests {
                     { "type": "function", "id": "tool-1" }
                 ]
             })),
-            function_data: Some(serde_json::json!({ "type": "prompt" })),
-            function_type: None,
-            created: None,
-            _xact_id: Some("123".to_string()),
-        };
+            "function_data": Some(serde_json::json!({ "type": "prompt" })),
+            "function_type": null,
+            "created": null,
+            "_xact_id": Some("123".to_string()),
+        }));
 
         let rendered = render_project_file(
             FunctionsLanguage::Python,
-            "p1",
+            "638729dd-2774-5508-826c-288c6882afc4",
             "woohoo",
             "braintrust/woohoo.py",
             &[row],
@@ -1821,7 +1794,7 @@ mod tests {
         assert!(rendered.contains("import braintrust"));
         assert!(rendered.contains("project = braintrust.projects.create(name=\"woohoo\")"));
         assert!(rendered.contains("doc_search = project.prompts.create("));
-        assert!(rendered.contains("    id=\"f1\","));
+        assert!(rendered.contains("    id=\"75e59da2-8764-5f09-bf97-e534e34d7c9f\","));
         assert!(rendered.contains("    version=\"123\","));
         assert!(rendered.contains("messages=["));
         assert!(rendered.contains("model=\"gpt-4o-mini\""));
@@ -1829,14 +1802,14 @@ mod tests {
 
     #[test]
     fn render_project_file_typescript_includes_prompt_identity() {
-        let row = PullFunctionRow {
-            id: "f1".to_string(),
-            name: "Basic math".to_string(),
-            slug: "basic-math".to_string(),
-            project_id: "p1".to_string(),
-            project_name: Some("woohoo".to_string()),
-            description: None,
-            prompt_data: Some(serde_json::json!({
+        let row = test_function_row(serde_json::json!({
+            "id": "75e59da2-8764-5f09-bf97-e534e34d7c9f".to_string(),
+            "name": "Basic math".to_string(),
+            "slug": "basic-math".to_string(),
+            "project_id": "638729dd-2774-5508-826c-288c6882afc4".to_string(),
+            "project_name": Some("woohoo".to_string()),
+            "description": null,
+            "prompt_data": Some(serde_json::json!({
                 "prompt": {
                     "type": "chat",
                     "messages": [
@@ -1847,15 +1820,15 @@ mod tests {
                     "model": "gpt-4o-mini"
                 }
             })),
-            function_data: Some(serde_json::json!({ "type": "prompt" })),
-            function_type: None,
-            created: None,
-            _xact_id: Some("123".to_string()),
-        };
+            "function_data": Some(serde_json::json!({ "type": "prompt" })),
+            "function_type": null,
+            "created": null,
+            "_xact_id": Some("123".to_string()),
+        }));
 
         let rendered = render_project_file(
             FunctionsLanguage::Typescript,
-            "p1",
+            "638729dd-2774-5508-826c-288c6882afc4",
             "woohoo",
             "braintrust/woohoo.ts",
             &[row],
@@ -1863,10 +1836,10 @@ mod tests {
         .expect("rendered");
 
         assert!(rendered.contains("const project = braintrust.projects.create({"));
-        assert!(rendered.contains("  id: \"p1\","));
+        assert!(rendered.contains("  id: \"638729dd-2774-5508-826c-288c6882afc4\","));
         assert!(rendered.contains("  name: \"woohoo\","));
         assert!(rendered.contains("export const basicMath = project.prompts.create({"));
-        assert!(rendered.contains("  id: \"f1\","));
+        assert!(rendered.contains("  id: \"75e59da2-8764-5f09-bf97-e534e34d7c9f\","));
         assert!(rendered.contains("  version: \"123\","));
     }
 

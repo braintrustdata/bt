@@ -20,7 +20,7 @@ pub async fn run(
 
     let exists = with_spinner(
         "Checking dataset...",
-        api::get_dataset_by_name(&ctx.client, &ctx.project.id, &name),
+        api::get_dataset_by_name(&ctx.client, &ctx.project.id.to_string(), &name),
     )
     .await?;
     if exists.is_some() {
@@ -35,7 +35,7 @@ pub async fn run(
 
     let dataset = match with_spinner_visible(
         "Creating dataset...",
-        api::create_dataset(&ctx.client, &ctx.project.id, &name, description),
+        api::create_dataset(&ctx.client, &ctx.project.id.to_string(), &name, description),
         Duration::from_millis(300),
     )
     .await
@@ -50,7 +50,7 @@ pub async fn run(
     if let Some(records) = records.as_ref() {
         if let Err(error) = utils::submit_prepared_records(
             ctx,
-            &dataset.id,
+            &dataset.id.to_string(),
             records,
             false,
             "Uploading dataset rows...",

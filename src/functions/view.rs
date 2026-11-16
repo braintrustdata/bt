@@ -12,7 +12,7 @@ use crate::ui::{
 use crate::utils::{app_project_url_with_encoded_path, app_url_with_selected_version};
 use crate::{http::ApiClient, projects::api as projects_api};
 
-use super::{api, build_web_path, label, label_plural, select_function_interactive};
+use super::{api, build_web_path_parts, label, label_plural, select_function_interactive};
 use super::{AuthContext, FunctionTypeFilter, ResolvedContext};
 
 #[derive(Debug, Clone, Copy)]
@@ -32,7 +32,7 @@ pub async fn run(
 ) -> Result<()> {
     let version = options.version;
     let environment = options.environment;
-    let project_id = &ctx.project.id;
+    let project_id = &ctx.project.id.to_string();
     let function = match slug {
         Some(s) => with_spinner(
             &format!("Loading {}...", label(ft)),
@@ -75,7 +75,9 @@ pub async fn run(
                     )
                 })?
             } else {
-                selected
+                api::get_function_by_slug(&ctx.client, project_id, &selected.slug, None, None)
+                    .await?
+                    .ok_or_else(|| anyhow!("function not found"))?
             }
         }
     };
@@ -118,10 +120,19 @@ async fn render_function(
     let requested_version = options.version;
     let environment = options.environment;
     if options.web {
-        let path = build_web_path(function);
+        let path = build_web_path_parts(
+            &function.id.to_string(),
+            function
+                .function_type
+                .as_ref()
+                .and_then(|v| v.as_ref())
+                .map(|v| v.as_str()),
+            function.prompt_data.as_ref().is_some_and(|v| v.is_some()),
+            &function.xact_id,
+        );
         let project_name = match project_name {
             Some(project_name) => project_name.to_string(),
-            None => resolve_project_name(client, &function.project_id).await?,
+            None => resolve_project_name(client, &function.project_id.to_string()).await?,
         };
         let mut url =
             app_project_url_with_encoded_path(app_url, client.org_name(), &project_name, &path);
@@ -129,7 +140,7 @@ async fn render_function(
             url,
             requested_version,
             environment,
-            function._xact_id.as_deref(),
+            Some(function.xact_id.as_str()),
         );
         open::that(&url)?;
         print_command_status(CommandStatus::Success, &format!("Opened {url} in browser"));
@@ -158,21 +169,27 @@ async fn render_function(
         )?;
     }
     if requested_version.is_some() || environment.is_some() {
-        if let Some(version) = function._xact_id.as_deref().or(requested_version) {
+        if let Some(version) = Some(function.xact_id.as_str()).or(requested_version) {
             writeln!(output, "{} {}", console::style("Version:").dim(), version)?;
         }
     }
 
-    if let Some(ft) = &function.function_type {
+    if let Some(Some(ft)) = &function.function_type {
         writeln!(output, "{} {}", console::style("Type:").dim(), ft)?;
     }
-    if let Some(desc) = &function.description {
+    if let Some(Some(desc)) = &function.description {
         if !desc.is_empty() {
             writeln!(output, "{} {}", console::style("Description:").dim(), desc)?;
         }
     }
 
-    if let Some(pd) = &function.prompt_data {
+    let prompt_value = function
+        .prompt_data
+        .as_ref()
+        .and_then(|v| v.as_ref())
+        .map(serde_json::to_value)
+        .transpose()?;
+    if let Some(pd) = &prompt_value {
         let prompt_options = pd.get("options");
         if let Some(model) = prompt_options
             .and_then(|o| o.get("model"))
@@ -192,7 +209,9 @@ async fn render_function(
         }
     }
 
-    if let Some(fd) = &function.function_data {
+    let data_value = serde_json::to_value(&function.function_data)?;
+    {
+        let fd = &data_value;
         if let Some(fd_type) = fd.get("type").and_then(|t| t.as_str()) {
             match fd_type {
                 "code" => {
@@ -359,10 +378,21 @@ async fn render_function(
                             writeln!(output, "  {name}")?;
                         }
                     }
-                    let path = build_web_path(function);
+                    let path = build_web_path_parts(
+                        &function.id.to_string(),
+                        function
+                            .function_type
+                            .as_ref()
+                            .and_then(|v| v.as_ref())
+                            .map(|v| v.as_str()),
+                        function.prompt_data.as_ref().is_some_and(|v| v.is_some()),
+                        &function.xact_id,
+                    );
                     let project_name = match project_name {
                         Some(project_name) => project_name.to_string(),
-                        None => resolve_project_name(client, &function.project_id).await?,
+                        None => {
+                            resolve_project_name(client, &function.project_id.to_string()).await?
+                        }
                     };
                     let url = app_project_url_with_encoded_path(
                         app_url,
@@ -389,7 +419,7 @@ async fn render_function(
     }
 
     if options.verbose {
-        if let Some(tags) = &function.tags {
+        if let Some(Some(tags)) = &function.tags {
             if !tags.is_empty() {
                 writeln!(
                     output,
@@ -399,9 +429,9 @@ async fn render_function(
                 )?;
             }
         }
-        if let Some(meta) = &function.metadata {
-            if let Some(obj) = meta.as_object() {
-                if !obj.is_empty() {
+        if let Some(Some(meta)) = &function.metadata {
+            {
+                if !meta.additional_properties.is_empty() {
                     writeln!(
                         output,
                         "{} {}",
@@ -421,7 +451,7 @@ async fn resolve_project_name(client: &ApiClient, project_id: &str) -> Result<St
     let projects = with_spinner("Loading project...", projects_api::list_projects(client)).await?;
     projects
         .into_iter()
-        .find(|project| project.id == project_id)
+        .find(|project| project.id.to_string() == project_id)
         .map(|project| project.name)
         .ok_or_else(|| anyhow!("project '{project_id}' not found for function"))
 }

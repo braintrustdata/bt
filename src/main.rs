@@ -340,10 +340,14 @@ fn handle_version_json(argv: &[OsString]) -> Result<bool> {
     Ok(true)
 }
 
-fn apply_runtime_env_overrides(base: &LoginBaseArgs) {
+fn apply_runtime_env_overrides(base: &mut LoginBaseArgs) {
     // Apply the CLI-owned override once so reqwest and inherited child
     // commands consistently observe BRAINTRUST_CA_CERT/--ca-cert precedence
     // over any ambient SSL_CERT_FILE.
+    base.custom_ca_pem = std::env::var_os("BRAINTRUST_CUSTOM_CA_BUNDLE");
+    if base.ca_cert.is_none() {
+        base.ca_cert = std::env::var_os("SSL_CERT_FILE").map(Into::into);
+    }
     if let Some(ca_cert) = base.ca_cert() {
         std::env::set_var("SSL_CERT_FILE", ca_cert);
     }
@@ -383,7 +387,7 @@ fn try_main() -> Result<()> {
         std::sync::atomic::Ordering::Relaxed,
     );
     configure_output(cli.command.base());
-    apply_runtime_env_overrides(cli.command.base());
+    apply_runtime_env_overrides(cli.command.base_mut());
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()
@@ -519,17 +523,14 @@ fn classify_error(err: &anyhow::Error, missing_credential: bool) -> ExitCode {
         return ExitCode::User;
     }
 
-    if let Some(http_error) = find_http_error(err) {
-        let status = http_error.status.as_u16();
-        if status == 401 || status == 403 {
-            return ExitCode::Auth;
-        }
-        if (400..=499).contains(&status) {
-            return ExitCode::User;
-        }
-        if (500..=599).contains(&status) {
-            return ExitCode::Network;
-        }
+    if let Some(kind) = braintrust_api_client::backend::failure_kind(err) {
+        use braintrust_api_client::backend::FailureKind;
+        return match kind {
+            FailureKind::Authentication => ExitCode::Auth,
+            FailureKind::InvalidInput => ExitCode::User,
+            FailureKind::Unavailable => ExitCode::Network,
+            _ => ExitCode::Error,
+        };
     }
 
     if let Some(code) = classify_sdk_error(err) {
@@ -551,26 +552,19 @@ fn classify_error(err: &anyhow::Error, missing_credential: bool) -> ExitCode {
     ExitCode::Error
 }
 
-fn find_http_error(err: &anyhow::Error) -> Option<&crate::http::HttpError> {
-    err.chain()
-        .find_map(|source| source.downcast_ref::<crate::http::HttpError>())
-}
-
 fn classify_sdk_error(err: &anyhow::Error) -> Option<ExitCode> {
     let sdk_err = err
         .chain()
         .find_map(|source| source.downcast_ref::<braintrust_sdk_rust::BraintrustError>())?;
     match sdk_err {
         braintrust_sdk_rust::BraintrustError::Api { status, .. } => {
-            if *status == 401 || *status == 403 {
-                Some(ExitCode::Auth)
-            } else if (400..=499).contains(status) {
-                Some(ExitCode::User)
-            } else if (500..=599).contains(status) {
-                Some(ExitCode::Network)
-            } else {
-                None
-            }
+            use braintrust_api_client::backend::FailureKind;
+            FailureKind::from_status(*status).map(|kind| match kind {
+                FailureKind::Authentication => ExitCode::Auth,
+                FailureKind::InvalidInput => ExitCode::User,
+                FailureKind::Unavailable => ExitCode::Network,
+                _ => ExitCode::Error,
+            })
         }
         braintrust_sdk_rust::BraintrustError::Http(_)
         | braintrust_sdk_rust::BraintrustError::Network(_) => Some(ExitCode::Network),
@@ -612,8 +606,7 @@ fn looks_like_user_error(err: &anyhow::Error) -> bool {
 }
 
 fn json_error_payload(err: &anyhow::Error) -> serde_json::Value {
-    let details = find_http_error(err)
-        .and_then(|error| serde_json::from_str::<serde_json::Value>(&error.body).ok());
+    let details = braintrust_api_client::backend::error_details(err);
     let message = details
         .as_ref()
         .and_then(json_error_message)
@@ -866,9 +859,9 @@ mod tests {
 
     #[test]
     fn provider_credential_errors_are_not_classified_as_bt_auth_errors() {
-        let err = crate::error::user_error(anyhow::Error::new(crate::http::HttpError {
-            status: reqwest::StatusCode::UNAUTHORIZED,
-            body: serde_json::json!({
+        let err = crate::error::user_error(anyhow::Error::new(crate::http::HttpError::new(
+            reqwest::StatusCode::UNAUTHORIZED,
+            serde_json::json!({
                 "error": {
                     "message": "Incorrect API key provided: synthetic-key",
                     "type": "invalid_request_error",
@@ -877,7 +870,7 @@ mod tests {
                 "status": 401
             })
             .to_string(),
-        }));
+        )));
 
         assert_eq!(classify_error(&err, false), ExitCode::User);
         let payload = json_error_payload(&err);
@@ -893,10 +886,10 @@ mod tests {
 
     #[test]
     fn json_http_errors_use_a_stable_envelope() {
-        let err = anyhow::Error::new(crate::http::HttpError {
-            status: reqwest::StatusCode::BAD_REQUEST,
-            body: serde_json::json!(["synthetic", "details"]).to_string(),
-        });
+        let err = anyhow::Error::new(crate::http::HttpError::new(
+            reqwest::StatusCode::BAD_REQUEST,
+            serde_json::json!(["synthetic", "details"]).to_string(),
+        ));
 
         let payload = json_error_payload(&err);
         assert!(payload["error"]["message"].is_string());
@@ -917,10 +910,10 @@ mod tests {
                 }
             }),
         ] {
-            let err = anyhow::Error::new(crate::http::HttpError {
-                status: reqwest::StatusCode::UNAUTHORIZED,
-                body: body.to_string(),
-            });
+            let err = anyhow::Error::new(crate::http::HttpError::new(
+                reqwest::StatusCode::UNAUTHORIZED,
+                body.to_string(),
+            ));
 
             assert_eq!(classify_error(&err, false), ExitCode::Auth);
         }

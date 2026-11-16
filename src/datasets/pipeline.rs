@@ -279,7 +279,7 @@ pub async fn run(base: BaseArgs, args: PipelineArgs) -> Result<()> {
             let transform_response = transform_source_refs(
                 &base,
                 &args.runner,
-                &source_project.id,
+                &source_project.id.to_string(),
                 &source,
                 TransformInput {
                     refs,
@@ -582,7 +582,7 @@ fn source_with_resolved_project(
     org_name: &str,
 ) -> PipelineSourceInspect {
     let mut source = source.clone();
-    source.project_id = Some(project.id.clone());
+    source.project_id = Some(project.id.to_string());
     source.project_name = Some(project.name.clone());
     if source.org_name.is_none() && !org_name.trim().is_empty() {
         source.org_name = Some(org_name.to_string());
@@ -1217,7 +1217,7 @@ async fn transform_refs(base: &BaseArgs, args: PipelineTransformArgs) -> Result<
     let response = transform_source_refs(
         &source_base,
         &args.runner,
-        &source_project.id,
+        &source_project.id.to_string(),
         &source,
         TransformInput {
             refs,
@@ -1514,7 +1514,7 @@ async fn upload_dataset_rows(
 
     utils::submit_prepared_records(
         &target_ctx,
-        &dataset.id,
+        &dataset.id.to_string(),
         &records,
         false,
         "Uploading dataset rows...",
@@ -1680,14 +1680,14 @@ async fn upload_deferred_attachment(
     base_dir: Option<&Path>,
 ) -> Result<Value> {
     let key = uuid::Uuid::new_v4().to_string();
-    let request = json!({
-        "key": key,
-        "filename": spec.filename,
-        "content_type": spec.content_type,
-        "org_id": client.org_id(),
-    });
-    let metadata: AttachmentUploadMetadata = client
-        .post("/attachment", &request)
+    let request = braintrust_api_client::backend::extensions::AttachmentRequest::new(
+        key.clone(),
+        spec.filename.clone(),
+        spec.content_type.clone(),
+        client.org_id().to_owned(),
+    );
+    let metadata = client
+        .request_attachment(&request)
         .await
         .context("failed to request signed URL from API server")?;
     let data = deferred_attachment_bytes(spec, base_dir)?;
@@ -1695,17 +1695,17 @@ async fn upload_deferred_attachment(
         crate::http::put_signed_url_with_headers(&metadata.signed_url, data, &metadata.headers)
             .await;
 
+    use braintrust_api_client::backend::extensions::{AttachmentStatus, AttachmentStatusRequest};
     let status = match &upload_result {
-        Ok(()) => json!({ "upload_status": "done" }),
-        Err(err) => json!({ "upload_status": "error", "error_message": err.to_string() }),
+        Ok(()) => AttachmentStatus::Done,
+        Err(err) => AttachmentStatus::Error {
+            error_message: err.to_string(),
+        },
     };
-    let status_request = json!({
-        "key": key,
-        "org_id": client.org_id(),
-        "status": status,
-    });
-    let _: Value = client
-        .post("/attachment/status", &status_request)
+    let status_request =
+        AttachmentStatusRequest::new(key.clone(), client.org_id().to_owned(), status);
+    client
+        .attachment_status(&status_request)
         .await
         .context("failed to log attachment status")?;
     upload_result.context("failed to upload attachment to object store")?;
@@ -1716,14 +1716,6 @@ async fn upload_deferred_attachment(
         "content_type": spec.content_type,
         "key": key,
     }))
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct AttachmentUploadMetadata {
-    signed_url: String,
-    #[serde(default)]
-    headers: HashMap<String, String>,
 }
 
 fn deferred_attachment_bytes(
@@ -1791,15 +1783,14 @@ async fn resolve_target_project(
     target: &PipelineTargetInspect,
 ) -> Result<Project> {
     if let Some(project_id) = target.project_id.as_deref() {
-        return Ok(Project {
-            id: project_id.to_string(),
-            name: target
+        return Ok(Project::new(
+            project_id.parse().context("invalid project ID")?,
+            target
                 .project_name
                 .clone()
                 .unwrap_or_else(|| project_id.to_string()),
-            org_id: String::new(),
-            description: None,
-        });
+            uuid::Uuid::nil(),
+        ));
     }
     let project_name = target
         .project_name
@@ -1824,10 +1815,10 @@ async fn resolve_target_dataset(
         bail!("dataset pipeline target.datasetName cannot be empty");
     }
 
-    let datasets = datasets_api::list_datasets(client, &project.id).await?;
+    let datasets = datasets_api::list_datasets(client, &project.id.to_string()).await?;
     if let Some(dataset) = datasets
         .iter()
-        .find(|dataset| dataset.id == dataset_name || dataset.name == dataset_name)
+        .find(|dataset| dataset.id.to_string() == dataset_name || dataset.name == dataset_name)
     {
         return Ok(dataset.clone());
     }
@@ -1842,7 +1833,7 @@ async fn resolve_target_dataset(
 
     datasets_api::create_dataset_with_metadata(
         client,
-        &project.id,
+        &project.id.to_string(),
         dataset_name,
         target.description.as_deref(),
         target.metadata.as_ref(),
@@ -1867,7 +1858,7 @@ async fn discover_refs(
     let result = discover_project_log_refs(
         &client,
         ProjectLogRefDiscoveryOptions {
-            project_id: &project.id,
+            project_id: &project.id.to_string(),
             filter: filter.as_ref(),
             scope: project_log_ref_scope(scope),
             target: limit,
@@ -1960,15 +1951,14 @@ async fn resolve_source_project(
     source: &PipelineSourceInspect,
 ) -> Result<Project> {
     if let Some(project_id) = source.project_id.as_deref() {
-        return Ok(Project {
-            id: project_id.to_string(),
-            name: source
+        return Ok(Project::new(
+            project_id.parse().context("invalid project ID")?,
+            source
                 .project_name
                 .clone()
                 .unwrap_or_else(|| project_id.to_string()),
-            org_id: String::new(),
-            description: None,
-        });
+            uuid::Uuid::nil(),
+        ));
     }
     let configured_project = crate::config::configured_project_for_context(Some(client.org_name()));
     let project_name = source
@@ -2253,7 +2243,7 @@ mod tests {
     fn pipeline_push_base_uses_target_org_and_project() {
         let base = test_base_args();
         let target = PipelineTargetInspect {
-            project_id: Some("project-id".to_string()),
+            project_id: Some("1a17b4f6-33ab-5acf-a53c-03f7a474fce3".to_string()),
             project_name: Some("Project Name".to_string()),
             org_name: Some("target-org".to_string()),
             dataset_name: "Dataset".to_string(),
@@ -2263,7 +2253,10 @@ mod tests {
 
         let target_base = base_with_pipeline_target(&base, &target);
         assert_eq!(target_base.org_name.as_deref(), Some("target-org"));
-        assert_eq!(target_base.project.as_deref(), Some("project-id"));
+        assert_eq!(
+            target_base.project.as_deref(),
+            Some("1a17b4f6-33ab-5acf-a53c-03f7a474fce3")
+        );
     }
 
     #[test]
@@ -2453,16 +2446,18 @@ mod tests {
             filter: Some("span_attributes.type = 'llm'".to_string()),
             scope: Some(PipelineScope::Span),
         };
-        let project = Project {
-            id: "project-id".to_string(),
-            name: "Loop".to_string(),
-            org_id: "org-id".to_string(),
-            description: None,
-        };
+        let project = Project::new(
+            "1a17b4f6-33ab-5acf-a53c-03f7a474fce3".parse().unwrap(),
+            "Loop".to_string(),
+            "27216650-d1df-5081-afb2-7d3ee020d75c".parse().unwrap(),
+        );
 
         let resolved = source_with_resolved_project(&source, &project, "braintrustdata.com");
 
-        assert_eq!(resolved.project_id.as_deref(), Some("project-id"));
+        assert_eq!(
+            resolved.project_id.as_deref(),
+            Some("1a17b4f6-33ab-5acf-a53c-03f7a474fce3")
+        );
         assert_eq!(resolved.project_name.as_deref(), Some("Loop"));
         assert_eq!(resolved.org_name.as_deref(), Some("braintrustdata.com"));
         assert_eq!(resolved.filter, source.filter);

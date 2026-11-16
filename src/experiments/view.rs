@@ -54,26 +54,28 @@ pub async fn run(ctx: &ResolvedContext, name: Option<&str>, json: bool, web: boo
 
     let description = experiment
         .description
-        .as_deref()
+        .as_ref()
+        .and_then(|value| value.as_deref())
         .filter(|d| !d.is_empty())
         .or_else(|| {
             experiment
                 .metadata
                 .as_ref()
-                .and_then(|m| m.get("description"))
+                .and_then(|value| value.as_ref())
+                .and_then(|m| m.additional_properties.get("description"))
                 .and_then(|d| d.as_str())
                 .filter(|d| !d.is_empty())
         });
     if let Some(desc) = description {
         writeln!(output, "{} {}", console::style("Description:").dim(), desc)?;
     }
-    if let Some(created) = &experiment.created {
+    if let Some(Some(created)) = &experiment.created {
         writeln!(output, "{} {}", console::style("Created:").dim(), created)?;
     }
-    if let Some(commit) = &experiment.commit {
+    if let Some(Some(commit)) = &experiment.commit {
         writeln!(output, "{} {}", console::style("Commit:").dim(), commit)?;
     }
-    if let Some(dataset_id) = &experiment.dataset_id {
+    if let Some(Some(dataset_id)) = &experiment.dataset_id {
         writeln!(
             output,
             "{} {}",
@@ -87,7 +89,7 @@ pub async fn run(ctx: &ResolvedContext, name: Option<&str>, json: bool, web: boo
         console::style("Public:").dim(),
         if experiment.public { "yes" } else { "no" }
     )?;
-    if let Some(tags) = &experiment.tags {
+    if let Some(Some(tags)) = &experiment.tags {
         if !tags.is_empty() {
             writeln!(
                 output,

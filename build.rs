@@ -106,6 +106,17 @@ fn copy_preview_assets() {
 fn main() {
     copy_preview_assets();
 
+    // Windows defaults to a 1 MiB main-thread stack, which can overflow while
+    // polling the HTTP client in an unoptimized build. Reserve the same 8 MiB
+    // commonly available to the main thread on other platforms.
+    if env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("windows") {
+        match env::var("CARGO_CFG_TARGET_ENV").as_deref() {
+            Ok("msvc") => println!("cargo:rustc-link-arg-bin=bt=/STACK:8388608"),
+            Ok("gnu") => println!("cargo:rustc-link-arg-bin=bt=-Wl,--stack,8388608"),
+            _ => {}
+        }
+    }
+
     let version = non_empty_env("BT_VERSION_STRING").unwrap_or_else(compute_default_version);
     println!("cargo:rustc-env=BT_VERSION_STRING={version}");
 

@@ -22,12 +22,12 @@ struct State {
 async fn login(req: HttpRequest) -> HttpResponse {
     let base = format!("http://{}", req.connection_info().host());
     HttpResponse::Ok()
-        .json(json!({"org_info": [{"id": "test-org-id", "name": "test-org", "api_url": base}]}))
+        .json(json!({"org_info": [{"id": "00000000-0000-4000-8000-000000000010", "name": "test-org", "api_url": base}]}))
 }
 
 async fn projects() -> HttpResponse {
     HttpResponse::Ok().json(
-        json!({"objects": [{"id": PROJECT, "name": "test-project", "org_id": "test-org-id"}]}),
+        json!({"objects": [{"id": PROJECT, "name": "test-project", "org_id": "00000000-0000-4000-8000-000000000010"}]}),
     )
 }
 

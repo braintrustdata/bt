@@ -79,13 +79,11 @@ where
         let query =
             build_project_log_ref_query(project_id, filter, limit, cursor.as_deref(), scope);
         let response: BtqlResponse = client
-            .btql_with_options(
-                &query,
-                BtqlOptions {
-                    source: Some("bt_sync_discovery"),
-                    ..Default::default()
-                },
-            )
+            .btql_with_options(&query, {
+                let mut options = BtqlOptions::default();
+                options.source = Some("bt_sync_discovery");
+                options
+            })
             .await?;
         let row_count = response.data.len();
 

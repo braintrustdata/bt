@@ -53,15 +53,12 @@ pub async fn run(ctx: &ResolvedContext, environment: Option<&str>, json: bool) -
     for prompt in &prompts {
         let desc = prompt
             .description
-            .as_deref()
+            .as_ref()
+            .and_then(|value| value.as_deref())
             .filter(|s| !s.is_empty())
             .map(|s| truncate(s, 60))
             .unwrap_or_else(|| "-".to_string());
-        let version = prompt
-            ._xact_id
-            .as_deref()
-            .map(crate::util_cmd::display_xact_id)
-            .unwrap_or_else(|| "-".to_string());
+        let version = crate::util_cmd::display_xact_id(&prompt.xact_id);
         let mut row = vec![prompt.name.as_str(), desc.as_str(), prompt.slug.as_str()];
         if environment.is_some() {
             row.push(version.as_str());

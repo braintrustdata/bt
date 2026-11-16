@@ -38,7 +38,7 @@ pub async fn run(ctx: &ResolvedContext, name: Option<&str>, force: bool) -> Resu
 
     match with_spinner(
         "Deleting experiment...",
-        api::delete_experiment(&ctx.client, &experiment.id),
+        api::delete_experiment(&ctx.client, &experiment.id.to_string()),
     )
     .await
     {

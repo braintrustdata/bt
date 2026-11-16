@@ -13,7 +13,7 @@ pub async fn run(ctx: &ResolvedContext, name: Option<&str>, force: bool) -> Resu
     let dataset = match name {
         Some(name) => with_spinner(
             "Loading dataset...",
-            api::get_dataset_by_name(&ctx.client, &ctx.project.id, name),
+            api::get_dataset_by_name(&ctx.client, &ctx.project.id.to_string(), name),
         )
         .await?
         .ok_or_else(|| anyhow!("dataset '{name}' not found"))?,
@@ -22,7 +22,7 @@ pub async fn run(ctx: &ResolvedContext, name: Option<&str>, force: bool) -> Resu
                 bail!("dataset name required. Use: bt datasets delete <name>");
             }
             let Some(dataset) =
-                super::select_dataset_interactive(&ctx.client, &ctx.project.id).await?
+                super::select_dataset_interactive(&ctx.client, &ctx.project.id.to_string()).await?
             else {
                 super::print_no_datasets_found(&ctx.project.name);
                 return Ok(());
@@ -52,7 +52,7 @@ pub async fn run(ctx: &ResolvedContext, name: Option<&str>, force: bool) -> Resu
 
     match with_spinner(
         "Deleting dataset...",
-        api::delete_dataset(&ctx.client, &dataset.id),
+        api::delete_dataset(&ctx.client, &dataset.id.to_string()),
     )
     .await
     {

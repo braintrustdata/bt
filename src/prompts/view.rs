@@ -26,9 +26,10 @@ pub async fn run(
             &ctx.app_public_url,
             ctx.client.org_name(),
             project_name,
-            &["prompts", &prompt.id],
+            &["prompts", &prompt.id.to_string()],
         );
-        url = app_url_with_selected_version(url, version, environment, prompt._xact_id.as_deref());
+        url =
+            app_url_with_selected_version(url, version, environment, Some(prompt.xact_id.as_str()));
         open::that(&url)?;
         print_command_status(CommandStatus::Success, &format!("Opened {url} in browser"));
         return Ok(());
@@ -50,7 +51,7 @@ pub async fn run(
             environment
         )?;
     }
-    if let Some(version) = prompt._xact_id.as_deref().or(version) {
+    if let Some(version) = Some(prompt.xact_id.as_str()).or(version) {
         writeln!(
             output,
             "{} {}",
@@ -59,7 +60,13 @@ pub async fn run(
         )?;
     }
 
-    let options = prompt.prompt_data.as_ref().and_then(|pd| pd.get("options"));
+    let prompt_data = prompt
+        .prompt_data
+        .as_ref()
+        .and_then(|value| value.as_ref())
+        .map(serde_json::to_value)
+        .transpose()?;
+    let options = prompt_data.as_ref().and_then(|pd| pd.get("options"));
 
     if let Some(model) = options
         .and_then(|o| o.get("model"))
@@ -76,7 +83,7 @@ pub async fn run(
 
     writeln!(output)?;
 
-    if let Some(prompt_block) = prompt.prompt_data.as_ref().and_then(|pd| pd.get("prompt")) {
+    if let Some(prompt_block) = prompt_data.as_ref().and_then(|pd| pd.get("prompt")) {
         render_prompt_block(&mut output, prompt_block)?;
     }
 

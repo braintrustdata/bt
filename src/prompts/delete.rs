@@ -43,7 +43,7 @@ pub async fn run(ctx: &ResolvedContext, slug: Option<&str>, force: bool) -> Resu
 
     match with_spinner(
         "Deleting prompt...",
-        api::delete_prompt(&ctx.client, &prompt.id),
+        api::delete_prompt(&ctx.client, &prompt.id.to_string()),
     )
     .await
     {

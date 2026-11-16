@@ -13,7 +13,11 @@ pub async fn run(ctx: &ResolvedContext, slug: Option<&str>, json: bool) -> Resul
 
     let versions = with_spinner(
         "Loading prompt versions...",
-        api::list_prompt_versions(&ctx.client, &ctx.project.id, &prompt.id),
+        api::list_prompt_versions(
+            &ctx.client,
+            &ctx.project.id.to_string(),
+            &prompt.id.to_string(),
+        ),
     )
     .await?;
 

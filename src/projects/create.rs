@@ -2,9 +2,8 @@ use std::time::Duration;
 
 use anyhow::{bail, Result};
 use dialoguer::Input;
-use reqwest::StatusCode;
 
-use crate::http::{ApiClient, HttpError};
+use crate::http::ApiClient;
 use crate::ui::{
     is_interactive, print_command_status, with_spinner, with_spinner_visible, CommandStatus,
 };
@@ -58,11 +57,7 @@ pub(crate) async fn create_project_checked(
 }
 
 fn is_conflict_error(err: &anyhow::Error) -> bool {
-    err.chain().any(|source| {
-        source
-            .downcast_ref::<HttpError>()
-            .is_some_and(|http_err| http_err.status == StatusCode::CONFLICT)
-    })
+    braintrust_api_client::backend::is_conflict(err)
 }
 
 pub async fn run(client: &ApiClient, name: Option<&str>, json: bool) -> Result<()> {
@@ -123,7 +118,7 @@ mod tests {
             Self {
                 id: id.to_string(),
                 name: name.to_string(),
-                org_id: "test-org".to_string(),
+                org_id: "00000000-0000-4000-8000-000000000010".to_string(),
             }
         }
     }
@@ -229,7 +224,7 @@ mod tests {
         match state.create_behavior {
             CreateBehavior::Create => {
                 let mut projects = state.projects.lock().expect("projects lock");
-                let id = format!("proj-created-{}", projects.len() + 1);
+                let id = format!("00000000-0000-4000-8000-{:012}", projects.len() + 3);
                 let created = MockProject::new(&id, &body.name);
                 projects.push(created.clone());
                 HttpResponse::Ok().json(
@@ -241,7 +236,10 @@ mod tests {
                     .projects
                     .lock()
                     .expect("projects lock")
-                    .push(MockProject::new("proj-race", &body.name));
+                    .push(MockProject::new(
+                        "00000000-0000-4000-8000-000000000002",
+                        &body.name,
+                    ));
                 HttpResponse::Conflict()
                     .json(serde_json::json!({ "error": "project already exists" }))
             }
@@ -251,7 +249,10 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn create_project_checked_returns_existing_project() {
         let (server, client) = setup_test(
-            vec![MockProject::new("proj-1", "existing-project")],
+            vec![MockProject::new(
+                "00000000-0000-4000-8000-000000000001",
+                "existing-project",
+            )],
             CreateBehavior::Create,
         )
         .await;
@@ -263,7 +264,10 @@ mod tests {
         let CreateProjectOutcome::Existing(project) = outcome else {
             panic!("expected existing project outcome");
         };
-        assert_eq!(project.id, "proj-1");
+        assert_eq!(
+            project.id.to_string(),
+            "00000000-0000-4000-8000-000000000001"
+        );
         assert_eq!(project.name, "existing-project");
 
         server.stop().await;
@@ -280,7 +284,10 @@ mod tests {
         let CreateProjectOutcome::Existing(project) = outcome else {
             panic!("expected existing project outcome after create conflict");
         };
-        assert_eq!(project.id, "proj-race");
+        assert_eq!(
+            project.id.to_string(),
+            "00000000-0000-4000-8000-000000000002"
+        );
         assert_eq!(project.name, "race-project");
 
         server.stop().await;
@@ -297,7 +304,10 @@ mod tests {
         let CreateProjectOutcome::Created(project) = outcome else {
             panic!("expected created project outcome");
         };
-        assert_eq!(project.id, "proj-created-1");
+        assert_eq!(
+            project.id.to_string(),
+            "00000000-0000-4000-8000-000000000003"
+        );
         assert_eq!(project.name, "new-project");
 
         server.stop().await;

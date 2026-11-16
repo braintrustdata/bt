@@ -25,11 +25,12 @@ const PUBLIC_PREVIEW_NOTICE: &str = "Observability templates are in public previ
 
 pub(crate) async fn run(base: BaseArgs, args: PullArgs) -> Result<()> {
     let ctx = resolve_project_command_context_with_auth_mode(&base, true).await?;
+    let project_id = ctx.project.id.to_string();
     let (functions, automations) =
         with_spinner("Loading active observability resources...", async {
             tokio::try_join!(
-                list_all_functions(&ctx.client, &ctx.project.id),
-                list_project_automations(&ctx.client, &ctx.project.id),
+                list_all_functions(&ctx.client, &project_id),
+                list_project_automations(&ctx.client, &project_id),
             )
         })
         .await?;

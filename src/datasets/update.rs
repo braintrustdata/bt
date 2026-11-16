@@ -20,7 +20,7 @@ pub async fn run(
 
     let existing_dataset = with_spinner(
         "Resolving remote dataset...",
-        api::get_dataset_by_name(&ctx.client, &ctx.project.id, &dataset_name),
+        api::get_dataset_by_name(&ctx.client, &ctx.project.id.to_string(), &dataset_name),
     )
     .await?;
     let dataset = match existing_dataset {
@@ -34,7 +34,7 @@ pub async fn run(
 
     if let Err(error) = utils::submit_prepared_records(
         ctx,
-        &dataset.id,
+        &dataset.id.to_string(),
         &local_records,
         true,
         "Updating remote dataset...",

@@ -1,53 +1,18 @@
-use anyhow::Result;
-use serde::{Deserialize, Serialize};
-use urlencoding::encode;
-
 use crate::http::ApiClient;
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct Environment {
-    pub id: String,
-    pub org_id: String,
-    pub name: String,
-    pub slug: String,
-    #[serde(default)]
-    pub description: Option<String>,
-    #[serde(default)]
-    pub created: Option<String>,
-    #[serde(default)]
-    pub deleted_at: Option<String>,
-}
-
-#[derive(Deserialize)]
-struct ListResponse {
-    objects: Vec<Environment>,
-}
-
-#[derive(Serialize)]
-pub struct CreateEnvironment<'a> {
-    pub name: &'a str,
-    pub slug: &'a str,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub description: Option<&'a str>,
-    pub org_name: &'a str,
-}
-
-#[derive(Serialize)]
-pub struct UpdateEnvironment<'a> {
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub name: Option<&'a str>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub slug: Option<&'a str>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub description: Option<Option<&'a str>>,
-}
+use anyhow::Result;
+pub use braintrust_api_client::types::{
+    CreateEnvironment, Environment, PatchEnvironment as UpdateEnvironment,
+};
 
 pub async fn list(client: &ApiClient) -> Result<Vec<Environment>> {
-    let response: ListResponse = client
-        .get(&format!(
-            "/environment?org_name={}",
-            encode(client.org_name())
-        ))
+    let response = client
+        .run(|| {
+            client
+                .generated()
+                .list_environments_builder()
+                .org_name(client.org_name())
+                .send()
+        })
         .await?;
     Ok(response.objects)
 }
@@ -59,22 +24,26 @@ pub async fn get_by_slug(client: &ApiClient, slug: &str) -> Result<Option<Enviro
         .find(|environment| environment.slug == slug))
 }
 
-pub async fn create(client: &ApiClient, body: &CreateEnvironment<'_>) -> Result<Environment> {
-    client.post("/environment", body).await
+pub async fn create(client: &ApiClient, body: &CreateEnvironment) -> Result<Environment> {
+    let request = body;
+    client
+        .run(|| client.generated().create_environment(Some(request.clone())))
+        .await
 }
 
-pub async fn update(
-    client: &ApiClient,
-    id: &str,
-    body: &UpdateEnvironment<'_>,
-) -> Result<Environment> {
+pub async fn update(client: &ApiClient, id: &str, body: &UpdateEnvironment) -> Result<Environment> {
+    let request = body;
     client
-        .patch(&format!("/environment/{}", encode(id)), body)
+        .run(|| {
+            client
+                .generated()
+                .update_environment(id, Some(request.clone()))
+        })
         .await
 }
 
 pub async fn delete(client: &ApiClient, id: &str) -> Result<Environment> {
     client
-        .delete_with_response(&format!("/environment/{}", encode(id)))
+        .run(|| client.generated().delete_environment(id))
         .await
 }

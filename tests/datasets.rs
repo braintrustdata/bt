@@ -110,9 +110,9 @@ impl MockServerState {
         Self {
             requests: Mutex::new(Vec::new()),
             projects: Mutex::new(vec![MockProject {
-                id: "proj_fixture".to_string(),
+                id: "00000000-0000-4000-8000-000000000010".to_string(),
                 name: "fixtures-project".to_string(),
-                org_id: "org_mock".to_string(),
+                org_id: "00000000-0000-4000-8000-000000000020".to_string(),
             }]),
             datasets: Mutex::new(Vec::new()),
             dataset_snapshots: Mutex::new(Vec::new()),
@@ -190,7 +190,7 @@ async fn mock_login(state: web::Data<Arc<MockServerState>>, req: HttpRequest) ->
     HttpResponse::Ok().json(serde_json::json!({
         "org_info": [
             {
-                "id": "org_mock",
+                "id": "00000000-0000-4000-8000-000000000020",
                 "name": "test-org",
                 "api_url": base
             }
@@ -244,6 +244,7 @@ async fn mock_list_datasets(
                 "id": dataset.id,
                 "name": dataset.name,
                 "project_id": dataset.project_id,
+                "url_slug":dataset.name,
                 "created": dataset.created
             })
         })
@@ -272,12 +273,13 @@ async fn mock_create_dataset(
             "id": existing.id,
             "name": existing.name,
             "project_id": existing.project_id,
+            "url_slug":existing.name,
             "created": existing.created
         }));
     }
 
     let created = MockDataset {
-        id: format!("dataset_{}", datasets.len() + 1),
+        id: format!("00000000-0000-4000-8000-{:012}", datasets.len() + 101),
         name: body.name.clone(),
         project_id: body.project_id.clone(),
         created: "2026-01-01T00:00:00Z".to_string(),
@@ -287,6 +289,7 @@ async fn mock_create_dataset(
         "id": created.id,
         "name": created.name,
         "project_id": created.project_id,
+        "url_slug":created.name,
         "created": created.created
     }))
 }
@@ -303,7 +306,7 @@ async fn mock_delete_dataset(
     let Some(index) = datasets.iter().position(|dataset| dataset.id == dataset_id) else {
         return HttpResponse::NotFound().body(format!("unknown dataset id '{dataset_id}'"));
     };
-    datasets.remove(index);
+    let deleted = datasets.remove(index);
     drop(datasets);
 
     state
@@ -317,7 +320,7 @@ async fn mock_delete_dataset(
         .expect("dataset rows lock")
         .remove(&dataset_id);
 
-    HttpResponse::Ok().finish()
+    HttpResponse::Ok().json(serde_json::json!({"id":deleted.id,"name":deleted.name,"project_id":deleted.project_id,"url_slug":deleted.name,"created":deleted.created}))
 }
 
 #[derive(Debug, Deserialize)]
@@ -382,7 +385,7 @@ async fn mock_create_dataset_snapshot(
     }
 
     let snapshot = MockDatasetSnapshot {
-        id: format!("snapshot_{}", snapshots.len() + 1),
+        id: format!("00000000-0000-4000-8000-{:012}", snapshots.len() + 201),
         dataset_id: body.dataset_id.clone(),
         name: body.name.clone(),
         xact_id: body.xact_id.clone(),
@@ -455,8 +458,8 @@ async fn mock_delete_dataset_snapshot(
         return HttpResponse::NotFound().body(format!("unknown snapshot id '{snapshot_id}'"));
     };
 
-    snapshots.remove(index);
-    HttpResponse::Ok().finish()
+    let deleted = snapshots.remove(index);
+    HttpResponse::Ok().json(serde_json::json!({"id":deleted.id,"dataset_id":deleted.dataset_id,"name":deleted.name,"description":deleted.description,"xact_id":deleted.xact_id,"created":deleted.created}))
 }
 
 #[derive(Debug, Deserialize)]

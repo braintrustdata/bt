@@ -25,11 +25,10 @@ use serde::{Deserialize, Serialize};
 use serde_json::json;
 use serde_json::{Map, Value};
 use unicode_width::UnicodeWidthStr;
-use urlencoding::encode;
 
 use crate::args::BaseArgs;
 use crate::auth::login;
-use crate::http::{ApiClient, BtqlOptions, HttpError, HttpOptions};
+use crate::http::{ApiClient, BtqlOptions, OperationOptions};
 use crate::project_context::resolve_required_project;
 use crate::ui::with_spinner;
 use crate::utils::parse_duration_to_seconds;
@@ -158,73 +157,11 @@ struct RealtimeState {
     pub state_type: String,
 }
 
-#[derive(Debug, Serialize)]
-struct SubmitAsyncQueryRequest<'a> {
-    query: &'a str,
-    format: &'static str,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    batch_size: Option<u64>,
-}
-
-#[derive(Debug, Deserialize, Serialize)]
-struct SubmitAsyncQueryResponse {
-    id: String,
-    #[serde(default)]
-    project_id: Option<String>,
-    #[serde(default)]
-    object_id: Option<String>,
-    status: AsyncQueryStatus,
-}
-
-#[derive(Debug, Clone, Copy, Deserialize, PartialEq, Eq, Serialize)]
-#[serde(rename_all = "snake_case")]
-enum AsyncQueryStatus {
-    Queued,
-    Running,
-    Canceled,
-    Succeeded,
-    Failed,
-}
-
-impl AsyncQueryStatus {
-    fn is_terminal(self) -> bool {
-        matches!(
-            self,
-            AsyncQueryStatus::Canceled | AsyncQueryStatus::Succeeded | AsyncQueryStatus::Failed
-        )
-    }
-}
-
-impl std::fmt::Display for AsyncQueryStatus {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let status = match self {
-            AsyncQueryStatus::Queued => "queued",
-            AsyncQueryStatus::Running => "running",
-            AsyncQueryStatus::Canceled => "canceled",
-            AsyncQueryStatus::Succeeded => "succeeded",
-            AsyncQueryStatus::Failed => "failed",
-        };
-        write!(f, "{status}")
-    }
-}
-
-#[derive(Debug, Deserialize)]
-struct AsyncQueryStatusResponse {
-    status: AsyncQueryStatus,
-    #[serde(default)]
-    error: Option<String>,
-}
-
-#[derive(Debug, Deserialize)]
-struct AsyncQueryResultPage {
-    status: AsyncQueryStatus,
-    #[serde(default)]
-    rows: Vec<Map<String, Value>>,
-    #[serde(default, deserialize_with = "crate::http::btql::deserialize_cursor")]
-    cursor: Option<String>,
-    #[serde(default)]
-    error: Option<String>,
-}
+use braintrust_api_client::backend::extensions::{
+    AsyncQuery as SubmitAsyncQueryResponse, AsyncQueryPage as AsyncQueryResultPage,
+    AsyncQueryState as AsyncQueryStatus, AsyncQueryStatus as AsyncQueryStatusResponse,
+    AsyncQuerySubmission,
+};
 
 pub async fn run(base: BaseArgs, args: SqlArgs) -> Result<()> {
     let ctx = login(&base).await?;
@@ -300,7 +237,7 @@ async fn prepare_query(base: &BaseArgs, client: &ApiClient, query: &str) -> Resu
     let project = resolve_required_project(base, client, false)
         .await
         .context("`FROM logs` requires a project; pass --project <name> or run `bt switch`")?;
-    Ok(rewrite_logs_sources(query, &project.id))
+    Ok(rewrite_logs_sources(query, &project.id.to_string()))
 }
 
 fn has_logs_source(query: &str) -> bool {
@@ -578,14 +515,12 @@ fn format_response(response: &SqlResponse, json_output: bool) -> Result<String> 
 
 async fn execute_query(client: &ApiClient, query: &str, lint_mode: &str) -> Result<SqlResponse> {
     match client
-        .btql_with_options(
-            query,
-            BtqlOptions {
-                source: Some("bt_sql"),
-                lint_mode: Some(lint_mode),
-                ..Default::default()
-            },
-        )
+        .btql_with_options(query, {
+            let mut options = BtqlOptions::default();
+            options.source = Some("bt_sql");
+            options.lint_mode = Some(lint_mode);
+            options
+        })
         .await
     {
         Ok(response) => Ok(response),
@@ -605,12 +540,6 @@ async fn run_async_query(
     args: &SqlArgs,
     json_output: bool,
 ) -> Result<()> {
-    let scoped = if client.org_name().is_empty() {
-        client.clone()
-    } else {
-        client.header("x-bt-org-name", client.org_name())
-    };
-    let client = &scoped;
     let submitted = with_spinner(
         "Submitting async query...",
         submit_async_query(client, query, args.async_batch_size),
@@ -645,8 +574,9 @@ async fn submit_async_query(
     query: &str,
     batch_size: Option<u64>,
 ) -> Result<SubmitAsyncQueryResponse> {
-    let body = async_query_submit_body(query, batch_size);
-    client.post("/btql/async", &body).await
+    client
+        .submit_query(&AsyncQuerySubmission::new(query, batch_size))
+        .await
 }
 
 async fn wait_for_async_query(
@@ -657,11 +587,12 @@ async fn wait_for_async_query(
     let started = Instant::now();
     loop {
         let status: AsyncQueryStatusResponse = client
-            .with_options(HttpOptions {
-                retry: Some(true),
-                ..Default::default()
+            .with_options({
+                let mut options = OperationOptions::default();
+                options.retry = Some(true);
+                options
             })
-            .get(&format!("/btql/async/{}", encode(automation_id)))
+            .query_status(automation_id)
             .await?;
         if status.status.is_terminal() {
             return Ok(status);
@@ -689,15 +620,12 @@ async fn collect_async_query_result(
         .pages(None, page_size, |limit, cursor| async move {
             loop {
                 let page: AsyncQueryResultPage = client
-                    .with_options(HttpOptions {
-                        retry: Some(true),
-                        ..Default::default()
+                    .with_options({
+                        let mut options = OperationOptions::default();
+                        options.retry = Some(true);
+                        options
                     })
-                    .get(&async_query_result_path(
-                        automation_id,
-                        limit as u64,
-                        cursor.as_deref(),
-                    ))
+                    .query_page(automation_id, limit as u64, cursor.as_deref())
                     .await?;
                 if page.status == AsyncQueryStatus::Queued {
                     tokio::time::sleep(args.poll_interval).await;
@@ -715,11 +643,9 @@ async fn collect_async_query_result(
                         ))
                     );
                 }
-                return Ok(crate::http::BtqlResponse {
-                    data: page.rows,
-                    cursor: page.cursor,
-                    schema: None,
-                });
+                let mut response = crate::http::BtqlResponse::new(page.rows);
+                response.cursor = page.cursor;
+                return Ok(response);
             }
         })
         .try_fold(Vec::new(), |mut rows, page| async move {
@@ -737,27 +663,6 @@ async fn collect_async_query_result(
         warnings: Vec::new(),
         extra: HashMap::new(),
     })
-}
-
-fn async_query_submit_body(query: &str, batch_size: Option<u64>) -> SubmitAsyncQueryRequest<'_> {
-    SubmitAsyncQueryRequest {
-        query,
-        format: "jsonl",
-        batch_size,
-    }
-}
-
-fn async_query_result_path(automation_id: &str, limit: u64, cursor: Option<&str>) -> String {
-    let mut path = format!(
-        "/btql/async/{}/result?limit={}",
-        encode(automation_id),
-        limit
-    );
-    if let Some(cursor) = cursor {
-        path.push_str("&cursor=");
-        path.push_str(encode(cursor).as_ref());
-    }
-    path
 }
 
 fn parse_positive_u64_arg(value: &str) -> Result<u64, String> {
@@ -793,9 +698,8 @@ fn print_response(response: &SqlResponse, json_output: bool) -> Result<()> {
 }
 
 fn format_strict_lint_error(err: &anyhow::Error) -> Option<String> {
-    let http_error = err.downcast_ref::<HttpError>()?;
-    let body: Value = serde_json::from_str(&http_error.body).ok()?;
-    format_strict_lint_message(body.get("Message")?.as_str()?)
+    let message = braintrust_api_client::backend::query_lint_message(err)?;
+    format_strict_lint_message(&message)
 }
 
 fn format_strict_lint_message(message: &str) -> Option<String> {
@@ -1186,32 +1090,6 @@ mod tests {
         assert_eq!(parsed.wait_timeout, Some(Duration::from_secs(3600)));
         assert_eq!(parsed.async_result_limit, 500);
         assert_eq!(parsed.query.as_deref(), Some("select 1"));
-    }
-
-    #[test]
-    fn async_query_submit_body_sets_jsonl_format() {
-        let body = serde_json::to_value(async_query_submit_body("select 1", Some(250))).unwrap();
-
-        assert_eq!(body["query"], "select 1");
-        assert_eq!(body["format"], "jsonl");
-        assert_eq!(body["batch_size"], 250);
-    }
-
-    #[test]
-    fn async_query_submit_body_omits_batch_size_when_unset() {
-        let body = serde_json::to_value(async_query_submit_body("select 1", None)).unwrap();
-
-        assert!(body.get("batch_size").is_none());
-    }
-
-    #[test]
-    fn async_result_path_encodes_cursor() {
-        let path = async_query_result_path("automation/id", 100, Some("cursor/with space"));
-
-        assert_eq!(
-            path,
-            "/btql/async/automation%2Fid/result?limit=100&cursor=cursor%2Fwith%20space"
-        );
     }
 
     #[test]

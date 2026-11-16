@@ -17,12 +17,13 @@ use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Map, Value};
 use sha2::{Digest, Sha256};
-use urlencoding::encode;
 
 use crate::args::BaseArgs;
 use crate::auth::login;
 use crate::experiments::api::create_experiment;
-use crate::http::{ApiClient, BtqlOptions, BtqlResponse, HttpOptions, Pagination, RetryReason};
+use crate::http::{
+    ApiClient, BtqlOptions, BtqlResponse, OperationOptions, Pagination, RetryReason,
+};
 use crate::projects::api::{create_project, list_projects, Project};
 use crate::ui::{animations_enabled, fuzzy_select, is_quiet};
 use crate::utils::{app_project_url, parse_duration_to_seconds, write_json_atomic};
@@ -404,17 +405,6 @@ struct NamedObject {
     name: String,
 }
 
-#[derive(Debug, Clone, Deserialize)]
-struct CreatedDataset {
-    id: String,
-    name: String,
-}
-
-#[derive(Debug, Deserialize)]
-struct NamedObjectListResponse {
-    objects: Vec<NamedObject>,
-}
-
 #[derive(Debug, Clone)]
 struct InteractiveChoice {
     label: String,
@@ -498,6 +488,7 @@ impl BtqlRetryTracker {
         move |reason| match reason {
             RetryReason::Status(status) => tracker.record_status(status),
             RetryReason::Network => tracker.record_network(),
+            _ => tracker.record_network(),
         }
     }
 
@@ -967,18 +958,17 @@ async fn pull_spans_mode(
         |batch_limit, cursor| async move {
             let query = build_spans_query(source_expr, filter, batch_limit, cursor.as_deref());
             client
-                .with_options(HttpOptions {
-                    on_retry: Some(Arc::new(btql_retry_tracker.observer())),
-                    trace: verbose.then_some("spans").map(str::to_owned),
-                    ..Default::default()
+                .with_options({
+                    let mut options = OperationOptions::default();
+                    options.on_retry = Some(Arc::new(btql_retry_tracker.observer()));
+                    options.trace = verbose.then_some("spans").map(str::to_owned);
+                    options
                 })
-                .btql_with_options::<BtqlResponse>(
-                    &query,
-                    BtqlOptions {
-                        source: Some("bt_sync"),
-                        ..Default::default()
-                    },
-                )
+                .btql_with_options::<BtqlResponse>(&query, {
+                    let mut options = BtqlOptions::default();
+                    options.source = Some("bt_sync");
+                    options
+                })
                 .await
         },
     );
@@ -1212,18 +1202,17 @@ async fn pull_traces_mode(
                 discovery_cursor.as_deref(),
             );
             let response = client
-                .with_options(HttpOptions {
-                    on_retry: Some(Arc::new(btql_retry_tracker.observer())),
-                    trace: verbose.then_some("discover_roots").map(str::to_owned),
-                    ..Default::default()
+                .with_options({
+                    let mut options = OperationOptions::default();
+                    options.on_retry = Some(Arc::new(btql_retry_tracker.observer()));
+                    options.trace = verbose.then_some("discover_roots").map(str::to_owned);
+                    options
                 })
-                .btql_with_options::<BtqlResponse>(
-                    &query,
-                    BtqlOptions {
-                        source: Some("bt_sync"),
-                        ..Default::default()
-                    },
-                )
+                .btql_with_options::<BtqlResponse>(&query, {
+                    let mut options = BtqlOptions::default();
+                    options.source = Some("bt_sync");
+                    options
+                })
                 .await?;
             let row_count = response.data.len();
 
@@ -1520,18 +1509,17 @@ async fn process_trace_chunk(
             cursor.as_deref(),
         );
         let BtqlResponse { data, cursor, .. } = client
-            .with_options(HttpOptions {
-                on_retry: Some(Arc::new(btql_retry_tracker.observer())),
-                trace: verbose.then_some("fetch_roots").map(str::to_owned),
-                ..Default::default()
+            .with_options({
+                let mut options = OperationOptions::default();
+                options.on_retry = Some(Arc::new(btql_retry_tracker.observer()));
+                options.trace = verbose.then_some("fetch_roots").map(str::to_owned);
+                options
             })
-            .btql_with_options::<BtqlResponse>(
-                &query,
-                BtqlOptions {
-                    source: Some("bt_sync"),
-                    ..Default::default()
-                },
-            )
+            .btql_with_options::<BtqlResponse>(&query, {
+                let mut options = BtqlOptions::default();
+                options.source = Some("bt_sync");
+                options
+            })
             .await?;
         let mut rows = data;
         let batch_count = rows.len();
@@ -2340,18 +2328,17 @@ async fn discover_vector_specs_global(
     ]
     .join(" | ");
     let response = client
-        .with_options(HttpOptions {
-            on_retry: Some(Arc::new(btql_retry_tracker.observer())),
-            trace: verbose.then_some("vector_models").map(str::to_owned),
-            ..Default::default()
+        .with_options({
+            let mut options = OperationOptions::default();
+            options.on_retry = Some(Arc::new(btql_retry_tracker.observer()));
+            options.trace = verbose.then_some("vector_models").map(str::to_owned);
+            options
         })
-        .btql_with_options::<BtqlResponse>(
-            &query,
-            BtqlOptions {
-                source: Some("bt_sync"),
-                ..Default::default()
-            },
-        )
+        .btql_with_options::<BtqlResponse>(&query, {
+            let mut options = BtqlOptions::default();
+            options.source = Some("bt_sync");
+            options
+        })
         .await?;
 
     let mut specs = Vec::new();
@@ -2459,18 +2446,17 @@ async fn fetch_vector_columns_for_rows(
         id_literals.len().max(1)
     );
     let response = client
-        .with_options(HttpOptions {
-            on_retry: Some(Arc::new(btql_retry_tracker.observer())),
-            trace: verbose.then_some("vector_rows").map(str::to_owned),
-            ..Default::default()
+        .with_options({
+            let mut options = OperationOptions::default();
+            options.on_retry = Some(Arc::new(btql_retry_tracker.observer()));
+            options.trace = verbose.then_some("vector_rows").map(str::to_owned);
+            options
         })
-        .btql_with_options::<BtqlResponse>(
-            &query,
-            BtqlOptions {
-                source: Some("bt_sync"),
-                ..Default::default()
-            },
-        )
+        .btql_with_options::<BtqlResponse>(&query, {
+            let mut options = BtqlOptions::default();
+            options.source = Some("bt_sync");
+            options
+        })
         .await?;
 
     let mut by_xact = BTreeMap::new();
@@ -3057,7 +3043,8 @@ async fn resolve_pull_object_ref(
         object_ref: format!("project_logs:{}", project.id),
     }];
 
-    match list_project_named_objects(client, ObjectType::Experiment, &project.id).await {
+    match list_project_named_objects(client, ObjectType::Experiment, &project.id.to_string()).await
+    {
         Ok(mut experiments) => {
             experiments.sort_by(|a, b| a.name.cmp(&b.name));
             choices.extend(experiments.into_iter().map(|obj| InteractiveChoice {
@@ -3071,7 +3058,7 @@ async fn resolve_pull_object_ref(
         ),
     }
 
-    match list_project_named_objects(client, ObjectType::Dataset, &project.id).await {
+    match list_project_named_objects(client, ObjectType::Dataset, &project.id.to_string()).await {
         Ok(mut datasets) => {
             datasets.sort_by(|a, b| a.name.cmp(&b.name));
             choices.extend(datasets.into_iter().map(|obj| InteractiveChoice {
@@ -3118,12 +3105,12 @@ async fn resolve_destination(
                 resolve_project_logs_target(client, requested.object_name.trim(), mode).await?;
             let object = ObjectRef {
                 object_type: ObjectType::ProjectLogs,
-                object_name: project.id.clone(),
+                object_name: project.id.to_string(),
             };
             Ok(ResolvedDestination {
                 object_ref: format!("project_logs:{}", project.id),
                 object,
-                project_id: project.id.clone(),
+                project_id: project.id.to_string(),
                 project_name: project.name.clone(),
                 object_name: project.name,
                 run_id: None,
@@ -3234,7 +3221,8 @@ async fn resolve_named_object_target(
 
     if let Some(project_selector) = project_selector {
         let project = find_project_by_selector(&projects, project_selector)?;
-        let objects = list_project_named_objects(client, object_type, &project.id).await?;
+        let objects =
+            list_project_named_objects(client, object_type, &project.id.to_string()).await?;
         let object = find_named_object_by_selector(
             &objects,
             object_selector,
@@ -3244,13 +3232,13 @@ async fn resolve_named_object_target(
         return Ok(ResolvedNamedObjectTarget {
             object_id: object.id.clone(),
             object_name: object.name.clone(),
-            project_id: project.id.clone(),
+            project_id: project.id.to_string(),
             project_name: project.name.clone(),
         });
     }
 
     for project in &projects {
-        let objects = list_project_named_objects(client, object_type, &project.id)
+        let objects = list_project_named_objects(client, object_type, &project.id.to_string())
             .await
             .with_context(|| {
                 format!(
@@ -3262,7 +3250,7 @@ async fn resolve_named_object_target(
             return Ok(ResolvedNamedObjectTarget {
                 object_id: object.id.clone(),
                 object_name: object.name.clone(),
-                project_id: project.id.clone(),
+                project_id: project.id.to_string(),
                 project_name: project.name.clone(),
             });
         }
@@ -3304,7 +3292,8 @@ async fn resolve_push_experiment_target(
         .await
         .with_context(|| format!("project '{project_selector}' not found"))?;
 
-    let objects = list_project_named_objects(client, ObjectType::Experiment, &project.id).await?;
+    let objects =
+        list_project_named_objects(client, ObjectType::Experiment, &project.id.to_string()).await?;
     if let Ok(object) = find_named_object_by_selector(
         &objects,
         experiment_selector,
@@ -3314,7 +3303,7 @@ async fn resolve_push_experiment_target(
         return Ok(ResolvedNamedObjectTarget {
             object_id: object.id.clone(),
             object_name: object.name.clone(),
-            project_id: project.id.clone(),
+            project_id: project.id.to_string(),
             project_name: project.name.clone(),
         });
     }
@@ -3327,7 +3316,7 @@ async fn resolve_push_experiment_target(
         );
     }
 
-    let created = create_experiment(client, &project.id, experiment_selector)
+    let created = create_experiment(client, &project.id.to_string(), experiment_selector)
         .await
         .with_context(|| {
             format!("experiment '{experiment_selector}' not found, and creating it failed")
@@ -3341,9 +3330,9 @@ async fn resolve_push_experiment_target(
     }
 
     Ok(ResolvedNamedObjectTarget {
-        object_id: created.id,
+        object_id: created.id.to_string(),
         object_name: created.name,
-        project_id: project.id,
+        project_id: project.id.to_string(),
         project_name: project.name,
     })
 }
@@ -3371,7 +3360,8 @@ async fn resolve_push_dataset_target(
         .await
         .with_context(|| format!("project '{project_selector}' not found"))?;
 
-    let objects = list_project_named_objects(client, ObjectType::Dataset, &project.id).await?;
+    let objects =
+        list_project_named_objects(client, ObjectType::Dataset, &project.id.to_string()).await?;
     if let Ok(object) = find_named_object_by_selector(
         &objects,
         dataset_selector,
@@ -3381,7 +3371,7 @@ async fn resolve_push_dataset_target(
         return Ok(ResolvedNamedObjectTarget {
             object_id: object.id.clone(),
             object_name: object.name.clone(),
-            project_id: project.id.clone(),
+            project_id: project.id.to_string(),
             project_name: project.name.clone(),
         });
     }
@@ -3394,7 +3384,7 @@ async fn resolve_push_dataset_target(
         );
     }
 
-    let created = create_dataset(client, &project.id, dataset_selector)
+    let created = create_dataset(client, &project.id.to_string(), dataset_selector)
         .await
         .with_context(|| {
             format!("dataset '{dataset_selector}' not found, and creating it failed")
@@ -3408,9 +3398,9 @@ async fn resolve_push_dataset_target(
     }
 
     Ok(ResolvedNamedObjectTarget {
-        object_id: created.id,
+        object_id: created.id.to_string(),
         object_name: created.name,
-        project_id: project.id,
+        project_id: project.id.to_string(),
         project_name: project.name,
     })
 }
@@ -3419,13 +3409,8 @@ async fn create_dataset(
     client: &ApiClient,
     project_id: &str,
     name: &str,
-) -> Result<CreatedDataset> {
-    let body = serde_json::json!({
-        "name": name,
-        "project_id": project_id,
-        "org_name": client.org_name(),
-    });
-    client.post("/v1/dataset", &body).await
+) -> Result<crate::datasets::api::Dataset> {
+    crate::datasets::api::create_dataset(client, project_id, name, None).await
 }
 
 async fn list_project_named_objects(
@@ -3433,14 +3418,28 @@ async fn list_project_named_objects(
     object_type: ObjectType,
     project_id: &str,
 ) -> Result<Vec<NamedObject>> {
-    let path = format!(
-        "/v1/{}?org_name={}&project_id={}",
-        encode(object_type.as_str()),
-        encode(client.org_name()),
-        encode(project_id)
-    );
-    let response: NamedObjectListResponse = client.get(&path).await?;
-    Ok(response.objects)
+    let objects = match object_type {
+        ObjectType::Dataset => crate::datasets::api::list_datasets(client, project_id)
+            .await?
+            .into_iter()
+            .map(|object| NamedObject {
+                id: object.id.to_string(),
+                name: object.name,
+            })
+            .collect(),
+        ObjectType::Experiment => {
+            crate::experiments::api::list_experiments_by_project_id(client, project_id)
+                .await?
+                .into_iter()
+                .map(|object| NamedObject {
+                    id: object.id.to_string(),
+                    name: object.name,
+                })
+                .collect()
+        }
+        ObjectType::ProjectLogs => anyhow::bail!("project logs do not have named child objects"),
+    };
+    Ok(objects)
 }
 
 async fn resolve_push_destination(
@@ -3471,7 +3470,9 @@ fn find_project_by_selector<'a>(projects: &'a [Project], selector: &str) -> Resu
         bail!("project selector cannot be empty");
     }
 
-    let mut id_matches = projects.iter().filter(|project| project.id == selector);
+    let mut id_matches = projects
+        .iter()
+        .filter(|project| project.id.to_string() == selector);
     if let Some(project) = id_matches.next() {
         return Ok(project);
     }
@@ -5122,40 +5123,42 @@ mod tests {
     #[test]
     fn find_project_by_selector_supports_id_and_name() -> Result<()> {
         let projects = vec![
-            Project {
-                id: "p1".to_string(),
-                name: "Alpha".to_string(),
-                org_id: "o1".to_string(),
-                description: None,
-            },
-            Project {
-                id: "p2".to_string(),
-                name: "Beta".to_string(),
-                org_id: "o1".to_string(),
-                description: None,
-            },
+            Project::new(
+                "638729dd-2774-5508-826c-288c6882afc4".parse().unwrap(),
+                "Alpha".to_string(),
+                "f44e2da1-57d6-5667-8640-7c2a5bd965e9".parse().unwrap(),
+            ),
+            Project::new(
+                "48785758-ab06-574d-ac64-78f6fc97396c".parse().unwrap(),
+                "Beta".to_string(),
+                "f44e2da1-57d6-5667-8640-7c2a5bd965e9".parse().unwrap(),
+            ),
         ];
 
-        assert_eq!(find_project_by_selector(&projects, "p1")?.name, "Alpha");
-        assert_eq!(find_project_by_selector(&projects, "Beta")?.id, "p2");
+        assert_eq!(
+            find_project_by_selector(&projects, "638729dd-2774-5508-826c-288c6882afc4")?.name,
+            "Alpha"
+        );
+        assert_eq!(
+            find_project_by_selector(&projects, "Beta")?.id.to_string(),
+            "48785758-ab06-574d-ac64-78f6fc97396c"
+        );
         Ok(())
     }
 
     #[test]
     fn find_project_by_selector_rejects_ambiguous_casefold_match() {
         let projects = vec![
-            Project {
-                id: "p1".to_string(),
-                name: "Alpha".to_string(),
-                org_id: "o1".to_string(),
-                description: None,
-            },
-            Project {
-                id: "p2".to_string(),
-                name: "ALPHA".to_string(),
-                org_id: "o1".to_string(),
-                description: None,
-            },
+            Project::new(
+                "638729dd-2774-5508-826c-288c6882afc4".parse().unwrap(),
+                "Alpha".to_string(),
+                "f44e2da1-57d6-5667-8640-7c2a5bd965e9".parse().unwrap(),
+            ),
+            Project::new(
+                "48785758-ab06-574d-ac64-78f6fc97396c".parse().unwrap(),
+                "ALPHA".to_string(),
+                "f44e2da1-57d6-5667-8640-7c2a5bd965e9".parse().unwrap(),
+            ),
         ];
 
         let err = find_project_by_selector(&projects, "alpha").unwrap_err();
