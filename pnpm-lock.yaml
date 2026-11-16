@@ -17,8 +17,8 @@ importers:
         specifier: 18.3.31
         version: 18.3.31
       braintrust:
-        specifier: 3.36.0
-        version: 3.36.0(zod@4.6.7)
+        specifier: 3.44.0
+        version: 3.44.0(@types/react@18.3.31)(zod@4.6.7)
       esbuild:
         specifier: 0.28.1
         version: 0.28.1
@@ -336,6 +336,12 @@ packages:
     cpu: [x64]
     os: [win32]
 
+  "@isaacs/nonrecursive-glob-match@1.1.0":
+    resolution:
+      {
+        integrity: sha512-GPm/Dbvk5RLmhRnxXIa7nTpK0xtl4E0wj0MslsuNiJ1FIROU+2+9lgUC/dgF7Ey4QCWhfEsgxilMRMCdHPfDfw==,
+      }
+
   "@jridgewell/gen-mapping@0.3.13":
     resolution:
       {
@@ -479,14 +485,18 @@ packages:
       }
     engines: { node: 20 || >=22 }
 
-  braintrust@3.36.0:
+  braintrust@3.44.0:
     resolution:
       {
-        integrity: sha512-E6lzjWrLyOyU/rOdiDqCS1Sw+sb+DlqcKtR8W2lreXaogPd442nz9gxUVUw8QaXR3SVoso57K9wNxx5ppionrA==,
+        integrity: sha512-QMjlci0l0EHTET+kBAkT8xtih16QAVR9Z0kHxS4AYwdRoVzGmA7r52dgiOzC8WfV8cYHIII3CaQH/Hvt7G0bxQ==,
       }
     hasBin: true
     peerDependencies:
+      "@types/react": ">=18"
       zod: ^3.25.34 || ^4.0
+    peerDependenciesMeta:
+      "@types/react":
+        optional: true
 
   bytes@3.1.2:
     resolution:
@@ -874,12 +884,12 @@ packages:
       }
     engines: { node: ">=18" }
 
-  minimatch@10.2.6:
+  minimatch@11.0.8:
     resolution:
       {
-        integrity: sha512-vpLQEs+VLCr1nU0BXS07maYoFwlDAH0gngQuuttxIwutDFEMHq2blX+8vpgxDdK3J1PwjCJiep77OitTZ4Ll1A==,
+        integrity: sha512-nFQuYSTVrGvysVBps5Ih+0BdnYFN/Cj3C816r6+p7yK+FHrVLGE4O4N9AFwykrlNlvM2HYt+Rad1Uiro6h88Ig==,
       }
-    engines: { node: 18 || 20 || >=22 }
+    engines: { node: 20 || >=22 }
 
   module-details-from-path@1.0.4:
     resolution:
@@ -1304,6 +1314,8 @@ snapshots:
   "@esbuild/win32-x64@0.28.1":
     optional: true
 
+  "@isaacs/nonrecursive-glob-match@1.1.0": {}
+
   "@jridgewell/gen-mapping@0.3.13":
     dependencies:
       "@jridgewell/sourcemap-codec": 1.6.0
@@ -1384,10 +1396,9 @@ snapshots:
     dependencies:
       balanced-match: 4.0.4
 
-  braintrust@3.36.0(zod@4.6.7):
+  braintrust@3.44.0(@types/react@18.3.31)(zod@4.6.7):
     dependencies:
       "@next/env": 14.2.35
-      "@types/react": 18.3.31
       "@vercel/functions": 1.6.0
       acorn: 8.18.0
       acorn-import-attributes: 1.9.5(acorn@8.18.0)
@@ -1405,7 +1416,7 @@ snapshots:
       express: 5.2.1
       http-errors: 2.0.1
       meriyah: 6.1.4
-      minimatch: 10.2.6
+      minimatch: 11.0.8
       module-details-from-path: 1.0.4
       mustache: 4.2.0
       pluralize: 8.0.0
@@ -1424,6 +1435,7 @@ snapshots:
       "@braintrust/bt-linux-x64-musl": 0.12.0
       "@braintrust/bt-win32-arm64": 0.12.0
       "@braintrust/bt-win32-x64": 0.12.0
+      "@types/react": 18.3.31
     transitivePeerDependencies:
       - "@aws-sdk/credential-provider-web-identity"
       - supports-color
@@ -1660,8 +1672,9 @@ snapshots:
     dependencies:
       mime-db: 1.54.0
 
-  minimatch@10.2.6:
+  minimatch@11.0.8:
     dependencies:
+      "@isaacs/nonrecursive-glob-match": 1.1.0
       brace-expansion: 5.0.12
 
   module-details-from-path@1.0.4: {}
