@@ -246,10 +246,11 @@ mod tests {
         .expect("tokens");
         assert_eq!(tokens.access_token, "test-access");
         assert_eq!(tokens.refresh_token.as_deref(), Some("test-refresh"));
-        let polls = state.polls.lock().expect("polls");
-        assert_eq!(polls.len(), 3);
-        assert!(polls[2].duration_since(polls[1]) >= Duration::from_secs(6));
-        drop(polls);
+        {
+            let polls = state.polls.lock().expect("polls");
+            assert_eq!(polls.len(), 3);
+            assert!(polls[2].duration_since(polls[1]) >= Duration::from_secs(6));
+        }
         handle.stop(false).await;
     }
 
@@ -304,8 +305,7 @@ mod tests {
         );
         let error = login(&origin, "test-client", &challenge, &verifier, true, true)
             .await
-            .err()
-            .expect("denied");
+            .expect_err("denied");
         assert!(error.to_string().contains("declined"));
         {
             let mut authorization = state.authorization.lock().expect("authorization");
@@ -314,8 +314,7 @@ mod tests {
         }
         let error = login(&origin, "test-client", &challenge, &verifier, true, true)
             .await
-            .err()
-            .expect("expired");
+            .expect_err("expired");
         assert!(error.to_string().contains("expired"));
         assert_eq!(state.polls.lock().expect("polls").len(), 1);
         handle.stop(false).await;
