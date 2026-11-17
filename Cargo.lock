@@ -581,59 +581,7 @@ dependencies = [
 [[package]]
 name = "braintrust-api-client"
 version = "0.1.0-alpha.2"
-source = "git+https://github.com/braintrustdata/braintrust-sdk-rust?rev=f3afd198a14daa571eae0f16c6dc807c26c078c8#f3afd198a14daa571eae0f16c6dc807c26c078c8"
-dependencies = [
- "anyhow",
- "backoff",
- "bytes",
- "chrono",
- "futures-timer",
- "futures-util",
- "http 1.5.0",
- "reqwest 0.13.5",
- "reqwest-middleware",
- "rustls-native-certs",
- "serde",
- "serde_json 1.0.151",
- "serde_path_to_error",
- "serde_urlencoded",
- "thiserror 2.0.21",
- "tracing",
- "url",
- "urlencoding",
- "uuid",
-]
-
-[[package]]
-name = "braintrust-api-client"
-version = "0.1.0-alpha.2"
-source = "git+https://github.com/braintrustdata/braintrust-sdk-rust?rev=bbce73e8207136453583dbdbb476365e295971ab#bbce73e8207136453583dbdbb476365e295971ab"
-dependencies = [
- "anyhow",
- "backoff",
- "bytes",
- "chrono",
- "futures-timer",
- "futures-util",
- "http 1.5.0",
- "reqwest 0.13.5",
- "reqwest-middleware",
- "rustls-native-certs",
- "serde",
- "serde_json 1.0.151",
- "serde_path_to_error",
- "serde_urlencoded",
- "thiserror 2.0.21",
- "tracing",
- "url",
- "urlencoding",
- "uuid",
-]
-
-[[package]]
-name = "braintrust-api-client"
-version = "0.1.0-alpha.2"
-source = "git+https://github.com/braintrustdata/braintrust-sdk-rust?rev=cb231d5785987a3143361cc846227f3ac758ba74#cb231d5785987a3143361cc846227f3ac758ba74"
+source = "git+https://github.com/braintrustdata/braintrust-sdk-rust?rev=38d17f1f71644fe02dbbfccd03c56d8972390824#38d17f1f71644fe02dbbfccd03c56d8972390824"
 dependencies = [
  "anyhow",
  "backoff",
@@ -659,7 +607,7 @@ dependencies = [
 [[package]]
 name = "braintrust-sdk-rust"
 version = "0.1.0-alpha.2"
-source = "git+https://github.com/braintrustdata/braintrust-sdk-rust?rev=f3afd198a14daa571eae0f16c6dc807c26c078c8#f3afd198a14daa571eae0f16c6dc807c26c078c8"
+source = "git+https://github.com/braintrustdata/braintrust-sdk-rust?rev=38d17f1f71644fe02dbbfccd03c56d8972390824#38d17f1f71644fe02dbbfccd03c56d8972390824"
 dependencies = [
  "anyhow",
  "arc-swap",
@@ -667,7 +615,7 @@ dependencies = [
  "backon",
  "base64 0.23.1",
  "bon",
- "braintrust-api-client 0.1.0-alpha.2 (git+https://github.com/braintrustdata/braintrust-sdk-rust?rev=f3afd198a14daa571eae0f16c6dc807c26c078c8)",
+ "braintrust-api-client",
  "bytes",
  "chrono",
  "crossbeam-utils",
@@ -737,7 +685,7 @@ dependencies = [
  "assert_cmd",
  "async-trait",
  "base64 0.22.1",
- "braintrust-api-client 0.1.0-alpha.2 (git+https://github.com/braintrustdata/braintrust-sdk-rust?rev=bbce73e8207136453583dbdbb476365e295971ab)",
+ "braintrust-api-client",
  "braintrust-sdk-rust",
  "bt-daemon",
  "chrono",
@@ -794,12 +742,12 @@ dependencies = [
 [[package]]
 name = "bt-daemon"
 version = "0.1.0"
-source = "git+https://github.com/braintrustdata/braintrust-coding-agent-plugins?rev=dbf9cce2cf61fbaa752b4162e8550ba501bebf4d#dbf9cce2cf61fbaa752b4162e8550ba501bebf4d"
+source = "git+https://github.com/braintrustdata/braintrust-coding-agent-plugins?rev=03af21b5f80e48b1b49d1029215e01ce4ad25236#03af21b5f80e48b1b49d1029215e01ce4ad25236"
 dependencies = [
  "anyhow",
  "async-trait",
  "base64 0.22.1",
- "braintrust-api-client 0.1.0-alpha.2 (git+https://github.com/braintrustdata/braintrust-sdk-rust?rev=cb231d5785987a3143361cc846227f3ac758ba74)",
+ "braintrust-api-client",
  "braintrust-sdk-rust",
  "chrono",
  "clap",
@@ -1472,7 +1420,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "39cab71617ae0d63f51a36d69f866391735b51691dbda63cf6f96d042b63efeb"
 dependencies = [
  "libc",
- "windows-sys 0.61.2",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]
@@ -2019,7 +1967,7 @@ dependencies = [
  "libc",
  "percent-encoding",
  "pin-project-lite",
- "socket2 0.6.5",
+ "socket2 0.5.10",
  "tokio",
  "tower-service",
  "tracing",
@@ -2719,7 +2667,7 @@ version = "0.50.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7957b9740744892f114936ab4a57b3f487491bbeafaf8083688b16841a4240e5"
 dependencies = [
- "windows-sys 0.61.2",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]
@@ -3264,7 +3212,7 @@ dependencies = [
  "quinn-udp",
  "rustc-hash",
  "rustls",
- "socket2 0.6.5",
+ "socket2 0.5.10",
  "thiserror 2.0.21",
  "tokio",
  "tracing",
@@ -3303,9 +3251,9 @@ dependencies = [
  "cfg_aliases 0.2.2",
  "libc",
  "once_cell",
- "socket2 0.6.5",
+ "socket2 0.5.10",
  "tracing",
- "windows-sys 0.61.2",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]
@@ -3805,7 +3753,7 @@ dependencies = [
  "errno",
  "libc",
  "linux-raw-sys 0.12.1",
- "windows-sys 0.61.2",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]
@@ -3864,7 +3812,7 @@ dependencies = [
  "security-framework",
  "security-framework-sys",
  "webpki-root-certs",
- "windows-sys 0.61.2",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]
@@ -4866,10 +4814,10 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "32497e9a4c7b38532efcdebeef879707aa9f794296a4f0244f6f69e9bc8574bd"
 dependencies = [
  "fastrand",
- "getrandom 0.4.3",
+ "getrandom 0.3.4",
  "once_cell",
  "rustix 1.1.4",
- "windows-sys 0.61.2",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]
@@ -5736,7 +5684,7 @@ version = "0.1.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c2a7b1c03c876122aa43f3020e6c3c3ee5c05081c9a00739faf7503aeba10d22"
 dependencies = [
- "windows-sys 0.61.2",
+ "windows-sys 0.48.0",
 ]
 
 [[package]]
