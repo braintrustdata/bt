@@ -37,7 +37,7 @@ dependencies = [
  "derive_more",
  "encoding_rs",
  "flate2",
- "foldhash 0.2.0",
+ "foldhash",
  "futures-core",
  "h2",
  "http 0.2.12",
@@ -151,7 +151,7 @@ dependencies = [
  "cookie",
  "derive_more",
  "encoding_rs",
- "foldhash 0.2.0",
+ "foldhash",
  "futures-core",
  "futures-util",
  "impl-more",
@@ -598,6 +598,32 @@ dependencies = [
 ]
 
 [[package]]
+name = "braintrust-api-client"
+version = "0.1.0-alpha.2"
+source = "git+https://github.com/braintrustdata/braintrust-sdk-rust?rev=cb231d5785987a3143361cc846227f3ac758ba74#cb231d5785987a3143361cc846227f3ac758ba74"
+dependencies = [
+ "anyhow",
+ "backoff",
+ "bytes",
+ "chrono",
+ "futures-timer",
+ "futures-util",
+ "http 1.5.0",
+ "reqwest 0.13.5",
+ "reqwest-middleware",
+ "rustls-native-certs",
+ "serde",
+ "serde_json 1.0.151",
+ "serde_path_to_error",
+ "serde_urlencoded",
+ "thiserror 2.0.19",
+ "tracing",
+ "url",
+ "urlencoding",
+ "uuid",
+]
+
+[[package]]
 name = "braintrust-sdk-rust"
 version = "0.1.0-alpha.2"
 source = "git+https://github.com/braintrustdata/braintrust-sdk-rust?rev=27f6721e56611d776e12e4cfc81dd1ad5ecd7af4#27f6721e56611d776e12e4cfc81dd1ad5ecd7af4"
@@ -636,7 +662,7 @@ dependencies = [
  "backoff",
  "base64 0.23.1",
  "bon",
- "braintrust-api-client",
+ "braintrust-api-client 0.1.0-alpha.2 (git+https://github.com/braintrustdata/braintrust-sdk-rust?rev=bbce73e8207136453583dbdbb476365e295971ab)",
  "bytes",
  "chrono",
  "crossbeam",
@@ -705,7 +731,7 @@ dependencies = [
  "assert_cmd",
  "async-trait",
  "base64 0.22.1",
- "braintrust-api-client",
+ "braintrust-api-client 0.1.0-alpha.2 (git+https://github.com/braintrustdata/braintrust-sdk-rust?rev=bbce73e8207136453583dbdbb476365e295971ab)",
  "braintrust-sdk-rust 0.1.0-alpha.2 (git+https://github.com/braintrustdata/braintrust-sdk-rust?rev=bbce73e8207136453583dbdbb476365e295971ab)",
  "bt-daemon",
  "chrono",
@@ -762,15 +788,20 @@ dependencies = [
 [[package]]
 name = "bt-daemon"
 version = "0.1.0"
-source = "git+https://github.com/braintrustdata/braintrust-coding-agent-plugins?rev=f7a7ddef57514c51df52e253aeada310dcc3316e#f7a7ddef57514c51df52e253aeada310dcc3316e"
+source = "git+https://github.com/braintrustdata/braintrust-coding-agent-plugins?rev=ff09caa4725747702d3335c5485b81e283b8849f#ff09caa4725747702d3335c5485b81e283b8849f"
 dependencies = [
  "anyhow",
  "async-trait",
  "base64 0.22.1",
+ "braintrust-api-client 0.1.0-alpha.2 (git+https://github.com/braintrustdata/braintrust-sdk-rust?rev=cb231d5785987a3143361cc846227f3ac758ba74)",
  "braintrust-sdk-rust 0.1.0-alpha.2 (git+https://github.com/braintrustdata/braintrust-sdk-rust?rev=27f6721e56611d776e12e4cfc81dd1ad5ecd7af4)",
  "chrono",
  "clap",
+ "file-rotate",
  "fs2",
+ "futures",
+ "humantime",
+ "mime_guess",
  "muse-code-sdk",
  "parking_lot",
  "regex",
@@ -780,6 +811,7 @@ dependencies = [
  "semver",
  "serde",
  "serde_json 1.0.151",
+ "serde_rusqlite",
  "sha2",
  "sysinfo",
  "tempfile",
@@ -787,7 +819,9 @@ dependencies = [
  "tokio",
  "tracing",
  "tracing-subscriber",
+ "url",
  "uuid",
+ "weak-table",
  "windows-sys 0.61.2",
  "zstd",
 ]
@@ -1523,6 +1557,16 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "da7c62ceae207dd37ea5b845da6a0696c799f85e97da1ab5b7910be3c1c80223"
 
 [[package]]
+name = "file-rotate"
+version = "0.8.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "6e8e2fa049328a1f3295991407a88585805d126dfaadf74b9fe8c194c730aafc"
+dependencies = [
+ "chrono",
+ "flate2",
+]
+
+[[package]]
 name = "filedescriptor"
 version = "0.8.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1581,12 +1625,6 @@ name = "fnv"
 version = "1.0.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "3f9eec918d3f24069decb9af1554cad7c880e2da24a9afd88aca000531ab82c1"
-
-[[package]]
-name = "foldhash"
-version = "0.1.5"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d9c4f5dac5e15c24eb999c26181a6ca40b39fe946cbe4c263c7209467bc83af2"
 
 [[package]]
 name = "foldhash"
@@ -1840,22 +1878,13 @@ dependencies = [
 
 [[package]]
 name = "hashbrown"
-version = "0.15.5"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "9229cfe53dfd69f0609a49f65461bd93001ea1ef889cd5529dd176593f5338a1"
-dependencies = [
- "foldhash 0.1.5",
-]
-
-[[package]]
-name = "hashbrown"
 version = "0.16.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "841d1cc9bed7f9236f321df977030373f4a4163ae1a7dbfe1a51a2c1a51d9100"
 dependencies = [
  "allocator-api2",
  "equivalent",
- "foldhash 0.2.0",
+ "foldhash",
 ]
 
 [[package]]
@@ -1866,16 +1895,16 @@ checksum = "ed5909b6e89a2db4456e54cd5f673791d7eca6732202bbf2a9cc504fe2f9b84a"
 dependencies = [
  "allocator-api2",
  "equivalent",
- "foldhash 0.2.0",
+ "foldhash",
 ]
 
 [[package]]
 name = "hashlink"
-version = "0.10.0"
+version = "0.12.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "7382cf6263419f2d8df38c55d7da83da5c18aef87fc7a7fc1fb1e344edfe14c1"
+checksum = "a596f1b20ed2cc5ecac41a164aaebc7258057060f06c0cf7a2ba3991ee7990fb"
 dependencies = [
- "hashbrown 0.15.5",
+ "hashbrown 0.17.1",
 ]
 
 [[package]]
@@ -1965,6 +1994,12 @@ name = "httpdate"
 version = "1.0.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "df3b46402a9d5adb4c86a0cf463f42e19994e3ee891101b1841f30a545cb49a9"
+
+[[package]]
+name = "humantime"
+version = "2.4.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "15cdd26707701c53297e2fa6afb323d55fbc1d0810c3aec078ae3ef0424c3c15"
 
 [[package]]
 name = "hybrid-array"
@@ -2429,9 +2464,9 @@ dependencies = [
 
 [[package]]
 name = "libsqlite3-sys"
-version = "0.35.0"
+version = "0.39.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "133c182a6a2c87864fe97778797e46c7e999672690dc9fa3ee8e241aa4a9c13f"
+checksum = "14a5f01b87b92705d07b433c06f96cbc764637d81a0bffb5734ce17cf0f9a2b3"
 dependencies = [
  "cc",
  "pkg-config",
@@ -3753,10 +3788,20 @@ dependencies = [
 ]
 
 [[package]]
-name = "rusqlite"
-version = "0.37.0"
+name = "rsqlite-vfs"
+version = "0.1.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "165ca6e57b20e1351573e3729b958bc62f0e48025386970b6e4d29e7a7e71f3f"
+checksum = "c51c9ae4df8a7fba42103df5c621fa3c37eccf3a3c650879e90fc48b11cc192c"
+dependencies = [
+ "hashbrown 0.16.1",
+ "thiserror 2.0.19",
+]
+
+[[package]]
+name = "rusqlite"
+version = "0.41.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "da9bba6f3506135e120a6586df05be18b48d18896600646a4bec8f993d91a594"
 dependencies = [
  "bitflags 2.13.1",
  "fallible-iterator",
@@ -3764,6 +3809,7 @@ dependencies = [
  "hashlink",
  "libsqlite3-sys",
  "smallvec",
+ "sqlite-wasm-rs",
 ]
 
 [[package]]
@@ -4080,6 +4126,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "serde_rusqlite"
+version = "0.44.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "554f7555174fb6e1b86062e62fa7c086e88513d4067bc106ffba2db7b24fcca2"
+dependencies = [
+ "rusqlite",
+ "serde_core",
+]
+
+[[package]]
 name = "serde_spanned"
 version = "0.6.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4311,6 +4367,18 @@ checksum = "c3d1e2c7f27f8d4cb10542a02c49005dbd6e93095799d6f3be745fae9f8fedd4"
 dependencies = [
  "libc",
  "windows-sys 0.61.2",
+]
+
+[[package]]
+name = "sqlite-wasm-rs"
+version = "0.5.5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "dc3efc0da82635d7e1ced0053bbbfa8c7ab9645d0bf36ceb4f7127bb85315d75"
+dependencies = [
+ "cc",
+ "js-sys",
+ "rsqlite-vfs",
+ "wasm-bindgen",
 ]
 
 [[package]]
@@ -5230,6 +5298,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "tracing-serde"
+version = "0.2.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "704b1aeb7be0d0a84fc9828cae51dab5970fee5088f83d1dd7ee6f6246fc6ff1"
+dependencies = [
+ "serde",
+ "tracing-core",
+]
+
+[[package]]
 name = "tracing-subscriber"
 version = "0.3.23"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -5239,12 +5317,15 @@ dependencies = [
  "nu-ansi-term",
  "once_cell",
  "regex-automata",
+ "serde",
+ "serde_json 1.0.151",
  "sharded-slab",
  "smallvec",
  "thread_local",
  "tracing",
  "tracing-core",
  "tracing-log",
+ "tracing-serde",
 ]
 
 [[package]]
@@ -5552,6 +5633,16 @@ dependencies = [
  "wasm-bindgen",
  "wasm-bindgen-futures",
  "web-sys",
+]
+
+[[package]]
+name = "weak-table"
+version = "0.4.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "5eba2ec791141b0bf4db542f6b038a8f9310cee33e076cb181245780b09a24ff"
+dependencies = [
+ "cfg-if",
+ "hashbrown 0.16.1",
 ]
 
 [[package]]
