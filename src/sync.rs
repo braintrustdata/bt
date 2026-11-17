@@ -9,7 +9,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::{anyhow, bail, Context, Result};
 use base64::prelude::{Engine as _, BASE64_STANDARD};
-use braintrust_sdk_rust::Logs3BatchUploader;
+use braintrust_sdk_rust::{api::Client, ingest::BatchUploader};
 use clap::{Args, Subcommand, ValueEnum};
 use futures_util::TryStreamExt;
 use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
@@ -1780,12 +1780,17 @@ async fn run_push(
         }
     });
 
-    let uploader_template = Logs3BatchUploader::new(
-        client.base_url(),
-        client.api_key().to_owned(),
-        (!client.org_name().trim().is_empty()).then(|| client.org_name().to_owned()),
-    )
-    .context("failed to initialize logs3 uploader")?;
+    let mut uploader_builder = Client::builder()
+        .api_url(client.base_url())
+        .api_key(client.api_key())
+        .http_client(crate::http::build_http_client(
+            crate::http::DEFAULT_HTTP_TIMEOUT,
+        )?);
+    if !client.org_name().trim().is_empty() {
+        uploader_builder = uploader_builder.org_name(client.org_name());
+    }
+    let uploader_template = BatchUploader::new(uploader_builder.build()?)
+        .context("failed to initialize logs3 uploader")?;
 
     let mut batch: Vec<Map<String, Value>> = Vec::with_capacity(args.page_size);
     let mut seen_roots: HashSet<String> = if state.line_offset > 0 {
@@ -2698,28 +2703,29 @@ fn build_time_filter_clause(window: &str, extra_filter: Option<&str>) -> Result<
 }
 
 async fn submit_logs_batch(
-    uploader: &mut Logs3BatchUploader,
-    rows: &[Map<String, Value>],
+    uploader: &BatchUploader,
+    rows: Vec<Map<String, Value>>,
     page_size: usize,
 ) -> Result<usize> {
     let result = uploader
         .upload_rows(rows, page_size)
         .await
         .map_err(|err| anyhow!("logs3 upload failed: {err}"))?;
-    Ok(result.bytes_processed)
+    Ok(result.bytes_processed())
 }
 
 fn spawn_push_upload_task(
     join_set: &mut tokio::task::JoinSet<Result<PushBatchResult>>,
-    mut uploader: Logs3BatchUploader,
+    uploader: BatchUploader,
     work: PushBatchWork,
     page_size: usize,
 ) {
     join_set.spawn(async move {
-        let bytes = submit_logs_batch(&mut uploader, &work.rows, page_size).await?;
+        let row_count = work.rows.len();
+        let bytes = submit_logs_batch(&uploader, work.rows, page_size).await?;
         Ok(PushBatchResult {
             batch_index: work.batch_index,
-            row_count: work.rows.len(),
+            row_count,
             input_bytes: work.input_bytes,
             bytes_sent: bytes as u64,
             end_line_offset: work.end_line_offset,

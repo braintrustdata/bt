@@ -1,7 +1,7 @@
 use std::time::Duration;
 
 use anyhow::{anyhow, Result};
-use braintrust_sdk_rust::Logs3BatchUploader;
+use braintrust_sdk_rust::{api::Client, ingest::BatchUploader};
 use serde_json::{Map, Value};
 
 use crate::ui::with_spinner_visible;
@@ -23,16 +23,16 @@ pub(crate) async fn submit_prepared_records(
         .iter()
         .map(|record| record.to_upload_row(dataset_id, is_merge))
         .collect::<Vec<_>>();
-    submit_rows(ctx, &rows, spinner_label, error_context).await
+    submit_rows(ctx, rows, spinner_label, error_context).await
 }
 
 pub(crate) async fn submit_rows(
     ctx: &ResolvedContext,
-    rows: &[Map<String, Value>],
+    rows: Vec<Map<String, Value>>,
     spinner_label: &str,
     error_context: &str,
 ) -> Result<()> {
-    let mut uploader = dataset_uploader(ctx)?;
+    let uploader = dataset_uploader(ctx)?;
     with_spinner_visible(
         spinner_label,
         async {
@@ -47,11 +47,16 @@ pub(crate) async fn submit_rows(
     Ok(())
 }
 
-fn dataset_uploader(ctx: &ResolvedContext) -> Result<Logs3BatchUploader> {
-    Logs3BatchUploader::new(
-        ctx.client.base_url(),
-        ctx.client.api_key().to_string(),
-        (!ctx.client.org_name().trim().is_empty()).then_some(ctx.client.org_name().to_string()),
-    )
-    .map_err(|err| anyhow!("failed to initialize dataset uploader: {err}"))
+fn dataset_uploader(ctx: &ResolvedContext) -> Result<BatchUploader> {
+    let mut builder = Client::builder()
+        .api_url(ctx.client.base_url())
+        .api_key(ctx.client.api_key())
+        .http_client(crate::http::build_http_client(
+            crate::http::DEFAULT_HTTP_TIMEOUT,
+        )?);
+    if !ctx.client.org_name().trim().is_empty() {
+        builder = builder.org_name(ctx.client.org_name());
+    }
+    BatchUploader::new(builder.build()?)
+        .map_err(|err| anyhow!("failed to initialize dataset uploader: {err}"))
 }
