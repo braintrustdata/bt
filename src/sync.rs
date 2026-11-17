@@ -1782,10 +1782,7 @@ async fn run_push(
 
     let mut uploader_builder = Client::builder()
         .api_url(client.base_url())
-        .api_key(client.api_key())
-        .http_client(crate::http::build_http_client(
-            crate::http::DEFAULT_HTTP_TIMEOUT,
-        )?);
+        .api_key(client.api_key());
     if !client.org_name().trim().is_empty() {
         uploader_builder = uploader_builder.org_name(client.org_name());
     }

@@ -50,10 +50,7 @@ pub(crate) async fn submit_rows(
 fn dataset_uploader(ctx: &ResolvedContext) -> Result<BatchUploader> {
     let mut builder = Client::builder()
         .api_url(ctx.client.base_url())
-        .api_key(ctx.client.api_key())
-        .http_client(crate::http::build_http_client(
-            crate::http::DEFAULT_HTTP_TIMEOUT,
-        )?);
+        .api_key(ctx.client.api_key());
     if !ctx.client.org_name().trim().is_empty() {
         builder = builder.org_name(ctx.client.org_name());
     }
