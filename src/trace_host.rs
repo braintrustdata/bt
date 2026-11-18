@@ -309,6 +309,12 @@ async fn resolve_trace_project(mut base: BaseArgs) -> anyhow::Result<BaseArgs> {
 
 #[async_trait]
 impl TraceHostServices for BtTraceHost {
+    fn has_explicit_route_selection(&self) -> bool {
+        self.base.profile_explicit
+            || self.base.trace_org_explicit
+            || self.base.trace_project_explicit
+    }
+
     async fn resolve_route(
         &self,
         requirements: RouteRequirements,
@@ -579,6 +585,28 @@ mod tests {
     use crate::args::LoginBaseArgs;
     use std::{env, ffi::OsString, fs};
     use tempfile::TempDir;
+
+    #[test]
+    fn explicit_trace_route_requires_command_line_selection() {
+        let mut base = BaseArgs {
+            login: LoginBaseArgs {
+                profile: Some("environment-profile".into()),
+                ..Default::default()
+            },
+            project: Some("environment-default".into()),
+            org_name: Some("environment-org".into()),
+            ..Default::default()
+        };
+        assert!(!BtTraceHost::new(base.clone()).has_explicit_route_selection());
+        base.profile_explicit = true;
+        assert!(BtTraceHost::new(base.clone()).has_explicit_route_selection());
+        base.profile_explicit = false;
+        base.trace_org_explicit = true;
+        assert!(BtTraceHost::new(base.clone()).has_explicit_route_selection());
+        base.trace_org_explicit = false;
+        base.trace_project_explicit = true;
+        assert!(BtTraceHost::new(base).has_explicit_route_selection());
+    }
 
     struct TestOAuthProfile {
         name: &'static str,

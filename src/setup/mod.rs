@@ -5289,6 +5289,7 @@ mod tests {
             },
             org_name: Some("test org".to_string()),
             project: Some("test project".to_string()),
+            ..Default::default()
         };
 
         assert_eq!(
