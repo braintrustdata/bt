@@ -315,6 +315,30 @@ impl TraceHostServices for BtTraceHost {
             || self.base.trace_project_explicit
     }
 
+    fn explicit_route_selection(&self) -> HostRouteSelection {
+        HostRouteSelection {
+            auth: AuthSelection {
+                source: AuthSource::Auto,
+                profile_id: None,
+                profile: self
+                    .base
+                    .profile_explicit
+                    .then(|| self.base.profile.clone())
+                    .flatten(),
+                org_name: self
+                    .base
+                    .trace_org_explicit
+                    .then(|| self.base.org_name.clone())
+                    .flatten(),
+            },
+            project_name: self
+                .base
+                .trace_project_explicit
+                .then(|| self.base.project.clone())
+                .flatten(),
+        }
+    }
+
     async fn resolve_route(
         &self,
         requirements: RouteRequirements,
@@ -597,9 +621,19 @@ mod tests {
             org_name: Some("environment-org".into()),
             ..Default::default()
         };
-        assert!(!BtTraceHost::new(base.clone()).has_explicit_route_selection());
+        let implicit = BtTraceHost::new(base.clone());
+        assert!(!implicit.has_explicit_route_selection());
+        let selection = implicit.explicit_route_selection();
+        assert!(selection.auth.profile.is_none());
+        assert!(selection.auth.org_name.is_none());
+        assert!(selection.project_name.is_none());
         base.profile_explicit = true;
-        assert!(BtTraceHost::new(base.clone()).has_explicit_route_selection());
+        let explicit = BtTraceHost::new(base.clone());
+        assert!(explicit.has_explicit_route_selection());
+        assert_eq!(
+            explicit.explicit_route_selection().auth.profile.as_deref(),
+            Some("environment-profile")
+        );
         base.profile_explicit = false;
         base.trace_org_explicit = true;
         assert!(BtTraceHost::new(base.clone()).has_explicit_route_selection());
