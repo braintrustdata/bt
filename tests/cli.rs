@@ -1754,7 +1754,8 @@ fn trace_setup_honors_global_json() {
         .clone();
     let output: serde_json::Value =
         serde_json::from_slice(&stdout).expect("trace setup emits JSON");
-    assert_eq!(output["command"], "enable");
+    assert_eq!(output["command"], "setup");
+    assert_eq!(output["scope"], "user");
     assert_eq!(output["source"], "opencode");
     assert_eq!(output["display_name"], "OpenCode");
     assert_eq!(output["restart_required"], true);
