@@ -11,7 +11,8 @@ mod structured_source;
 mod text_source;
 
 pub(crate) use app_url::{
-    app_project_url, app_project_url_with_encoded_path, app_url_with_selected_version,
+    api_url_for_log, app_project_url, app_project_url_with_encoded_path,
+    app_url_with_selected_version,
 };
 pub use duration::parse_duration_to_seconds;
 #[cfg(not(windows))]
