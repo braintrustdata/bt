@@ -59,9 +59,28 @@ pub(crate) fn app_url_with_selected_version(
     url
 }
 
+pub(crate) fn api_url_for_log(url: &str) -> String {
+    reqwest::Url::parse(url)
+        .ok()
+        .and_then(|parsed| {
+            let origin = parsed.origin();
+            origin.is_tuple().then(|| origin.ascii_serialization())
+        })
+        .unwrap_or_else(|| "<invalid URL>".to_string())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn api_url_logging_strips_paths_queries_and_credentials() {
+        assert_eq!(
+            api_url_for_log("https://user:secret@api.example.test:8443/private?token=secret"),
+            "https://api.example.test:8443"
+        );
+        assert_eq!(api_url_for_log("not a URL"), "<invalid URL>");
+    }
 
     #[test]
     fn app_project_urls_encode_owned_segments_and_preserve_encoded_paths() {

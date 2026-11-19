@@ -36,6 +36,7 @@ use crate::ui::{
     summary_metric_unit, SummaryExperimentColumn, SummaryMetricCell, SummaryMetricKind,
     SummaryMetricRow, SummaryTableOptions,
 };
+use crate::utils::api_url_for_log;
 
 const MAX_NAME_LENGTH: usize = 40;
 const WATCH_POLL_INTERVAL: Duration = Duration::from_millis(500);
@@ -1393,16 +1394,6 @@ fn effective_dev_api_url<'a>(
     auth: &'a DevAuthContext,
 ) -> Option<(&'a str, &'static str)> {
     select_effective_dev_api_url(state.base.api_url.as_deref(), auth.api_url.as_deref())
-}
-
-fn api_url_for_log(url: &str) -> String {
-    reqwest::Url::parse(url)
-        .ok()
-        .and_then(|parsed| {
-            let origin = parsed.origin();
-            origin.is_tuple().then(|| origin.ascii_serialization())
-        })
-        .unwrap_or_else(|| "<invalid URL>".to_string())
 }
 
 fn log_dev_api_url(request_id: &str, state: &DevServerState, auth: &DevAuthContext) {
@@ -4025,15 +4016,6 @@ mod tests {
         assert!(excerpt.starts_with("…[stderr truncated]"));
         assert!(excerpt.ends_with("final traceback"));
         assert!(excerpt.len() <= DEV_RUNNER_STDERR_EXCERPT_MAX_BYTES + 32);
-    }
-
-    #[test]
-    fn dev_api_url_logging_strips_paths_queries_and_credentials() {
-        assert_eq!(
-            api_url_for_log("https://user:secret@api.example.test:8443/private?token=secret"),
-            "https://api.example.test:8443"
-        );
-        assert_eq!(api_url_for_log("not a URL"), "<invalid URL>");
     }
 
     #[test]

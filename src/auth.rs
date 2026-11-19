@@ -33,6 +33,7 @@ use tokio::sync::oneshot;
 use crate::{
     args::{BaseArgs, DEFAULT_API_URL, DEFAULT_APP_URL},
     ui,
+    utils::api_url_for_log,
 };
 
 #[cfg(any(windows, test))]
@@ -290,11 +291,7 @@ impl OrgOptions {
             .app_url
             .clone()
             .unwrap_or_else(|| DEFAULT_APP_URL.to_string());
-        let api_url = org
-            .api_url
-            .clone()
-            .or_else(|| self.auth.api_url.clone())
-            .unwrap_or_else(|| DEFAULT_API_URL.to_string());
+        let api_url = resolve_login_api_url(self.auth.api_url.as_deref(), org.api_url.clone());
 
         let login = LoginState::new();
         login.set(
@@ -652,10 +649,7 @@ pub async fn login(base: &BaseArgs) -> Result<LoginContext> {
     }
     let login = builder.build().await?.wait_for_login().await?;
 
-    let api_url = login
-        .api_url()
-        .or(auth.api_url.clone())
-        .unwrap_or_else(|| DEFAULT_API_URL.to_string());
+    let api_url = resolve_login_api_url(auth.api_url.as_deref(), login.api_url());
 
     let app_url = auth
         .app_url
@@ -670,6 +664,39 @@ pub async fn login(base: &BaseArgs) -> Result<LoginContext> {
     };
     maybe_warn_ai_provider_key_staleness(base, &ctx).await;
     Ok(ctx)
+}
+
+/// An explicit `--api-url` / `BRAINTRUST_API_URL` wins over the organization's
+/// registered API URL, matching the Python and TypeScript SDKs. This lets clients
+/// that can only reach the data plane through an internal address use it.
+fn resolve_login_api_url(explicit: Option<&str>, from_login: Option<String>) -> String {
+    let explicit = explicit.map(str::trim).filter(|url| !url.is_empty());
+    match (explicit, from_login) {
+        (Some(explicit), Some(from_login)) => {
+            if let Some(warning) = api_url_override_warning(explicit, &from_login) {
+                eprintln!("{warning}");
+            }
+            explicit.to_string()
+        }
+        (Some(explicit), None) => explicit.to_string(),
+        (None, Some(from_login)) => from_login,
+        (None, None) => DEFAULT_API_URL.to_string(),
+    }
+}
+
+fn api_url_override_warning(explicit: &str, from_login: &str) -> Option<String> {
+    (!same_url(explicit, from_login)).then(|| {
+        format!(
+            "warning: using API URL {} from --api-url/BRAINTRUST_API_URL instead of the organization's API URL {}",
+            api_url_for_log(explicit),
+            api_url_for_log(from_login),
+        )
+    })
+}
+
+fn same_url(a: &str, b: &str) -> bool {
+    a.trim_end_matches('/')
+        .eq_ignore_ascii_case(b.trim_end_matches('/'))
 }
 
 use braintrust_api_client::backend::extensions::AiProviderSecret;
@@ -3886,6 +3913,75 @@ mod tests {
     }
 
     #[test]
+    fn explicit_api_url_overrides_login_api_url() {
+        assert_eq!(
+            resolve_login_api_url(
+                Some("https://internal.example.test"),
+                Some("https://public.example.test".to_string()),
+            ),
+            "https://internal.example.test"
+        );
+    }
+
+    #[test]
+    fn login_api_url_used_without_explicit_api_url() {
+        assert_eq!(
+            resolve_login_api_url(None, Some("https://public.example.test".to_string())),
+            "https://public.example.test"
+        );
+        assert_eq!(
+            resolve_login_api_url(Some("  "), Some("https://public.example.test".to_string())),
+            "https://public.example.test"
+        );
+    }
+
+    #[test]
+    fn api_url_falls_back_to_default() {
+        assert_eq!(resolve_login_api_url(None, None), DEFAULT_API_URL);
+        assert_eq!(
+            resolve_login_api_url(Some("https://internal.example.test"), None),
+            "https://internal.example.test"
+        );
+    }
+
+    #[test]
+    fn api_url_override_warning_redacts_credentials() {
+        let warning = api_url_override_warning(
+            "https://user:secret@internal.example.test/path?token=secret",
+            "https://public.example.test",
+        )
+        .expect("differing URLs should warn");
+        assert!(warning.contains("https://internal.example.test"));
+        assert!(warning.contains("https://public.example.test"));
+        assert!(
+            !warning.contains("secret"),
+            "warning leaked credentials: {warning}"
+        );
+        assert!(
+            !warning.contains("user"),
+            "warning leaked credentials: {warning}"
+        );
+
+        assert!(api_url_override_warning(
+            "https://public.example.test/",
+            "https://public.example.test"
+        )
+        .is_none());
+    }
+
+    #[test]
+    fn same_url_ignores_trailing_slash_and_case() {
+        assert!(same_url(
+            "https://API.example.test/",
+            "https://api.example.test"
+        ));
+        assert!(!same_url(
+            "https://internal.example.test",
+            "https://public.example.test"
+        ));
+    }
+
+    #[test]
     fn environment_api_keys_require_explicit_persistence_consent() {
         let mut base = make_base();
         base.api_key_source = Some(crate::args::ArgValueSource::EnvVariable);
@@ -5633,23 +5729,23 @@ mod tests {
     /// Must fill the same fields the SDK's `perform_login` does.
     #[tokio::test]
     async fn login_context_matches_a_real_login() {
-        // Given: a normal, non-tracing command has resolved a saved profile and
-        // the selected organization returned its own API URL during login.
+        // Given: a normal, non-tracing command selected an organization that
+        // returned its own API URL during login, with no explicit API URL set.
         // `json` suppresses the interactive warnings the call would otherwise emit.
         let base: BaseArgs = crate::args::LoginBaseArgs {
             json: true,
             ..Default::default()
         }
         .into();
-        let profile_url = Some("https://api.profile.example");
+        let explicit_url = Some("https://api.explicit.example");
 
         // When: the command builds its authenticated login context.
-        let ctx = org_options(profile_url)
+        let ctx = org_options(None)
             .login_context(&base, &available_org(Some("https://api.org.example")))
             .await;
 
-        // Then: the organization URL takes precedence, and the remaining saved
-        // profile identity is preserved.
+        // Then: the organization URL is used, and the remaining login identity
+        // is preserved.
         assert_eq!(ctx.api_url, "https://api.org.example");
         assert_eq!(ctx.app_url, DEFAULT_APP_URL);
         assert_eq!(ctx.profile.as_deref(), Some("test-profile"));
@@ -5657,16 +5753,30 @@ mod tests {
         assert_eq!(ctx.login.org_id().as_deref(), Some("org_123"));
         assert_eq!(ctx.login.org_name().as_deref(), Some("test-org"));
 
+        // Given: --api-url / BRAINTRUST_API_URL is set and the organization also
+        // returned its own API URL.
+        // When: the same command builds its login context.
+        let explicit_over_org = org_options(explicit_url)
+            .login_context(&base, &available_org(Some("https://api.org.example")))
+            .await;
+
+        // Then: the explicit API URL wins, matching `login()`.
+        assert_eq!(explicit_over_org.api_url, "https://api.explicit.example");
+        assert_eq!(
+            explicit_over_org.login.api_url().as_deref(),
+            Some("https://api.explicit.example")
+        );
+
         // Given: the selected organization did not return its own API URL.
-        // When: the same normal command builds its login context.
-        let from_profile = org_options(profile_url)
+        // When: the same command builds its login context.
+        let explicit_only = org_options(explicit_url)
             .login_context(&base, &available_org(None))
             .await;
 
-        // Then: the command falls back to the saved profile's API URL.
-        assert_eq!(from_profile.api_url, "https://api.profile.example");
+        // Then: the command uses the explicit API URL.
+        assert_eq!(explicit_only.api_url, "https://api.explicit.example");
 
-        // Given: neither the organization nor the profile provides an API URL.
+        // Given: neither the organization nor an explicit setting provides an API URL.
         // When: the normal command builds its login context.
         let from_default = org_options(None)
             .login_context(&base, &available_org(None))
