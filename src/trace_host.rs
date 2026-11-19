@@ -309,36 +309,6 @@ async fn resolve_trace_project(mut base: BaseArgs) -> anyhow::Result<BaseArgs> {
 
 #[async_trait]
 impl TraceHostServices for BtTraceHost {
-    fn has_explicit_route_selection(&self) -> bool {
-        self.base.profile_explicit
-            || self.base.trace_org_explicit
-            || self.base.trace_project_explicit
-    }
-
-    fn explicit_route_selection(&self) -> HostRouteSelection {
-        HostRouteSelection {
-            auth: AuthSelection {
-                source: AuthSource::Auto,
-                profile_id: None,
-                profile: self
-                    .base
-                    .profile_explicit
-                    .then(|| self.base.profile.clone())
-                    .flatten(),
-                org_name: self
-                    .base
-                    .trace_org_explicit
-                    .then(|| self.base.org_name.clone())
-                    .flatten(),
-            },
-            project_name: self
-                .base
-                .trace_project_explicit
-                .then(|| self.base.project.clone())
-                .flatten(),
-        }
-    }
-
     async fn resolve_route(
         &self,
         requirements: RouteRequirements,
@@ -609,38 +579,6 @@ mod tests {
     use crate::args::LoginBaseArgs;
     use std::{env, ffi::OsString, fs};
     use tempfile::TempDir;
-
-    #[test]
-    fn explicit_trace_route_requires_command_line_selection() {
-        let mut base = BaseArgs {
-            login: LoginBaseArgs {
-                profile: Some("environment-profile".into()),
-                ..Default::default()
-            },
-            project: Some("environment-default".into()),
-            org_name: Some("environment-org".into()),
-            ..Default::default()
-        };
-        let implicit = BtTraceHost::new(base.clone());
-        assert!(!implicit.has_explicit_route_selection());
-        let selection = implicit.explicit_route_selection();
-        assert!(selection.auth.profile.is_none());
-        assert!(selection.auth.org_name.is_none());
-        assert!(selection.project_name.is_none());
-        base.profile_explicit = true;
-        let explicit = BtTraceHost::new(base.clone());
-        assert!(explicit.has_explicit_route_selection());
-        assert_eq!(
-            explicit.explicit_route_selection().auth.profile.as_deref(),
-            Some("environment-profile")
-        );
-        base.profile_explicit = false;
-        base.trace_org_explicit = true;
-        assert!(BtTraceHost::new(base.clone()).has_explicit_route_selection());
-        base.trace_org_explicit = false;
-        base.trace_project_explicit = true;
-        assert!(BtTraceHost::new(base).has_explicit_route_selection());
-    }
 
     struct TestOAuthProfile {
         name: &'static str,

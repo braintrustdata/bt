@@ -120,9 +120,6 @@ pub struct BaseArgs {
     #[arg(short = 'o', long = "org", env = "BRAINTRUST_ORG_NAME", global = true)]
     pub org_name: Option<String>,
 
-    #[arg(skip)]
-    pub trace_org_explicit: bool,
-
     /// Override active project
     #[arg(
         short = 'p',
@@ -132,9 +129,6 @@ pub struct BaseArgs {
         global = true
     )]
     pub project: Option<String>,
-
-    #[arg(skip)]
-    pub trace_project_explicit: bool,
 }
 
 #[derive(Debug, Clone, Args)]
@@ -195,7 +189,8 @@ impl From<LoginBaseArgs> for BaseArgs {
     fn from(login: LoginBaseArgs) -> Self {
         Self {
             login,
-            ..Default::default()
+            org_name: None,
+            project: None,
         }
     }
 }

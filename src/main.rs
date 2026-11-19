@@ -379,9 +379,6 @@ fn try_main() -> Result<()> {
             cmd.args.cli_project = cmd.base.project.clone();
         }
     }
-    if let Commands::Trace(cmd) = &mut cli.command {
-        apply_trace_arg_sources(&matches, &mut cmd.base);
-    }
     apply_base_arg_sources(&matches, cli.command.base_mut());
     cli.command.base_mut().profile_explicit = has_explicit_profile_arg(&argv);
     apply_base_output_defaults(&mut cli.command);
@@ -435,20 +432,18 @@ fn try_main() -> Result<()> {
             Commands::Switch(cmd) => switch::run(cmd.base, cmd.args).await?,
             Commands::Status(cmd) => status::run(cmd.base, cmd.args).await?,
             Commands::Trace(cmd) => {
-                bt_daemon::run_trace(cmd.args, trace_host::context(cmd.base)).await?
+                bt_daemon::run_trace_with_matches(
+                    cmd.args,
+                    trace_host::context(cmd.base),
+                    Some(&matches),
+                )
+                .await?
             }
         }
         Ok(())
     });
 
     command_result
-}
-
-fn apply_trace_arg_sources(matches: &ArgMatches, base: &mut crate::args::BaseArgs) {
-    base.trace_org_explicit =
-        find_value_source(matches, "org_name") == Some(ValueSource::CommandLine);
-    base.trace_project_explicit =
-        find_value_source(matches, "project") == Some(ValueSource::CommandLine);
 }
 
 fn apply_base_arg_sources(matches: &ArgMatches, base: &mut LoginBaseArgs) {
@@ -709,39 +704,6 @@ mod tests {
             Some(ArgValueSource::CommandLine)
         );
         assert!(cli.command.base().verbose_explicit());
-    }
-
-    #[test]
-    fn trace_route_sources_distinguish_flags_from_environment() {
-        let _guard = env_test_lock().lock().expect("env test lock");
-        let old_project = env::var_os("BRAINTRUST_DEFAULT_PROJECT");
-        let old_org = env::var_os("BRAINTRUST_ORG_NAME");
-        env::set_var("BRAINTRUST_DEFAULT_PROJECT", "default-project");
-        env::set_var("BRAINTRUST_ORG_NAME", "default-org");
-        for (argv, expected_project, expected_org) in [
-            (vec!["bt", "trace", "enable", "pi"], false, false),
-            (
-                vec!["bt", "trace", "enable", "pi", "--project", "chosen"],
-                true,
-                false,
-            ),
-            (
-                vec!["bt", "trace", "enable", "pi", "--org", "chosen"],
-                false,
-                true,
-            ),
-        ] {
-            let matches = Cli::command().try_get_matches_from(argv).unwrap();
-            let mut cli = Cli::from_arg_matches(&matches).unwrap();
-            let Commands::Trace(cmd) = &mut cli.command else {
-                panic!("expected trace")
-            };
-            apply_trace_arg_sources(&matches, &mut cmd.base);
-            assert_eq!(cmd.base.trace_project_explicit, expected_project);
-            assert_eq!(cmd.base.trace_org_explicit, expected_org);
-        }
-        restore_env_var("BRAINTRUST_DEFAULT_PROJECT", old_project);
-        restore_env_var("BRAINTRUST_ORG_NAME", old_org);
     }
 
     #[test]

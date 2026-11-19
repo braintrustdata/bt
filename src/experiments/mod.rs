@@ -416,7 +416,6 @@ mod tests {
             },
             org_name: Some("explicit-org".to_string()),
             project: Some("explicit-project".to_string()),
-            ..Default::default()
         };
         let parsed = parse_experiment_compare_url(
             "https://www.example.test/app/url-org/p/url-project/experiments/baseline?c=challenger",

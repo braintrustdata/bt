@@ -1769,6 +1769,49 @@ fn trace_setup_honors_global_json() {
     );
 }
 
+#[test]
+fn project_setup_uses_only_explicit_global_selections() {
+    let repo = tempfile::tempdir().unwrap();
+    let home = tempfile::tempdir().unwrap();
+    let config = tempfile::tempdir().unwrap();
+    fs::create_dir(repo.path().join(".git")).unwrap();
+    let path = repo.path().join(".claude/braintrust.json");
+    let run = |args: &[&str]| {
+        bt_trace_command(config.path(), "environment-profile", "environment-org")
+            .env("HOME", home.path())
+            .env("BRAINTRUST_DEFAULT_PROJECT", "environment-project")
+            .current_dir(repo.path())
+            .args(args)
+            .assert()
+            .success();
+        serde_json::from_slice::<serde_json::Value>(&fs::read(&path).unwrap()).unwrap()
+    };
+    assert_eq!(
+        run(&["trace", "setup", "claude", "--scope", "project"]),
+        serde_json::json!({"trace_to_braintrust":true})
+    );
+    assert_eq!(
+        run(&[
+            "trace",
+            "enable",
+            "claude",
+            "--scope",
+            "project",
+            "--profile",
+            "chosen-profile",
+            "--org",
+            "chosen-org",
+            "--project",
+            "chosen-project"
+        ]),
+        serde_json::json!({"trace_to_braintrust":true,"profile":"chosen-profile","org_name":"chosen-org","project":"chosen-project"})
+    );
+    assert_eq!(
+        run(&["trace", "disable", "claude", "--scope", "project"])["project"],
+        "chosen-project"
+    );
+}
+
 #[cfg(unix)]
 #[test]
 fn trace_doctor_reports_saved_profile_provenance_without_credentials() {
