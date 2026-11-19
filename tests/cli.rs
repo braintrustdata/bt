@@ -1915,6 +1915,7 @@ fn scorers_create_help_includes_llm_judge_configuration() {
         .stdout(predicate::str::contains("--tool-choice"))
         .stdout(predicate::str::contains("--reasoning-effort"))
         .stdout(predicate::str::contains("--verbosity"))
+        .stdout(predicate::str::contains("--service-tier <TIER>"))
         .stdout(predicate::str::contains("--use-cache"))
         .stdout(predicate::str::contains("--response-format"))
         .stdout(predicate::str::contains("--template-format"))
