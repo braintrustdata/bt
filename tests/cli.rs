@@ -1279,6 +1279,85 @@ fn trace_run_uses_the_invocation_project_without_changing_setup() {
 
 #[cfg(unix)]
 #[test]
+fn trace_run_inherits_user_and_project_settings_without_mutating_them() {
+    let home = tempfile::tempdir().unwrap();
+    let config = tempfile::tempdir().unwrap();
+    let bin = tempfile::tempdir().unwrap();
+    let repo = tempfile::tempdir().unwrap();
+    let state = tempfile::tempdir().unwrap();
+    fs::create_dir(repo.path().join(".git")).unwrap();
+    fs::create_dir(repo.path().join(".codex")).unwrap();
+    let user = state.path().join("user.json");
+    let project = repo.path().join(".codex/braintrust.json");
+    let run = state.path().join("run.json");
+    let user_text = r#"{"trace_to_braintrust":false,"route":{"auth":{},"destination":{"type":"project_logs","project_name":"user"},"tags":["user"],"additional_metadata":{"nested":{"a":1,"b":2},"list":[1,2]}}}"#;
+    let project_text = r#"{"trace_to_braintrust":false,"project":"project","additional_metadata":{"nested":{"b":3},"list":[4]}}"#;
+    fs::write(&user, user_text).unwrap();
+    fs::write(&project, project_text).unwrap();
+    write_run_agent(&bin.path().join("codex"));
+    bt_trace_environment_command(config.path())
+        .current_dir(repo.path())
+        .env("HOME", home.path())
+        .env("PATH", bin.path())
+        .env("AGENT_RUN_LOG", state.path().join("run.log"))
+        .env("AGENT_RUN_SETTINGS", &run)
+        .env("AGENT_RUN_DAEMON_ENV", state.path().join("daemon.txt"))
+        .env("BRAINTRUST_DAEMON_CONFIG", &user)
+        .args([
+            "trace",
+            "run",
+            "codex",
+            "--inherit",
+            "--additional-metadata",
+            r#"{"nested":{"c":5}}"#,
+            "--",
+            "--version",
+        ])
+        .assert()
+        .success();
+    let result: serde_json::Value = serde_json::from_slice(&fs::read(&run).unwrap()).unwrap();
+    assert_eq!(result["trace_to_braintrust"], true);
+    assert_eq!(result["route"]["auth"]["source"], "environment");
+    assert_eq!(result["route"]["destination"]["project_name"], "project");
+    assert_eq!(result["route"]["tags"], serde_json::json!(["user"]));
+    assert_eq!(
+        result["route"]["additional_metadata"],
+        serde_json::json!({"nested":{"a":1,"b":3,"c":5},"list":[4]})
+    );
+    bt_trace_environment_command(config.path())
+        .current_dir(repo.path())
+        .env("HOME", home.path())
+        .env("PATH", bin.path())
+        .env("AGENT_RUN_LOG", state.path().join("run.log"))
+        .env("AGENT_RUN_SETTINGS", &run)
+        .env("AGENT_RUN_DAEMON_ENV", state.path().join("daemon.txt"))
+        .env("BRAINTRUST_DAEMON_CONFIG", &user)
+        .args([
+            "trace",
+            "run",
+            "codex",
+            "--inherit",
+            "--project",
+            "explicit",
+            "--tag",
+            "run",
+            "--",
+            "--version",
+        ])
+        .assert()
+        .success();
+    let overridden: serde_json::Value = serde_json::from_slice(&fs::read(&run).unwrap()).unwrap();
+    assert_eq!(
+        overridden["route"]["destination"]["project_name"],
+        "explicit"
+    );
+    assert_eq!(overridden["route"]["tags"], serde_json::json!(["run"]));
+    assert_eq!(fs::read_to_string(user).unwrap(), user_text);
+    assert_eq!(fs::read_to_string(project).unwrap(), project_text);
+}
+
+#[cfg(unix)]
+#[test]
 fn trace_enable_persists_environment_auth_and_completes_setup() {
     let home = tempfile::tempdir().expect("home tempdir");
     let config_home = tempfile::tempdir().expect("config tempdir");
@@ -1770,6 +1849,72 @@ fn trace_setup_honors_global_json() {
 }
 
 #[test]
+fn trace_install_can_be_disabled_by_default() {
+    let home = tempfile::tempdir().unwrap();
+    let config = tempfile::tempdir().unwrap();
+    let settings = config.path().join("tracing.json");
+    bt_trace_command(config.path(), "test-profile", "test-org")
+        .env("HOME", home.path())
+        .env("BRAINTRUST_DAEMON_CONFIG", &settings)
+        .args([
+            "trace",
+            "install",
+            "opencode",
+            "--disable",
+            "--project",
+            "agent-traces",
+            "--no-input",
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("Tracing is disabled by default"));
+    let settings: serde_json::Value = serde_json::from_slice(&fs::read(settings).unwrap()).unwrap();
+    assert_eq!(settings["trace_to_braintrust"], false);
+    assert_eq!(
+        settings["route"]["destination"]["project_name"],
+        "agent-traces"
+    );
+}
+
+#[test]
+fn trace_doctor_reports_effective_project_settings() {
+    let home = tempfile::tempdir().unwrap();
+    let config = tempfile::tempdir().unwrap();
+    let repo = tempfile::tempdir().unwrap();
+    let settings = config.path().join("tracing.json");
+    fs::create_dir(repo.path().join(".git")).unwrap();
+    fs::create_dir(repo.path().join(".claude")).unwrap();
+    let project = repo.path().join(".claude/braintrust.json");
+    fs::write(&settings, r#"{"trace_to_braintrust":false,"route":{"auth":{"source":"environment"},"destination":{"type":"project_logs","project_name":"global"}}}"#).unwrap();
+    fs::write(
+        &project,
+        r#"{"trace_to_braintrust":true,"project":"local"}"#,
+    )
+    .unwrap();
+    let result = bt_trace_environment_command(config.path())
+        .env("HOME", home.path())
+        .env("BRAINTRUST_DAEMON_CONFIG", &settings)
+        .current_dir(repo.path())
+        .args(["trace", "doctor", "claude", "--json"])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let output: serde_json::Value = serde_json::from_slice(&result).unwrap();
+    assert_eq!(output["enabled"], true);
+    assert_eq!(
+        output["project_settings_path"],
+        project.canonicalize().unwrap().to_string_lossy().as_ref()
+    );
+    assert_eq!(output["route"]["destination"]["project_name"], "local");
+    assert!(output["project_settings_fields"]
+        .as_array()
+        .unwrap()
+        .contains(&serde_json::json!("trace_to_braintrust")));
+}
+
+#[test]
 fn project_setup_uses_only_explicit_global_selections() {
     let repo = tempfile::tempdir().unwrap();
     let home = tempfile::tempdir().unwrap();
@@ -1787,9 +1932,23 @@ fn project_setup_uses_only_explicit_global_selections() {
         serde_json::from_slice::<serde_json::Value>(&fs::read(&path).unwrap()).unwrap()
     };
     assert_eq!(
-        run(&["trace", "setup", "claude", "--scope", "project"]),
+        run(&["trace", "install", "claude", "--scope", "project"]),
         serde_json::json!({"trace_to_braintrust":true})
     );
+    let stdout = bt_trace_command(config.path(), "environment-profile", "environment-org")
+        .env("HOME", home.path())
+        .current_dir(repo.path())
+        .args(["trace", "install", "claude", "--scope", "project", "--json"])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let output: serde_json::Value = serde_json::from_slice(&stdout).unwrap();
+    assert!(output["warnings"][0]
+        .as_str()
+        .unwrap()
+        .contains("Each user"));
     assert_eq!(
         run(&[
             "trace",
