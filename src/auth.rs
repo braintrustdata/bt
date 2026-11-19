@@ -652,10 +652,7 @@ pub async fn login(base: &BaseArgs) -> Result<LoginContext> {
     }
     let login = builder.build().await?.wait_for_login().await?;
 
-    let api_url = login
-        .api_url()
-        .or(auth.api_url.clone())
-        .unwrap_or_else(|| DEFAULT_API_URL.to_string());
+    let api_url = resolve_login_api_url(auth.api_url.as_deref(), login.api_url());
 
     let app_url = auth
         .app_url
@@ -670,6 +667,31 @@ pub async fn login(base: &BaseArgs) -> Result<LoginContext> {
     };
     maybe_warn_ai_provider_key_staleness(base, &ctx).await;
     Ok(ctx)
+}
+
+/// An explicit `--api-url` / `BRAINTRUST_API_URL` wins over the organization's
+/// registered API URL, matching the Python and TypeScript SDKs. This lets clients
+/// that can only reach the data plane through an internal address use it.
+fn resolve_login_api_url(explicit: Option<&str>, from_login: Option<String>) -> String {
+    let explicit = explicit.map(str::trim).filter(|url| !url.is_empty());
+    match (explicit, from_login) {
+        (Some(explicit), Some(from_login)) => {
+            if !same_url(explicit, &from_login) {
+                eprintln!(
+                    "warning: using API URL {explicit} from --api-url/BRAINTRUST_API_URL instead of the organization's API URL {from_login}"
+                );
+            }
+            explicit.to_string()
+        }
+        (Some(explicit), None) => explicit.to_string(),
+        (None, Some(from_login)) => from_login,
+        (None, None) => DEFAULT_API_URL.to_string(),
+    }
+}
+
+fn same_url(a: &str, b: &str) -> bool {
+    a.trim_end_matches('/')
+        .eq_ignore_ascii_case(b.trim_end_matches('/'))
 }
 
 use braintrust_api_client::backend::extensions::AiProviderSecret;
@@ -3883,6 +3905,50 @@ mod tests {
 
     fn make_base() -> BaseArgs {
         BaseArgs::default()
+    }
+
+    #[test]
+    fn explicit_api_url_overrides_login_api_url() {
+        assert_eq!(
+            resolve_login_api_url(
+                Some("https://internal.example.test"),
+                Some("https://public.example.test".to_string()),
+            ),
+            "https://internal.example.test"
+        );
+    }
+
+    #[test]
+    fn login_api_url_used_without_explicit_api_url() {
+        assert_eq!(
+            resolve_login_api_url(None, Some("https://public.example.test".to_string())),
+            "https://public.example.test"
+        );
+        assert_eq!(
+            resolve_login_api_url(Some("  "), Some("https://public.example.test".to_string())),
+            "https://public.example.test"
+        );
+    }
+
+    #[test]
+    fn api_url_falls_back_to_default() {
+        assert_eq!(resolve_login_api_url(None, None), DEFAULT_API_URL);
+        assert_eq!(
+            resolve_login_api_url(Some("https://internal.example.test"), None),
+            "https://internal.example.test"
+        );
+    }
+
+    #[test]
+    fn same_url_ignores_trailing_slash_and_case() {
+        assert!(same_url(
+            "https://API.example.test/",
+            "https://api.example.test"
+        ));
+        assert!(!same_url(
+            "https://internal.example.test",
+            "https://public.example.test"
+        ));
     }
 
     #[test]
