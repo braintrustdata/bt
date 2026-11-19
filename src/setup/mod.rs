@@ -16,7 +16,7 @@ use serde_json::{Map, Value};
 use tokio::process::Command;
 use toml::Value as TomlValue;
 
-use crate::args::{ArgValueSource, BaseArgs, DEFAULT_API_URL, DEFAULT_APP_URL};
+use crate::args::{ArgValueSource, BaseArgs, DEFAULT_APP_URL};
 use crate::auth;
 use crate::auth::LoginContext;
 use crate::config;
@@ -1516,11 +1516,11 @@ fn build_api_key_login_context(
     api_key: &str,
     org: &auth::AvailableOrg,
 ) -> LoginContext {
-    let api_url = base
-        .api_url
-        .clone()
-        .or_else(|| org.api_url.clone())
-        .unwrap_or_else(|| DEFAULT_API_URL.to_string());
+    let api_url = braintrust_api_client::resolve_login_api_url(
+        base.api_url.as_deref(),
+        org.api_url.as_deref(),
+    )
+    .to_string();
     let app_url = base
         .app_url
         .clone()

@@ -198,6 +198,7 @@ struct MockServerState {
     uploaded_bundles: Mutex<Vec<Vec<u8>>>,
     inserted_functions: Mutex<Vec<Value>>,
     bundle_counter: Mutex<usize>,
+    login_api_url: Mutex<Option<String>>,
 }
 
 struct MockServer {
@@ -241,7 +242,12 @@ impl MockServer {
 
 async fn mock_login(state: web::Data<Arc<MockServerState>>, req: HttpRequest) -> HttpResponse {
     log_request(&state, &req);
-    let base = request_base_url(&req);
+    let base = state
+        .login_api_url
+        .lock()
+        .expect("login api url lock")
+        .clone()
+        .unwrap_or_else(|| request_base_url(&req));
     HttpResponse::Ok().json(serde_json::json!({
         "org_info": [
             {
@@ -2395,6 +2401,75 @@ async fn functions_view_by_positional_id_does_not_require_project_context() {
             .iter()
             .any(|entry| entry.starts_with("/v1/project")),
         "view by id should not resolve project context, got {requests:?}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn explicit_api_url_overrides_org_api_url_from_login() {
+    let state = Arc::new(MockServerState::default());
+    *state.login_api_url.lock().expect("login api url lock") =
+        Some("http://127.0.0.1:9".to_string());
+    state
+        .pull_rows
+        .lock()
+        .expect("pull rows lock")
+        .push(serde_json::json!({
+            "id": "00000000-0000-4000-8000-000000000003",
+            "name": "Doc Search",
+            "slug": "doc-search",
+            "project_id": "00000000-0000-4000-8000-000000000001",
+            "function_type": "tool",
+            "function_data": { "type": "code", "data": { "type": "inline", "runtime_context":{"runtime":"node","version":"22"}, "code": "export default async function handler() {}" } },
+            "_xact_id": "0000000000000001"
+        }));
+
+    let server = MockServer::start(state.clone()).await;
+
+    let tmp = tempdir().expect("tempdir");
+    let config_dir = tempdir().expect("config dir");
+
+    let output = Command::new(common::bt_binary_path(&repo_root()))
+        .current_dir(tmp.path())
+        .args([
+            "functions",
+            "--json",
+            "view",
+            "00000000-0000-4000-8000-000000000003",
+        ])
+        .env("XDG_CONFIG_HOME", config_dir.path())
+        .env("APPDATA", config_dir.path())
+        .env("BRAINTRUST_API_KEY", "test-key")
+        .env("BRAINTRUST_ORG_NAME", "test-org")
+        .env("BRAINTRUST_API_URL", &server.base_url)
+        .env("BRAINTRUST_APP_URL", &server.base_url)
+        .env("BRAINTRUST_NO_COLOR", "1")
+        .env("BRAINTRUST_NO_INPUT", "1")
+        .env_remove("BRAINTRUST_PROFILE")
+        .env_remove("BRAINTRUST_DEFAULT_PROJECT")
+        .env_remove("BRAINTRUST_FUNCTIONS_VIEW_ID")
+        .env_remove("BRAINTRUST_FUNCTIONS_VIEW_VERSION")
+        .output()
+        .expect("run bt functions view with explicit API URL");
+
+    server.stop().await;
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    if !output.status.success() {
+        panic!(
+            "view with explicit API URL failed:\n{stderr}\n{}",
+            String::from_utf8_lossy(&output.stdout)
+        );
+    }
+
+    let function: Value = serde_json::from_slice(&output.stdout).expect("parse function JSON");
+    assert_eq!(function["slug"].as_str(), Some("doc-search"));
+
+    let requests = state.requests.lock().expect("requests lock").clone();
+    assert!(
+        requests
+            .iter()
+            .any(|entry| entry == "/v1/function?ids=00000000-0000-4000-8000-000000000003"),
+        "function request should go to the explicit API URL, got {requests:?}"
     );
 }
 
