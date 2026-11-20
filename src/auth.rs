@@ -290,11 +290,11 @@ impl OrgOptions {
             .app_url
             .clone()
             .unwrap_or_else(|| DEFAULT_APP_URL.to_string());
-        let api_url = org
-            .api_url
-            .clone()
-            .or_else(|| self.auth.api_url.clone())
-            .unwrap_or_else(|| DEFAULT_API_URL.to_string());
+        let api_url = braintrust_api_client::resolve_login_api_url(
+            self.auth.api_url.as_deref(),
+            org.api_url.as_deref(),
+        )
+        .to_string();
 
         let login = LoginState::new();
         login.set(
@@ -654,7 +654,6 @@ pub async fn login(base: &BaseArgs) -> Result<LoginContext> {
 
     let api_url = login
         .api_url()
-        .or(auth.api_url.clone())
         .unwrap_or_else(|| DEFAULT_API_URL.to_string());
 
     let app_url = auth
@@ -5633,40 +5632,43 @@ mod tests {
     /// Must fill the same fields the SDK's `perform_login` does.
     #[tokio::test]
     async fn login_context_matches_a_real_login() {
-        // Given: a normal, non-tracing command has resolved a saved profile and
-        // the selected organization returned its own API URL during login.
+        // Given: an explicit API URL and an organization with its own URL.
         // `json` suppresses the interactive warnings the call would otherwise emit.
         let base: BaseArgs = crate::args::LoginBaseArgs {
             json: true,
             ..Default::default()
         }
         .into();
-        let profile_url = Some("https://api.profile.example");
+        let explicit_url = Some("https://api.explicit.example");
 
         // When: the command builds its authenticated login context.
-        let ctx = org_options(profile_url)
+        let ctx = org_options(explicit_url)
             .login_context(&base, &available_org(Some("https://api.org.example")))
             .await;
 
-        // Then: the organization URL takes precedence, and the remaining saved
-        // profile identity is preserved.
-        assert_eq!(ctx.api_url, "https://api.org.example");
+        // Then: the explicit URL wins and the login identity is preserved.
+        assert_eq!(ctx.api_url, "https://api.explicit.example");
         assert_eq!(ctx.app_url, DEFAULT_APP_URL);
         assert_eq!(ctx.profile.as_deref(), Some("test-profile"));
         assert_eq!(ctx.login.api_key().as_deref(), Some("sk-test"));
         assert_eq!(ctx.login.org_id().as_deref(), Some("org_123"));
         assert_eq!(ctx.login.org_name().as_deref(), Some("test-org"));
 
+        let discovered = org_options(None)
+            .login_context(&base, &available_org(Some("https://api.org.example")))
+            .await;
+        assert_eq!(discovered.api_url, "https://api.org.example");
+
         // Given: the selected organization did not return its own API URL.
         // When: the same normal command builds its login context.
-        let from_profile = org_options(profile_url)
+        let from_profile = org_options(explicit_url)
             .login_context(&base, &available_org(None))
             .await;
 
-        // Then: the command falls back to the saved profile's API URL.
-        assert_eq!(from_profile.api_url, "https://api.profile.example");
+        // Then: the explicit API URL is used.
+        assert_eq!(from_profile.api_url, "https://api.explicit.example");
 
-        // Given: neither the organization nor the profile provides an API URL.
+        // Given: neither the organization nor an explicit setting provides an API URL.
         // When: the normal command builds its login context.
         let from_default = org_options(None)
             .login_context(&base, &available_org(None))

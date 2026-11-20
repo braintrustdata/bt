@@ -460,6 +460,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "backon"
+version = "1.6.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "cffb0e931875b666fc4fcb20fee52e9bbd1ef836fd9e9e04ec21555f9f85f7ef"
+dependencies = [
+ "fastrand",
+ "tokio",
+]
+
+[[package]]
 name = "base64"
 version = "0.13.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -574,7 +584,7 @@ dependencies = [
 [[package]]
 name = "braintrust-api-client"
 version = "0.1.0-alpha.2"
-source = "git+https://github.com/braintrustdata/braintrust-sdk-rust?rev=bbce73e8207136453583dbdbb476365e295971ab#bbce73e8207136453583dbdbb476365e295971ab"
+source = "git+https://github.com/braintrustdata/braintrust-sdk-rust?rev=3f34503e2be50270f92e96aa2d4b872ccd789936#3f34503e2be50270f92e96aa2d4b872ccd789936"
 dependencies = [
  "anyhow",
  "backoff",
@@ -654,15 +664,15 @@ dependencies = [
 [[package]]
 name = "braintrust-sdk-rust"
 version = "0.1.0-alpha.2"
-source = "git+https://github.com/braintrustdata/braintrust-sdk-rust?rev=bbce73e8207136453583dbdbb476365e295971ab#bbce73e8207136453583dbdbb476365e295971ab"
+source = "git+https://github.com/braintrustdata/braintrust-sdk-rust?rev=3f34503e2be50270f92e96aa2d4b872ccd789936#3f34503e2be50270f92e96aa2d4b872ccd789936"
 dependencies = [
  "anyhow",
  "arc-swap",
  "async-trait",
- "backoff",
+ "backon",
  "base64 0.23.1",
  "bon",
- "braintrust-api-client 0.1.0-alpha.2 (git+https://github.com/braintrustdata/braintrust-sdk-rust?rev=bbce73e8207136453583dbdbb476365e295971ab)",
+ "braintrust-api-client 0.1.0-alpha.2 (git+https://github.com/braintrustdata/braintrust-sdk-rust?rev=3f34503e2be50270f92e96aa2d4b872ccd789936)",
  "bytes",
  "chrono",
  "crossbeam",
@@ -731,8 +741,8 @@ dependencies = [
  "assert_cmd",
  "async-trait",
  "base64 0.22.1",
- "braintrust-api-client 0.1.0-alpha.2 (git+https://github.com/braintrustdata/braintrust-sdk-rust?rev=bbce73e8207136453583dbdbb476365e295971ab)",
- "braintrust-sdk-rust 0.1.0-alpha.2 (git+https://github.com/braintrustdata/braintrust-sdk-rust?rev=bbce73e8207136453583dbdbb476365e295971ab)",
+ "braintrust-api-client 0.1.0-alpha.2 (git+https://github.com/braintrustdata/braintrust-sdk-rust?rev=3f34503e2be50270f92e96aa2d4b872ccd789936)",
+ "braintrust-sdk-rust 0.1.0-alpha.2 (git+https://github.com/braintrustdata/braintrust-sdk-rust?rev=3f34503e2be50270f92e96aa2d4b872ccd789936)",
  "bt-daemon",
  "chrono",
  "clap",
