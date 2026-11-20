@@ -432,7 +432,12 @@ fn try_main() -> Result<()> {
             Commands::Switch(cmd) => switch::run(cmd.base, cmd.args).await?,
             Commands::Status(cmd) => status::run(cmd.base, cmd.args).await?,
             Commands::Trace(cmd) => {
-                bt_daemon::run_trace(cmd.args, trace_host::context(cmd.base)).await?
+                bt_daemon::run_trace_with_matches(
+                    cmd.args,
+                    trace_host::context(cmd.base),
+                    Some(&matches),
+                )
+                .await?
             }
         }
         Ok(())
