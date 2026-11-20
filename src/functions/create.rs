@@ -623,6 +623,8 @@ mod tests {
             "medium",
             "--verbosity",
             "high",
+            "--service-tier",
+            "flex",
             "--template-format",
             "jinja",
             "--pass-threshold",
@@ -645,6 +647,7 @@ mod tests {
         assert_eq!(params["tool_choice"], "required");
         assert_eq!(params["reasoning_effort"], "medium");
         assert_eq!(params["verbosity"], "high");
+        assert_eq!(params["service_tier"], "flex");
         assert_eq!(body["prompt_data"]["template_format"], "nunjucks");
         assert_eq!(body["metadata"]["owner"], "test-team");
         assert_eq!(body["metadata"]["__pass_threshold"], 0.7);
