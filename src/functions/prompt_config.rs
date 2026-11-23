@@ -64,6 +64,10 @@ pub(crate) struct PromptConfigArgs {
     #[arg(long, value_enum)]
     verbosity: Option<Verbosity>,
 
+    /// OpenAI service tier for supported models (for example, flex).
+    #[arg(long, value_name = "TIER")]
+    service_tier: Option<String>,
+
     /// Whether to use Braintrust's completion cache. Pass --use-cache=false to
     /// bypass it.
     #[arg(
@@ -216,6 +220,12 @@ impl PromptConfigArgs {
             params.insert(
                 "verbosity".to_string(),
                 Value::String(verbosity.as_str().to_string()),
+            );
+        }
+        if let Some(service_tier) = &self.service_tier {
+            params.insert(
+                "service_tier".to_string(),
+                Value::String(service_tier.clone()),
             );
         }
         if let Some(use_cache) = self.use_cache {
