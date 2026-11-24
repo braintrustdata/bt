@@ -15,8 +15,7 @@ on:
         default: true
 
 permissions:
-  contents: write
-  pull-requests: write
+  contents: read
 
 concurrency:
   group: update-rust-dependencies
@@ -26,15 +25,25 @@ jobs:
   update:
     runs-on: ubuntu-24.04
     env:
-      GH_TOKEN: ${{ github.token }}
       BRANCH: automation/update-rust-dependencies
       UPDATE_RUST_SDK: ${{ inputs.update_rust_sdk }}
       UPDATE_BT_DAEMON: ${{ inputs.update_bt_daemon }}
       SDK_REPOSITORY: braintrustdata/braintrust-sdk-rust
       DAEMON_REPOSITORY: braintrustdata/braintrust-coding-agent-plugins
     steps:
+      # App-authenticated pushes and PRs let pull_request CI start automatically.
+      - name: Generate app token
+        id: app-token
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
+        with:
+          app-id: ${{ secrets.BRAINTRUST_BOT_APP_ID }}
+          private-key: ${{ secrets.BRAINTRUST_BOT_PRIVATE_KEY }}
+          permission-contents: write
+          permission-pull-requests: write
+
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
         with:
+          token: ${{ steps.app-token.outputs.token }}
           fetch-depth: 0
           ref: main
 
@@ -119,6 +128,7 @@ jobs:
 
       - name: Commit and open pull request
         env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
           SDK_SHA: ${{ steps.dependencies.outputs.sdk_sha }}
           DAEMON_SHA: ${{ steps.dependencies.outputs.daemon_sha }}
         shell: bash
