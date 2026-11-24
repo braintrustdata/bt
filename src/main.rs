@@ -14,6 +14,7 @@ mod error;
 #[cfg(unix)]
 mod eval;
 mod experiments;
+mod feedback;
 mod functions;
 #[cfg(unix)]
 mod go_runner;
@@ -139,6 +140,8 @@ struct Cli {
 
 #[derive(Debug, Subcommand)]
 enum Commands {
+    /// Send feedback to the Braintrust team
+    Feedback(CLIArgs<feedback::FeedbackArgs>),
     /// Initialize .bt config directory and files
     Init(CLIArgs<init::InitArgs>),
     /// Configure Braintrust setup flows
@@ -204,6 +207,7 @@ enum Commands {
 impl Commands {
     fn base(&self) -> &LoginBaseArgs {
         match self {
+            Commands::Feedback(cmd) => &cmd.base,
             Commands::Init(cmd) => &cmd.base,
             Commands::Setup(cmd) => &cmd.base,
             Commands::Docs(cmd) => &cmd.base,
@@ -238,6 +242,7 @@ impl Commands {
 
     fn base_mut(&mut self) -> &mut LoginBaseArgs {
         match self {
+            Commands::Feedback(cmd) => &mut cmd.base,
             Commands::Init(cmd) => &mut cmd.base,
             Commands::Setup(cmd) => &mut cmd.base,
             Commands::Docs(cmd) => &mut cmd.base,
@@ -395,6 +400,7 @@ fn try_main() -> Result<()> {
 
     let command_result: Result<()> = runtime.block_on(async move {
         match cli.command {
+            Commands::Feedback(cmd) => feedback::run(cmd.base, cmd.args).await?,
             Commands::Login(cmd) => auth::run_login_command(cmd.base.into(), cmd.args).await?,
             Commands::Logout(cmd) => auth::run_logout_command(cmd.base, cmd.args)?,
             Commands::Profiles(cmd) => profiles::run(cmd.base, cmd.args)?,

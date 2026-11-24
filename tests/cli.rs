@@ -12,6 +12,21 @@ fn bt_command() -> Command {
     Command::cargo_bin("bt").expect("bt binary")
 }
 
+#[test]
+fn feedback_rejects_empty_input_and_invalid_context() {
+    bt_command()
+        .args(["feedback"])
+        .write_stdin("  \n")
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("feedback cannot be empty"));
+    bt_command()
+        .args(["feedback", "test report", "--context", "[]"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("context must be a JSON object"));
+}
+
 fn clear_braintrust_auth_env(cmd: &mut Command) {
     for key in [
         "BRAINTRUST_API_KEY",
