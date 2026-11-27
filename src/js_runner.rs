@@ -211,7 +211,15 @@ pub fn is_ts_node_runner_path(runner_command: &Path) -> bool {
 /// npm and pnpm install an extensionless POSIX shell shim next to `.cmd` on
 /// Windows, which `CreateProcess` cannot run, so Windows tries launchers first.
 pub(crate) fn executable_candidates(path: &Path) -> impl Iterator<Item = PathBuf> {
-    let windows_launchers = if cfg!(windows) {
+    let has_launcher_extension = path
+        .extension()
+        .and_then(|extension| extension.to_str())
+        .is_some_and(|extension| {
+            ["exe", "cmd", "bat"]
+                .iter()
+                .any(|launcher| extension.eq_ignore_ascii_case(launcher))
+        });
+    let windows_launchers = if cfg!(windows) && !has_launcher_extension {
         [".exe", ".cmd"]
             .iter()
             .map(|suffix| {
@@ -299,6 +307,21 @@ mod tests {
             vec![base.into()]
         };
         assert_eq!(candidates, expected);
+    }
+
+    #[test]
+    fn explicit_launcher_extension_is_kept() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let cmd = dir.path().join("runner.cmd");
+        std::fs::write(&cmd, "").expect("write runner.cmd");
+        std::fs::write(dir.path().join("runner.exe"), "").expect("write runner.exe");
+
+        assert_eq!(
+            executable_candidates(&cmd).collect::<Vec<_>>(),
+            vec![cmd.clone()]
+        );
+        let resolved = resolve_js_runner_command(cmd.to_str().expect("utf-8 path"), &[]);
+        assert_eq!(resolved, cmd);
     }
 
     #[test]
