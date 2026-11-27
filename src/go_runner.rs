@@ -82,13 +82,20 @@ pub fn resolve_go_toolchain(env_overrides: &[&str]) -> Option<PathBuf> {
     }
 
     if let Some(goroot) = std::env::var_os("GOROOT") {
-        let candidate = PathBuf::from(goroot).join("bin").join("go");
-        if candidate.is_file() {
-            return Some(candidate);
+        if let Some(go) = go_in_goroot(Path::new(&goroot)) {
+            return Some(go);
         }
     }
 
     crate::python_runner::find_binary_in_path(&["go"])
+}
+
+/// The `go` executable inside a Go installation, which is `go.exe` on Windows.
+fn go_in_goroot(goroot: &Path) -> Option<PathBuf> {
+    let candidate = goroot
+        .join("bin")
+        .join(format!("go{}", std::env::consts::EXE_SUFFIX));
+    candidate.is_file().then_some(candidate)
 }
 
 /// Resolves `--runner` for Go, which names a prebuilt eval binary rather than
@@ -348,11 +355,12 @@ mod tests {
         assert_eq!(packages.len(), 2);
         assert_eq!(packages[0].import_path, "example.test/a");
         assert_eq!(packages[1].name, "b");
+        let dir = Path::new("/repo/a");
         assert_eq!(
             packages[0].absolute_go_files(),
             vec![
-                "/repo/a/main.go".to_string(),
-                "/repo/a/classifier.go".to_string()
+                dir.join("main.go").to_string_lossy().into_owned(),
+                dir.join("classifier.go").to_string_lossy().into_owned()
             ]
         );
     }
@@ -446,11 +454,28 @@ mod tests {
 
         assert!(!is_go_eval_runner_binary(&dir.join("missing")));
         #[cfg(unix)]
-        assert!(
-            !is_go_eval_runner_binary(Path::new("/bin/sh")),
-            "a native non-Go binary"
-        );
+        let native = PathBuf::from("/bin/sh");
+        #[cfg(windows)]
+        let native = PathBuf::from(std::env::var_os("SystemRoot").expect("SystemRoot is set"))
+            .join("System32")
+            .join("cmd.exe");
+        assert!(native.is_file(), "missing {}", native.display());
+        assert!(!is_go_eval_runner_binary(&native), "a native non-Go binary");
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn go_in_goroot_finds_the_platform_executable() {
+        let goroot = make_temp_dir("goroot");
+        assert_eq!(go_in_goroot(&goroot), None, "empty GOROOT");
+
+        let bin = goroot.join("bin");
+        std::fs::create_dir_all(&bin).expect("bin dir should be created");
+        let go = bin.join(format!("go{}", std::env::consts::EXE_SUFFIX));
+        std::fs::write(&go, b"").expect("go written");
+        assert_eq!(go_in_goroot(&goroot), Some(go));
+
+        let _ = std::fs::remove_dir_all(&goroot);
     }
 }

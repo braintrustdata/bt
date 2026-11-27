@@ -110,25 +110,31 @@ jobs:
         run: ./scripts/test-windows-auth-msix.ps1 -BtPath ./target/debug/bt.exe
 
   eval-tests-go:
-    name: eval-tests-go
-    runs-on: ubuntu-latest
+    name: eval-tests-go (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
     timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
     permissions:
       contents: read
     env:
       CARGO_NET_GIT_FETCH_WITH_CLI: true
+      BT_EVAL_REQUIRED_RUNTIMES: go
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
       - uses: ./.github/actions/setup-rust-node
         with:
           rust-cache-key: tests
+          mise-tools: rust node pnpm go@1.26.0
       - name: Install JS dependencies
         run: pnpm install --frozen-lockfile --ignore-scripts
-      # No Go toolchain is installed on purpose: these tests stub `go` through
-      # BT_EVAL_GO_BIN, so they stay hermetic and fast. Exercising a real
-      # `go run` would need a fixture under tests/evals/go plus actions/setup-go.
+      # Most of these tests stub `go` through BRAINTRUST_EVAL_GO_BIN so they stay
+      # hermetic; the real toolchain checks how `go list` reports paths on each
+      # platform.
       - name: Run Go eval unit tests
-        run: "cargo test --bin bt -- eval::tests::go:: go_runner::tests::"
+        run: "cargo test --locked --bin bt -- eval::tests::go:: go_runner::tests::"
 
   eval-tests-node:
     name: eval-tests-node (node ${{ matrix.node-version }})

@@ -3496,7 +3496,9 @@ fn real_go_binary() -> Option<std::path::PathBuf> {
         return None;
     }
     let goroot = String::from_utf8(output.stdout).ok()?;
-    let go = Path::new(goroot.trim()).join("bin").join("go");
+    let go = Path::new(goroot.trim())
+        .join("bin")
+        .join(format!("go{}", std::env::consts::EXE_SUFFIX));
     go.is_file().then_some(go)
 }
 
