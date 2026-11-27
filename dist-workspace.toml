@@ -7,6 +7,8 @@ members = ["cargo:."]
 allow-dirty = ["ci"]
 # The preferred dist version to use in CI (Cargo.toml SemVer syntax)
 cargo-dist-version = "0.31.0"
+# Sign macOS binaries before cargo-dist packages them.
+macos-sign = true
 # CI backends to support
 ci = "github"
 # Whether dist should create a Github Release or use an existing draft
