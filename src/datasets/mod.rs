@@ -112,6 +112,9 @@ enum DatasetsCommands {
     /// Create a new dataset, optionally seeding rows from a file, --rows, or stdin
     Create(CreateArgs),
     /// Upsert remote dataset rows by record id
+    ///
+    /// Include a tags array of unique strings to replace a row's tags. Use [] to clear
+    /// the tags or omit the field to preserve them. A row can contain just its id and tags.
     #[command(visible_aliases = ["add", "refresh"])]
     Update(UpdateArgs),
     /// View a dataset

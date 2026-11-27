@@ -8,7 +8,7 @@ use std::{
 use anyhow::{anyhow, bail, Context, Result};
 use chrono::Utc;
 use serde::{Deserialize, Deserializer};
-use serde_json::{Map, Value};
+use serde_json::{json, Map, Value};
 
 use crate::utils::{lookup_object_path, new_uuid_id};
 
@@ -67,6 +67,10 @@ impl PreparedDatasetRecord {
                 "tags".to_string(),
                 Value::Array(tags.iter().cloned().map(Value::String).collect()),
             );
+            if is_merge {
+                // Tags are unioned by default on merge. Replace the entire array.
+                row.insert("_merge_paths".to_string(), json!([["tags"]]));
+            }
         }
         if let Some(origin) = &self.origin {
             row.insert("origin".to_string(), origin.clone());
@@ -209,7 +213,7 @@ fn expect_record_object(value: Value, record_number: Option<usize>) -> Result<Ma
 pub(crate) fn prepare_records(
     raw_records: Vec<Map<String, Value>>,
     id_field: &str,
-    require_ids: bool,
+    is_update: bool,
 ) -> Result<Vec<PreparedDatasetRecord>> {
     let id_path = parse_id_field_path(id_field)?;
     let id_root = id_path.first().cloned().expect("id path must be non-empty");
@@ -217,10 +221,26 @@ pub(crate) fn prepare_records(
     let mut seen_ids = HashSet::new();
 
     for (row_index, raw_record) in raw_records.into_iter().enumerate() {
+        let updates_tags = is_update && raw_record.contains_key("tags");
         let (input_record, explicit_id) =
             deserialize_input_record(raw_record, &id_path, &id_root, row_index)?;
+        if updates_tags {
+            let tags = input_record.tags.as_ref().ok_or_else(|| {
+                anyhow!(
+                    "dataset record {} tags must be an array of strings",
+                    row_index + 1
+                )
+            })?;
+            let mut seen_tags = HashSet::new();
+            if !tags.iter().all(|tag| seen_tags.insert(tag)) {
+                bail!(
+                    "dataset record {} tags must not contain duplicates",
+                    row_index + 1
+                );
+            }
+        }
         let record =
-            prepare_record_from_input(input_record, explicit_id, id_field, require_ids, row_index)?;
+            prepare_record_from_input(input_record, explicit_id, id_field, is_update, row_index)?;
         if !seen_ids.insert(record.id.clone()) {
             bail!("duplicate dataset record id '{}' in input", record.id);
         }
@@ -543,6 +563,70 @@ mod tests {
     }
 
     #[test]
+    fn update_rows_replace_tags_only_when_provided() {
+        let records = load_refresh_records(
+            None,
+            Some(
+                r#"[
+                    {"id":"case-1","tags":["reviewed","verified"]},
+                    {"id":"case-2","tags":[],"expected":"gold"},
+                    {"id":"case-3","expected":"gold"},
+                    {"id":"case-4"}
+                ]"#,
+            ),
+            "id",
+        )
+        .expect("valid update rows");
+
+        let mut updates = records
+            .iter()
+            .map(|record| record.to_upload_row("dataset_1", true))
+            .collect::<Vec<_>>();
+        for row in &mut updates {
+            assert_eq!(row.remove("dataset_id"), Some(json!("dataset_1")));
+            assert_eq!(row.remove("_is_merge"), Some(json!(true)));
+            assert!(row.remove("created").is_some());
+        }
+        assert_eq!(
+            json!(updates),
+            json!([
+                {"id": "case-1", "tags": ["reviewed", "verified"], "_merge_paths": [["tags"]]},
+                {"id": "case-2", "tags": [], "expected": "gold", "_merge_paths": [["tags"]]},
+                {"id": "case-3", "expected": "gold"},
+                {"id": "case-4"}
+            ])
+        );
+
+        let inserted = records[0].to_upload_row("dataset_1", false);
+        assert!(!inserted.contains_key("_merge_paths"));
+        assert_eq!(inserted.get("tags"), Some(&json!(["reviewed", "verified"])));
+    }
+
+    #[test]
+    fn load_refresh_records_rejects_duplicate_tags() {
+        let err = load_refresh_records(
+            None,
+            Some(r#"[{"id":"case-1","tags":[]},{"id":"case-2","tags":["smoke","smoke"]}]"#),
+            "id",
+        )
+        .expect_err("update should reject duplicate tags");
+        assert_eq!(
+            err.to_string(),
+            "dataset record 2 tags must not contain duplicates"
+        );
+    }
+
+    #[test]
+    fn load_refresh_records_rejects_null_tags() {
+        let err = load_refresh_records(None, Some(r#"[{"id":"case-1","tags":null}]"#), "id")
+            .expect_err("update should require an array when tags are provided");
+        assert_eq!(
+            err.to_string(),
+            "dataset record 1 tags must be an array of strings"
+        );
+    }
+
+    #[test]
     fn prepare_records_rejects_duplicate_ids() {
         let first = serde_json::from_value(serde_json::json!({"id": "dup"})).expect("map");
         let second = serde_json::from_value(serde_json::json!({"id": "dup"})).expect("map");
@@ -654,21 +738,6 @@ mod tests {
         );
         assert!(row.get("output").is_none());
         assert!(row.get("_is_merge").is_none());
-    }
-
-    #[test]
-    fn to_upload_row_marks_merge_rows() {
-        let record = PreparedDatasetRecord {
-            id: "case-1".to_string(),
-            input: None,
-            expected: None,
-            metadata: None,
-            tags: None,
-            origin: None,
-        };
-
-        let row = record.to_upload_row("dataset_1", true);
-        assert_eq!(row.get("_is_merge"), Some(&Value::Bool(true)));
     }
 
     #[test]
