@@ -2,7 +2,7 @@
 
 ## Current Limitations
 
-- `bt eval` is currently Unix-only (Linux/macOS). Windows support is planned.
+- On Windows, `bt eval` supports JavaScript/TypeScript and Python evals. Go eval support on Windows is in progress.
 
 ## Install
 

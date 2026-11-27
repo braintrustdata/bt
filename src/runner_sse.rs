@@ -194,7 +194,6 @@ where
     }
 }
 
-#[cfg(unix)]
 pub(crate) async fn forward_stream<T, F>(
     stream: T,
     name: &'static str,
@@ -289,10 +288,20 @@ fn abort_unconnected_sse(sse_task: &mut tokio::task::JoinHandle<()>, sse_connect
     }
 }
 
-#[cfg(all(test, unix))]
+#[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(unix)]
     use std::os::unix::process::ExitStatusExt;
+    #[cfg(windows)]
+    use std::os::windows::process::ExitStatusExt;
+
+    fn exit_status_with_code(code: u8) -> ExitStatus {
+        #[cfg(unix)]
+        return ExitStatus::from_raw(i32::from(code) << 8);
+        #[cfg(windows)]
+        return ExitStatus::from_raw(u32::from(code));
+    }
 
     // A runner that dies fast (e.g. `go run` on a package that fails to
     // compile) can exit and close its pipes before the forwarded stderr lines
@@ -305,7 +314,7 @@ mod tests {
         }
         drop(tx);
 
-        let wait = Box::pin(async { Ok(ExitStatus::from_raw(1 << 8)) });
+        let wait = Box::pin(async { Ok(exit_status_with_code(1)) });
         let mut sse_task = tokio::spawn(async {});
         let sse_connected = AtomicBool::new(false);
         let mut received = Vec::new();

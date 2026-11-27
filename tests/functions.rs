@@ -1,5 +1,5 @@
 mod common;
-use common::command_exists;
+use common::{command_exists, find_python};
 use std::collections::BTreeMap;
 use std::fs;
 #[cfg(unix)]
@@ -43,20 +43,6 @@ fn default_expect_success() -> bool {
 
 fn repo_root() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-}
-
-fn find_python() -> Option<String> {
-    for candidate in ["python3", "python"] {
-        let Ok(status) = Command::new(candidate).arg("--version").status() else {
-            continue;
-        };
-        if status.success() {
-            return Some(candidate.to_string());
-        }
-    }
-    assert!(!common::in_ci(), "Python is required in CI");
-    assert!(!common::in_ci(), "Python is required in CI");
-    None
 }
 
 fn run_git(cwd: &Path, args: &[&str]) {

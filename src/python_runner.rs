@@ -83,30 +83,14 @@ pub fn find_binary_in_path(candidates: &[&str]) -> Option<PathBuf> {
     for dir in std::env::split_paths(&paths) {
         for candidate in candidates {
             let path = dir.join(candidate);
-            if path.is_file() {
-                return Some(path);
-            }
-            if cfg!(windows) {
-                let exe = with_windows_extensions(&path);
-                for candidate_path in exe {
-                    if candidate_path.is_file() {
-                        return Some(candidate_path);
-                    }
-                }
+            if let Some(found) =
+                crate::js_runner::executable_candidates(&path).find(|path| path.is_file())
+            {
+                return Some(found);
             }
         }
     }
     None
-}
-
-#[cfg(windows)]
-fn with_windows_extensions(path: &Path) -> [PathBuf; 2] {
-    [path.with_extension("exe"), path.with_extension("cmd")]
-}
-
-#[cfg(not(windows))]
-fn with_windows_extensions(_path: &Path) -> [PathBuf; 0] {
-    []
 }
 
 #[cfg(test)]

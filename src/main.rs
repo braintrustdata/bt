@@ -11,11 +11,9 @@ mod datasets;
 mod env;
 mod environments;
 mod error;
-#[cfg(unix)]
 mod eval;
 mod experiments;
 mod functions;
-#[cfg(unix)]
 mod go_runner;
 mod http;
 mod init;
@@ -159,7 +157,6 @@ enum Commands {
     CustomViews(CLIArgs<custom_views::CustomViewsArgs>),
     /// Push, preview, and manage preprocessors
     Preprocessors(CLIArgs<preprocessors::PreprocessorsArgs>),
-    #[cfg(unix)]
     /// Run eval files
     Eval(CLIArgs<eval::EvalArgs>),
     /// Manage projects
@@ -214,7 +211,6 @@ impl Commands {
             Commands::View(cmd) => &cmd.base,
             Commands::CustomViews(cmd) => &cmd.base,
             Commands::Preprocessors(cmd) => &cmd.base,
-            #[cfg(unix)]
             Commands::Eval(cmd) => &cmd.base,
             Commands::Projects(cmd) => &cmd.base,
             Commands::Observability(cmd) => &cmd.base,
@@ -248,7 +244,6 @@ impl Commands {
             Commands::View(cmd) => &mut cmd.base,
             Commands::CustomViews(cmd) => &mut cmd.base,
             Commands::Preprocessors(cmd) => &mut cmd.base,
-            #[cfg(unix)]
             Commands::Eval(cmd) => &mut cmd.base,
             Commands::Projects(cmd) => &mut cmd.base,
             Commands::Observability(cmd) => &mut cmd.base,
@@ -405,7 +400,6 @@ fn try_main() -> Result<()> {
             Commands::Sql(cmd) => sql::run(cmd.base, cmd.args).await?,
             Commands::Setup(cmd) => setup::run_setup_top(cmd.base, cmd.args).await?,
             Commands::Docs(cmd) => setup::run_docs_top(cmd.base, cmd.args).await?,
-            #[cfg(unix)]
             Commands::Eval(cmd) => eval::run(cmd.base, cmd.args).await?,
             Commands::Projects(cmd) => projects::run(cmd.base, cmd.args).await?,
             Commands::Observability(cmd) => observability::run(cmd.base, cmd.args).await?,
@@ -752,10 +746,6 @@ mod tests {
         ];
         for deprecated in crate::env::DEPRECATED_BT_ENV_VARS {
             let canonical = crate::env::canonical_env_name(deprecated);
-            if cfg!(not(unix)) && canonical.starts_with("BRAINTRUST_EVAL_") {
-                // `bt eval` is unix-only.
-                continue;
-            }
             assert!(
                 names.contains(&canonical) || non_clap.contains(&canonical.as_str()),
                 "{deprecated} maps to {canonical}, which no CLI arg reads"

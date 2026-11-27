@@ -2730,7 +2730,7 @@ fn build_js_plan(
         return Ok(JsRunnerPlan { cmd: command, kind });
     }
 
-    let mut command = Command::new("npx");
+    let mut command = Command::new(js_runner::npx_program());
     command.arg("--yes").arg("tsx").arg(runner).args(files);
     Ok(JsRunnerPlan {
         cmd: command,
@@ -2748,7 +2748,7 @@ fn build_vite_node_fallback_command(runner: &Path, files: &[String]) -> Result<C
         return Ok(command);
     }
 
-    let mut command = Command::new("npx");
+    let mut command = Command::new(js_runner::npx_program());
     command
         .arg("--yes")
         .arg("vite-node")
