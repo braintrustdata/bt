@@ -4632,6 +4632,72 @@ mod tests {
     mod go {
         use super::*;
 
+        /// The real toolchain, or `None` when Go is not installed or does not run
+        /// (for example, a mise shim with no version selected). CI jobs that list
+        /// `go` in `BT_EVAL_REQUIRED_RUNTIMES` fail instead of skipping.
+        fn real_go_toolchain() -> Option<PathBuf> {
+            let go = go_runner::resolve_go_toolchain(&[]).filter(|go| {
+                std::process::Command::new(go)
+                    .arg("version")
+                    .output()
+                    .is_ok_and(|output| output.status.success())
+            });
+            let required = std::env::var("BT_EVAL_REQUIRED_RUNTIMES")
+                .unwrap_or_default()
+                .split(',')
+                .any(|runtime| runtime.trim().eq_ignore_ascii_case("go"));
+            assert!(
+                go.is_some() || !required,
+                "go runtime is required but not installed"
+            );
+            go
+        }
+
+        // Path handling is what differs by platform, so check it against what a
+        // real `go list` reports rather than hand-written JSON.
+        #[test]
+        fn list_packages_reads_a_real_module() {
+            // Other tests clear PATH and GOROOT.
+            let _guard = lock_env();
+            let Some(go) = real_go_toolchain() else {
+                eprintln!("skipping: no Go toolchain installed");
+                return;
+            };
+            let module = make_temp_dir("real-module");
+            fs::write(
+                module.join("go.mod"),
+                "module example.test/goevals\n\ngo 1.21\n",
+            )
+            .expect("go.mod written");
+            let package = module.join("cmd").join("a");
+            fs::create_dir_all(&package).expect("package dir should be created");
+            fs::write(package.join("main.go"), "package main\n\nfunc main() {}\n")
+                .expect("main.go written");
+            fs::write(package.join("main_test.go"), "package main\n").expect("test written");
+
+            assert!(go_runner::in_go_module(&package));
+            let packages = go_runner::list_packages(&go, &["./...".to_string()], &module)
+                .expect("go list should succeed");
+
+            let canonical = |p: &Path| dunce::canonicalize(p).expect("path should canonicalize");
+            assert_eq!(packages.len(), 1, "got {packages:?}");
+            let pkg = &packages[0];
+            assert_eq!(pkg.import_path, "example.test/goevals/cmd/a");
+            assert_eq!(pkg.name, "main");
+            assert!(!pkg.is_eval_runner(), "does not import the eval runner");
+            assert_eq!(canonical(&pkg.dir), canonical(&package));
+            let module_dir = pkg.module.as_ref().and_then(|m| m.dir.as_deref());
+            assert_eq!(module_dir.map(canonical), Some(canonical(&module)));
+            let files = pkg.absolute_go_files();
+            assert_eq!(files.len(), 1, "test files are not build inputs: {files:?}");
+            assert_eq!(
+                canonical(Path::new(&files[0])),
+                canonical(&package.join("main.go"))
+            );
+
+            let _ = fs::remove_dir_all(&module);
+        }
+
         #[test]
         fn detect_eval_language_detects_go_extension() {
             let files = vec!["evals/classifier_eval.go".to_string()];
