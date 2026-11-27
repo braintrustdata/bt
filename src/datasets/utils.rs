@@ -32,7 +32,7 @@ pub(crate) async fn submit_rows(
     spinner_label: &str,
     error_context: &str,
 ) -> Result<()> {
-    let mut uploader = dataset_uploader(ctx)?;
+    let uploader = dataset_uploader(ctx)?;
     with_spinner_visible(
         spinner_label,
         async {

@@ -2698,7 +2698,7 @@ fn build_time_filter_clause(window: &str, extra_filter: Option<&str>) -> Result<
 }
 
 async fn submit_logs_batch(
-    uploader: &mut Logs3BatchUploader,
+    uploader: &Logs3BatchUploader,
     rows: &[Map<String, Value>],
     page_size: usize,
 ) -> Result<usize> {
@@ -2711,12 +2711,12 @@ async fn submit_logs_batch(
 
 fn spawn_push_upload_task(
     join_set: &mut tokio::task::JoinSet<Result<PushBatchResult>>,
-    mut uploader: Logs3BatchUploader,
+    uploader: Logs3BatchUploader,
     work: PushBatchWork,
     page_size: usize,
 ) {
     join_set.spawn(async move {
-        let bytes = submit_logs_batch(&mut uploader, &work.rows, page_size).await?;
+        let bytes = submit_logs_batch(&uploader, &work.rows, page_size).await?;
         Ok(PushBatchResult {
             batch_index: work.batch_index,
             row_count: work.rows.len(),
