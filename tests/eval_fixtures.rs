@@ -380,10 +380,15 @@ fn eval_runner_list_mode_serializes_parameter_defaults() {
         .join("eval-ts-node-only");
     ensure_dependencies(&fixture_dir);
 
+    // Windows cannot spawn the extensionless shell shim next to `ts-node.cmd`.
     let runner = fixture_dir
         .join("node_modules")
         .join(".bin")
-        .join("ts-node");
+        .join(if cfg!(windows) {
+            "ts-node.cmd"
+        } else {
+            "ts-node"
+        });
     if !runner.is_file() || !js_module_resolves(&fixture_dir, "zod") {
         install_js_dependencies(&fixture_dir);
     }

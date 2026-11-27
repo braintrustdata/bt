@@ -101,7 +101,10 @@ pub fn find_js_runner_binary(files: &[PathBuf]) -> Option<PathBuf> {
 
 pub fn resolve_js_runner_command(runner: &str, files: &[PathBuf]) -> PathBuf {
     if is_path_like_runner(runner) {
-        return PathBuf::from(runner);
+        let path = Path::new(runner);
+        return executable_candidates(path)
+            .find(|candidate| candidate.is_file())
+            .unwrap_or_else(|| path.to_path_buf());
     }
 
     find_node_module_bin_for_files(runner, files)
@@ -209,7 +212,14 @@ pub fn is_ts_node_runner_path(runner_command: &Path) -> bool {
 /// Windows, which `CreateProcess` cannot run, so Windows tries launchers first.
 pub(crate) fn executable_candidates(path: &Path) -> impl Iterator<Item = PathBuf> {
     let windows_launchers = if cfg!(windows) {
-        vec![path.with_extension("exe"), path.with_extension("cmd")]
+        [".exe", ".cmd"]
+            .iter()
+            .map(|suffix| {
+                let mut candidate = path.as_os_str().to_os_string();
+                candidate.push(suffix);
+                PathBuf::from(candidate)
+            })
+            .collect()
     } else {
         Vec::new()
     };
@@ -277,12 +287,12 @@ mod tests {
 
     #[test]
     fn executable_candidates_prefer_windows_launchers() {
-        let base = Path::new("node_modules/.bin/tsx");
+        let base = Path::new("bin/python3.12");
         let candidates: Vec<PathBuf> = executable_candidates(base).collect();
         let expected: Vec<PathBuf> = if cfg!(windows) {
             vec![
-                base.with_extension("exe"),
-                base.with_extension("cmd"),
+                PathBuf::from("bin/python3.12.exe"),
+                PathBuf::from("bin/python3.12.cmd"),
                 base.into(),
             ]
         } else {
