@@ -82,13 +82,20 @@ pub fn resolve_go_toolchain(env_overrides: &[&str]) -> Option<PathBuf> {
     }
 
     if let Some(goroot) = std::env::var_os("GOROOT") {
-        let candidate = PathBuf::from(goroot).join("bin").join("go");
-        if candidate.is_file() {
-            return Some(candidate);
+        if let Some(go) = go_in_goroot(Path::new(&goroot)) {
+            return Some(go);
         }
     }
 
     crate::python_runner::find_binary_in_path(&["go"])
+}
+
+/// The `go` executable inside a Go installation, which is `go.exe` on Windows.
+fn go_in_goroot(goroot: &Path) -> Option<PathBuf> {
+    let candidate = goroot
+        .join("bin")
+        .join(format!("go{}", std::env::consts::EXE_SUFFIX));
+    candidate.is_file().then_some(candidate)
 }
 
 /// Resolves `--runner` for Go, which names a prebuilt eval binary rather than
@@ -348,11 +355,12 @@ mod tests {
         assert_eq!(packages.len(), 2);
         assert_eq!(packages[0].import_path, "example.test/a");
         assert_eq!(packages[1].name, "b");
+        let dir = Path::new("/repo/a");
         assert_eq!(
             packages[0].absolute_go_files(),
             vec![
-                "/repo/a/main.go".to_string(),
-                "/repo/a/classifier.go".to_string()
+                dir.join("main.go").to_string_lossy().into_owned(),
+                dir.join("classifier.go").to_string_lossy().into_owned()
             ]
         );
     }
@@ -446,11 +454,86 @@ mod tests {
 
         assert!(!is_go_eval_runner_binary(&dir.join("missing")));
         #[cfg(unix)]
-        assert!(
-            !is_go_eval_runner_binary(Path::new("/bin/sh")),
-            "a native non-Go binary"
-        );
+        let native = PathBuf::from("/bin/sh");
+        #[cfg(windows)]
+        let native = PathBuf::from(std::env::var_os("SystemRoot").expect("SystemRoot is set"))
+            .join("System32")
+            .join("cmd.exe");
+        assert!(native.is_file(), "missing {}", native.display());
+        assert!(!is_go_eval_runner_binary(&native), "a native non-Go binary");
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn go_in_goroot_finds_the_platform_executable() {
+        let goroot = make_temp_dir("goroot");
+        assert_eq!(go_in_goroot(&goroot), None, "empty GOROOT");
+
+        let bin = goroot.join("bin");
+        std::fs::create_dir_all(&bin).expect("bin dir should be created");
+        let go = bin.join(format!("go{}", std::env::consts::EXE_SUFFIX));
+        std::fs::write(&go, b"").expect("go written");
+        assert_eq!(go_in_goroot(&goroot), Some(go));
+
+        let _ = std::fs::remove_dir_all(&goroot);
+    }
+
+    /// The real toolchain, or `None` when Go is not installed. CI jobs that list
+    /// `go` in `BT_EVAL_REQUIRED_RUNTIMES` fail instead of skipping.
+    fn real_go_toolchain() -> Option<PathBuf> {
+        let go = resolve_go_toolchain(&["BRAINTRUST_EVAL_GO_BIN", "BRAINTRUST_EVAL_GO"]);
+        let required = std::env::var("BT_EVAL_REQUIRED_RUNTIMES")
+            .unwrap_or_default()
+            .split(',')
+            .any(|runtime| runtime.trim().eq_ignore_ascii_case("go"));
+        assert!(
+            go.is_some() || !required,
+            "go runtime is required but not installed"
+        );
+        go
+    }
+
+    // Path handling is what differs by platform, so check it against what a
+    // real `go list` reports rather than hand-written JSON.
+    #[test]
+    fn list_packages_reads_a_real_module() {
+        let Some(go) = real_go_toolchain() else {
+            eprintln!("skipping: no Go toolchain installed");
+            return;
+        };
+        let module = make_temp_dir("real-module");
+        std::fs::write(
+            module.join("go.mod"),
+            "module example.test/goevals\n\ngo 1.21\n",
+        )
+        .expect("go.mod written");
+        let package = module.join("cmd").join("a");
+        std::fs::create_dir_all(&package).expect("package dir should be created");
+        std::fs::write(package.join("main.go"), "package main\n\nfunc main() {}\n")
+            .expect("main.go written");
+        std::fs::write(package.join("main_test.go"), "package main\n").expect("test written");
+
+        assert!(in_go_module(&package));
+        let packages =
+            list_packages(&go, &["./...".to_string()], &module).expect("go list should succeed");
+
+        let canonical = |p: &Path| dunce::canonicalize(p).expect("path should canonicalize");
+        assert_eq!(packages.len(), 1, "got {packages:?}");
+        let pkg = &packages[0];
+        assert_eq!(pkg.import_path, "example.test/goevals/cmd/a");
+        assert_eq!(pkg.name, "main");
+        assert!(!pkg.is_eval_runner(), "does not import the eval runner");
+        assert_eq!(canonical(&pkg.dir), canonical(&package));
+        let module_dir = pkg.module.as_ref().and_then(|m| m.dir.as_deref());
+        assert_eq!(module_dir.map(canonical), Some(canonical(&module)));
+        let files = pkg.absolute_go_files();
+        assert_eq!(files.len(), 1, "test files are not build inputs: {files:?}");
+        assert_eq!(
+            canonical(Path::new(&files[0])),
+            canonical(&package.join("main.go"))
+        );
+
+        let _ = std::fs::remove_dir_all(&module);
     }
 }

@@ -2606,20 +2606,33 @@ fn discover_go_eval_packages(dir: &str, exclude_default_dirs: bool) -> Result<Op
 /// Renders a package directory for a command hint: relative to the cwd when it
 /// sits below it, absolute otherwise.
 fn display_go_package_dir(dir: &Path) -> String {
+    match std::env::current_dir() {
+        Ok(cwd) => display_go_package_dir_from(dir, &cwd),
+        Err(_) => dir.display().to_string(),
+    }
+}
+
+/// Like [`display_go_package_dir`], relative to `cwd`.
+fn display_go_package_dir_from(dir: &Path, cwd: &Path) -> String {
     // Canonicalize both sides: `go list` and the cwd can disagree about
     // symlinked prefixes such as macOS's `/tmp` -> `/private/tmp`.
-    let canonical = |p: &Path| std::fs::canonicalize(p).unwrap_or_else(|_| p.to_path_buf());
-    std::env::current_dir()
-        .ok()
-        .and_then(|cwd| {
-            canonical(dir)
-                .strip_prefix(canonical(&cwd))
-                .ok()
-                .map(Path::to_path_buf)
-        })
-        .filter(|relative| !relative.as_os_str().is_empty())
-        .map(|relative| format!("./{}", relative.display()))
-        .unwrap_or_else(|| dir.display().to_string())
+    let canonical = |p: &Path| dunce::canonicalize(p).unwrap_or_else(|_| p.to_path_buf());
+    let Ok(relative) = canonical(dir)
+        .strip_prefix(canonical(cwd))
+        .map(Path::to_path_buf)
+    else {
+        return dir.display().to_string();
+    };
+    if relative.as_os_str().is_empty() {
+        return dir.display().to_string();
+    }
+    // `go` reads `./` as a relative package path on every platform, so join with
+    // `/` rather than Windows' `\`.
+    let parts: Vec<_> = relative
+        .components()
+        .map(|c| c.as_os_str().to_string_lossy())
+        .collect();
+    format!("./{}", parts.join("/"))
 }
 
 fn validate_eval_input_files(files: &[String]) -> Result<()> {
@@ -2896,7 +2909,9 @@ fn go_package_dir(files: &[String]) -> Result<PathBuf> {
         };
         // Canonicalize so the same directory reached by different paths counts
         // once, and so the argument stays valid if we change the working dir.
-        dirs.insert(std::fs::canonicalize(&dir).unwrap_or(dir));
+        // `dunce` keeps Windows paths in their usual `C:\...` form rather than
+        // the verbatim `\\?\C:\...` form `std` returns.
+        dirs.insert(dunce::canonicalize(&dir).unwrap_or(dir));
     }
 
     match dirs.len() {
@@ -4099,43 +4114,77 @@ mod tests {
     ///
     /// The Go path now delegates package layout to the toolchain, so exercising
     /// it needs a `go` that replies rather than merely a path that exists.
-    #[cfg(unix)]
     fn write_fake_go(dir: &Path, json: &str) -> PathBuf {
-        use std::os::unix::fs::PermissionsExt;
+        write_fake_go_with(dir, json, "", 0)
+    }
 
-        let fake_go = dir.join("go");
-        fs::write(
-            &fake_go,
-            format!("#!/bin/sh\ncat <<'BT_EOF'\n{json}\nBT_EOF\n"),
-        )
-        .expect("fake go written");
-        let mut perms = fs::metadata(&fake_go)
-            .expect("fake go metadata")
-            .permissions();
-        perms.set_mode(0o755);
-        fs::set_permissions(&fake_go, perms).expect("fake go made executable");
+    /// Writes a stub `go` that prints `stdout`, then `stderr` to stderr, and
+    /// exits with `code`: a shell script on Unix, a batch file on Windows.
+    fn write_fake_go_with(dir: &Path, stdout: &str, stderr: &str, code: i32) -> PathBuf {
+        let stdout_path = dir.join("fake-go-stdout.txt");
+        let stderr_path = dir.join("fake-go-stderr.txt");
+        fs::write(&stdout_path, stdout).expect("fake go stdout written");
+        fs::write(&stderr_path, stderr).expect("fake go stderr written");
+
+        #[cfg(unix)]
+        let fake_go = {
+            use std::os::unix::fs::PermissionsExt;
+
+            let fake_go = dir.join("go");
+            fs::write(
+                &fake_go,
+                format!(
+                    "#!/bin/sh\ncat '{}'\ncat '{}' >&2\nexit {code}\n",
+                    stdout_path.display(),
+                    stderr_path.display()
+                ),
+            )
+            .expect("fake go written");
+            fs::set_permissions(&fake_go, fs::Permissions::from_mode(0o755))
+                .expect("fake go made executable");
+            fake_go
+        };
+        #[cfg(windows)]
+        let fake_go = {
+            let fake_go = dir.join("go.cmd");
+            fs::write(
+                &fake_go,
+                format!(
+                    "@type \"{}\"\r\n@type \"{}\" 1>&2\r\n@exit /b {code}\r\n",
+                    stdout_path.display(),
+                    stderr_path.display()
+                ),
+            )
+            .expect("fake go written");
+            fake_go
+        };
         fake_go
     }
 
     /// A single `go list -json` document for `dir` holding `files`.
-    #[cfg(unix)]
     fn go_list_json(dir: &Path, name: &str, files: &[&str], deps: &[&str]) -> String {
-        let quoted = |items: &[&str]| {
-            items
-                .iter()
-                .map(|item| format!("\"{item}\""))
-                .collect::<Vec<_>>()
-                .join(", ")
-        };
-        format!(
-            r#"{{"Dir": "{dir}", "ImportPath": "example.test/evals", "Name": "{name}",
-                 "GoFiles": [{files}], "Deps": [{deps}],
-                 "Module": {{"Path": "example.test", "Dir": "{dir}"}}}}"#,
-            dir = dir.display(),
-            name = name,
-            files = quoted(files),
-            deps = quoted(deps)
-        )
+        go_package_json(dir, "example.test/evals", name, files, deps, dir)
+    }
+
+    /// A `go list -json` document for the package at `dir` in the module at
+    /// `module_dir`. Built with serde so Windows paths are escaped.
+    fn go_package_json(
+        dir: &Path,
+        import_path: &str,
+        name: &str,
+        files: &[&str],
+        deps: &[&str],
+        module_dir: &Path,
+    ) -> String {
+        serde_json::json!({
+            "Dir": dir,
+            "ImportPath": import_path,
+            "Name": name,
+            "GoFiles": files,
+            "Deps": deps,
+            "Module": {"Path": "example.test", "Dir": module_dir},
+        })
+        .to_string()
     }
 
     fn make_temp_dir(prefix: &str) -> PathBuf {
@@ -4610,7 +4659,6 @@ mod tests {
 
         // A Go eval needs no marker filename: `go list` reports the build inputs,
         // so bt takes whatever the package actually compiles.
-        #[cfg(unix)]
         #[test]
         fn expand_eval_file_globs_go_language_takes_the_packages_build_inputs() {
             let _guard = lock_env();
@@ -4642,7 +4690,6 @@ mod tests {
 
         // Build constraints and `_test.go` exclusion are the toolchain's job now, so
         // whatever `go list` leaves out of GoFiles never reaches bt.
-        #[cfg(unix)]
         #[test]
         fn expand_eval_file_globs_go_language_honours_the_toolchains_file_list() {
             let _guard = lock_env();
@@ -4671,7 +4718,6 @@ mod tests {
             let _ = fs::remove_dir_all(&dir);
         }
 
-        #[cfg(unix)]
         #[test]
         fn expand_eval_file_globs_go_language_errors_on_dir_without_go_files() {
             let _guard = lock_env();
@@ -4698,7 +4744,6 @@ mod tests {
         // The point of asking `go list`: bt finds Go evals with no naming convention
         // at all. An eval runner is a `package main` that imports the SDK runner, so
         // arbitrary filenames work and unrelated main packages are left alone.
-        #[cfg(unix)]
         #[test]
         fn expand_eval_file_globs_discovers_go_evals_without_a_naming_convention() {
             let _guard = lock_env();
@@ -4712,16 +4757,23 @@ mod tests {
 
             // Neither eval file carries a marker suffix.
             let json = format!(
-                r#"{{"Dir": "{evals}", "ImportPath": "example.test/evals", "Name": "main",
-                      "GoFiles": ["classifier.go", "main.go"], "Deps": ["fmt", "{runner}"],
-                      "Module": {{"Path": "example.test", "Dir": "{root}"}}}}
-                   {{"Dir": "{cli}", "ImportPath": "example.test/cmd/cli", "Name": "main",
-                      "GoFiles": ["main.go"], "Deps": ["fmt"],
-                      "Module": {{"Path": "example.test", "Dir": "{root}"}}}}"#,
-                evals = evals_dir.display(),
-                cli = cli_dir.display(),
-                root = dir.display(),
-                runner = go_runner::EVAL_RUNNER_IMPORT
+                "{}\n{}",
+                go_package_json(
+                    &evals_dir,
+                    "example.test/evals",
+                    "main",
+                    &["classifier.go", "main.go"],
+                    &["fmt", go_runner::EVAL_RUNNER_IMPORT],
+                    &dir,
+                ),
+                go_package_json(
+                    &cli_dir,
+                    "example.test/cmd/cli",
+                    "main",
+                    &["main.go"],
+                    &["fmt"],
+                    &dir,
+                )
             );
             let fake_go = write_fake_go(&dir, &json);
             let previous = set_env_var(
@@ -4748,7 +4800,6 @@ mod tests {
         // Eval-named files in excluded folders (a virtualenv's `openai` package ships
         // `eval_*.py` files) must not stop bare `bt eval` from falling back to Go,
         // and Go eval runners inside those folders must not be picked up either.
-        #[cfg(unix)]
         #[test]
         fn default_discovery_ignores_excluded_dirs_before_go_fallback() {
             let _guard = lock_env();
@@ -4769,15 +4820,23 @@ mod tests {
 
             // `go list ./...` skips `vendor` and dot-dirs but still walks `node_modules`.
             let json = format!(
-                r#"{{"Dir": "{eval}", "ImportPath": "example.test/cmd/a", "Name": "main",
-                      "GoFiles": ["main.go"], "Deps": ["{runner}"],
-                      "Module": {{"Path": "example.test", "Dir": "{root}"}}}}
-                   {{"Dir": "{root}/node_modules/x/cmd", "ImportPath": "example.test/node_modules/x/cmd",
-                      "Name": "main", "GoFiles": ["main.go"], "Deps": ["{runner}"],
-                      "Module": {{"Path": "example.test", "Dir": "{root}"}}}}"#,
-                eval = eval_dir.display(),
-                root = dir.display(),
-                runner = go_runner::EVAL_RUNNER_IMPORT
+                "{}\n{}",
+                go_package_json(
+                    &eval_dir,
+                    "example.test/cmd/a",
+                    "main",
+                    &["main.go"],
+                    &[go_runner::EVAL_RUNNER_IMPORT],
+                    &dir,
+                ),
+                go_package_json(
+                    &dir.join("node_modules").join("x").join("cmd"),
+                    "example.test/node_modules/x/cmd",
+                    "main",
+                    &["main.go"],
+                    &[go_runner::EVAL_RUNNER_IMPORT],
+                    &dir,
+                )
             );
             let fake_go = write_fake_go(&dir, &json);
             let previous = set_env_var(
@@ -4795,7 +4854,10 @@ mod tests {
             restore_env_var("BRAINTRUST_EVAL_GO_BIN", previous);
 
             assert_eq!(result.len(), 1, "unexpected matches: {result:?}");
-            assert!(result[0].ends_with("cmd/a/main.go"), "got {result:?}");
+            assert!(
+                Path::new(&result[0]).ends_with(Path::new("cmd").join("a").join("main.go")),
+                "got {result:?}"
+            );
 
             let _ = fs::remove_dir_all(&dir);
         }
@@ -4885,7 +4947,6 @@ mod tests {
             assert!(format!("{err:#}").contains("--runner binary not found"));
         }
 
-        #[cfg(unix)]
         #[test]
         fn build_go_command_runs_the_package_directory() {
             let _guard = lock_env();
@@ -4919,7 +4980,6 @@ mod tests {
 
         // `go run` needs `package main`, and a main that never links evalrunner
         // would run zero evals and exit 0. Both get a pointed error up front.
-        #[cfg(unix)]
         #[test]
         fn build_go_command_rejects_unrunnable_packages() {
             let cases: [(&str, &str, &[&str], &[&str]); 2] = [
@@ -4980,7 +5040,6 @@ mod tests {
         // A Go binary cannot report its own sources, so bt watches the package
         // directory (whose mtime changes when files come and go) plus the files
         // `go list` says the build uses.
-        #[cfg(unix)]
         #[test]
         fn collect_go_static_dependencies_covers_the_package() {
             let _guard = lock_env();
@@ -5012,6 +5071,28 @@ mod tests {
             assert!(
                 !names.iter().any(|n| n == "main_test.go"),
                 "test files are not part of the build: {names:?}"
+            );
+
+            let _ = fs::remove_dir_all(&dir);
+        }
+
+        // `go` reads `./cmd/a` as a relative package path on every platform, so
+        // the hint uses `/` even where the native separator is `\`.
+        #[test]
+        fn display_go_package_dir_is_relative_with_forward_slashes() {
+            let dir = make_temp_dir("go-display");
+            let package = dir.join("cmd").join("a");
+            fs::create_dir_all(&package).expect("package dir");
+
+            assert_eq!(display_go_package_dir_from(&package, &dir), "./cmd/a");
+            assert_eq!(
+                display_go_package_dir_from(&dir, &package),
+                dir.display().to_string(),
+                "a directory above the cwd stays absolute"
+            );
+            assert_eq!(
+                display_go_package_dir_from(&dir, &dir),
+                dir.display().to_string()
             );
 
             let _ = fs::remove_dir_all(&dir);
@@ -5079,11 +5160,8 @@ mod tests {
             let _ = fs::remove_dir_all(&dir);
         }
 
-        #[cfg(unix)]
         #[test]
         fn default_discovery_in_go_module_reports_the_go_list_error() {
-            use std::os::unix::fs::PermissionsExt;
-
             let _guard = lock_env();
             let dir = make_temp_dir("go-576-broken-mod");
             fs::write(
@@ -5091,13 +5169,12 @@ mod tests {
                 "module example.com/test-goevals\ngarbage\n",
             )
             .expect("go.mod");
-            let fake_go = dir.join("go");
-            fs::write(
-                &fake_go,
-                "#!/bin/sh\necho 'go: errors parsing go.mod:' >&2\necho 'go.mod:2: unknown directive: garbage' >&2\nexit 1\n",
-            )
-            .expect("fake go written");
-            fs::set_permissions(&fake_go, fs::Permissions::from_mode(0o755)).expect("chmod");
+            let fake_go = write_fake_go_with(
+                &dir,
+                "",
+                "go: errors parsing go.mod:\ngo.mod:2: unknown directive: garbage\n",
+                1,
+            );
             let previous = set_env_var(
                 "BRAINTRUST_EVAL_GO_BIN",
                 fake_go.to_str().expect("utf-8 path"),
@@ -5117,7 +5194,6 @@ mod tests {
             let _ = fs::remove_dir_all(&dir);
         }
 
-        #[cfg(unix)]
         #[test]
         fn default_discovery_in_go_module_reports_packages_without_the_runner() {
             let _guard = lock_env();
@@ -5125,7 +5201,7 @@ mod tests {
             fs::write(dir.join("go.mod"), "module example.com/test-goevals\n").expect("go.mod");
             let json = format!(
                 "{}\n{}",
-                go_list_json(&dir.join("cmd/a"), "main", &["main.go"], &["fmt"]),
+                go_list_json(&dir.join("cmd").join("a"), "main", &["main.go"], &["fmt"]),
                 go_list_json(&dir.join("lib"), "lib", &["lib.go"], &[])
             );
             let fake_go = write_fake_go(&dir, &json);
@@ -5150,18 +5226,19 @@ mod tests {
             let _ = fs::remove_dir_all(&dir);
         }
 
-        #[cfg(unix)]
         #[test]
         fn default_discovery_in_go_module_reports_excluded_eval_runners() {
             let _guard = lock_env();
             let dir = make_temp_dir("go-576-all-excluded");
             fs::write(dir.join("go.mod"), "module example.com/test-goevals\n").expect("go.mod");
-            let json = format!(
-                r#"{{"Dir": "{root}/node_modules/x/cmd", "ImportPath": "example.com/test-goevals/node_modules/x/cmd",
-                      "Name": "main", "GoFiles": ["main.go"], "Deps": ["{runner}"],
-                      "Module": {{"Path": "example.com/test-goevals", "Dir": "{root}"}}}}"#,
-                root = dir.display(),
-                runner = go_runner::EVAL_RUNNER_IMPORT
+            let excluded_dir = dir.join("node_modules").join("x").join("cmd");
+            let json = go_package_json(
+                &excluded_dir,
+                "example.com/test-goevals/node_modules/x/cmd",
+                "main",
+                &["main.go"],
+                &[go_runner::EVAL_RUNNER_IMPORT],
+                &dir,
             );
             let fake_go = write_fake_go(&dir, &json);
             let previous = set_env_var(
@@ -5177,7 +5254,7 @@ mod tests {
                 "default-excluded directories",
                 "node_modules",
                 "bt eval --language go ",
-                "node_modules/x/cmd`",
+                &format!("{}`", excluded_dir.display()),
             ] {
                 assert!(message.contains(needle), "missing {needle:?}: {message}");
             }
