@@ -325,20 +325,21 @@ jobs:
 
       - name: Build artifacts
         shell: bash
+        env:
+          CODESIGN_IDENTITY: Developer ID Application
+          CODESIGN_CERTIFICATE: ${{ runner.os == 'macOS' && secrets.APPLE_DEVELOPER_CERTIFICATE_P12 || '' }}
+          CODESIGN_CERTIFICATE_PASSWORD: ${{ runner.os == 'macOS' && secrets.APPLE_DEVELOPER_CERTIFICATE_PASSWORD || '' }}
+          CODESIGN_OPTIONS: runtime
         run: |
+          if [ "$RUNNER_OS" = macOS ]; then
+            : "${CODESIGN_CERTIFICATE:?}" "${CODESIGN_CERTIFICATE_PASSWORD:?}"
+          fi
           BT_UPDATE_CHANNEL=stable \
           BT_VERSION_STRING="${{ needs.plan.outputs.release-version }}" \
           dist build ${{ needs.plan.outputs.tag-flag }} --print=linkage --output-format=json ${{ matrix.dist_args }} > dist-manifest.json
           echo "dist ran successfully"
 
-      - name: Import macOS signing certificate
-        if: runner.os == 'macOS'
-        uses: apple-actions/import-codesign-certs@8cd59b36c197ab4209cc6cf6eb93e47835f79b28 # v6
-        with:
-          p12-file-base64: ${{ secrets.APPLE_DEVELOPER_CERTIFICATE_P12 }}
-          p12-password: ${{ secrets.APPLE_DEVELOPER_CERTIFICATE_PASSWORD }}
-
-      - name: Sign and notarize macOS artifacts
+      - name: Notarize macOS artifacts
         if: runner.os == 'macOS'
         shell: bash
         env:
@@ -356,7 +357,6 @@ jobs:
             tar -xzf "$archive" -C "$staging"
             binary=$(find "$staging" -type f -name bt -print)
             [ -f "$binary" ]
-            codesign --force --options runtime --timestamp --sign "Developer ID Application" "$binary"
             codesign --verify --strict --verbose=2 "$binary"
             codesign -dv "$binary" 2>&1 | grep -F "TeamIdentifier=$APPLE_TEAM_ID"
             ditto -c -k "$binary" "$RUNNER_TEMP/bt-notarize.zip"
@@ -364,8 +364,6 @@ jobs:
               --apple-id "$APPLE_ID" --password "$APPLE_APP_SPECIFIC_PASSWORD" \
               --team-id "$APPLE_TEAM_ID" --wait --output-format json)
             echo "$result" | jq -e '.status == "Accepted"'
-            tar -czf "$archive" -C "$staging" "$(basename "$archive" .tar.gz)"
-            shasum -a 256 "$archive" | awk '{print $1 "  " name}' name="$(basename "$archive")" > "$archive.sha256"
             rm -rf "$staging" "$RUNNER_TEMP/bt-notarize.zip"
           done
 
