@@ -331,6 +331,44 @@ jobs:
           dist build ${{ needs.plan.outputs.tag-flag }} --print=linkage --output-format=json ${{ matrix.dist_args }} > dist-manifest.json
           echo "dist ran successfully"
 
+      - name: Import macOS signing certificate
+        if: runner.os == 'macOS'
+        uses: apple-actions/import-codesign-certs@8cd59b36c197ab4209cc6cf6eb93e47835f79b28 # v6
+        with:
+          p12-file-base64: ${{ secrets.APPLE_DEVELOPER_CERTIFICATE_P12 }}
+          p12-password: ${{ secrets.APPLE_DEVELOPER_CERTIFICATE_PASSWORD }}
+
+      - name: Sign and notarize macOS artifacts
+        if: runner.os == 'macOS'
+        shell: bash
+        env:
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_APP_SPECIFIC_PASSWORD: ${{ secrets.APPLE_APP_SPECIFIC_PASSWORD }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+        run: |
+          set -euo pipefail
+          : "${APPLE_ID:?}" "${APPLE_APP_SPECIFIC_PASSWORD:?}" "${APPLE_TEAM_ID:?}"
+          shopt -s nullglob
+          archives=(target/distrib/bt-*-apple-darwin.tar.gz)
+          [ ${#archives[@]} -gt 0 ]
+          for archive in "${archives[@]}"; do
+            staging=$(mktemp -d)
+            tar -xzf "$archive" -C "$staging"
+            binary=$(find "$staging" -type f -name bt -print)
+            [ -f "$binary" ]
+            codesign --force --options runtime --timestamp --sign "Developer ID Application" "$binary"
+            codesign --verify --strict --verbose=2 "$binary"
+            codesign -dv "$binary" 2>&1 | grep -F "TeamIdentifier=$APPLE_TEAM_ID"
+            ditto -c -k "$binary" "$RUNNER_TEMP/bt-notarize.zip"
+            result=$(xcrun notarytool submit "$RUNNER_TEMP/bt-notarize.zip" \
+              --apple-id "$APPLE_ID" --password "$APPLE_APP_SPECIFIC_PASSWORD" \
+              --team-id "$APPLE_TEAM_ID" --wait --output-format json)
+            echo "$result" | jq -e '.status == "Accepted"'
+            tar -czf "$archive" -C "$staging" .
+            shasum -a 256 "$archive" | awk '{print $1 "  " name}' name="$(basename "$archive")" > "$archive.sha256"
+            rm -rf "$staging" "$RUNNER_TEMP/bt-notarize.zip"
+          done
+
       - name: Sign Windows artifacts
         id: sign
         if: ${{ runner.os == 'Windows' && env.HAS_AZURE_SIGNING == 'true' }}
