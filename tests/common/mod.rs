@@ -30,6 +30,20 @@ pub fn command_exists(command: &str) -> bool {
     found
 }
 
+/// Windows Python installs ship `python.exe` but usually no `python3.exe`.
+pub fn find_python() -> Option<String> {
+    let found = ["python3", "python"].into_iter().find(|candidate| {
+        Command::new(candidate)
+            .arg("--version")
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .is_ok_and(|status| status.success())
+    });
+    assert!(found.is_some() || !in_ci(), "Python is required in CI");
+    found.map(str::to_string)
+}
+
 pub fn ensure_python_env(fixtures_root: &Path) -> Option<PathBuf> {
     if !command_exists("uv") {
         assert!(

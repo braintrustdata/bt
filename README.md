@@ -1,9 +1,5 @@
 # Braintrust CLI (`bt`)
 
-## Current Limitations
-
-- `bt eval` is currently Unix-only (Linux/macOS). Windows support is planned.
-
 ## Install
 
 ### Unix (macOS / Linux)
@@ -198,7 +194,7 @@ Remove-Item -Recurse -Force (Join-Path $userProfile ".braintrust\auth") -ErrorAc
 | `bt profiles`      | List, delete, and rename saved login profiles                       |
 | `bt switch`        | Switch org and project context                                      |
 | `bt status`        | Show current org and project context                                |
-| `bt eval`          | Run eval files (Unix only)                                          |
+| `bt eval`          | Run eval files                                                      |
 | `bt trace`         | Trace coding-agent sessions                                         |
 | `bt sql`           | Run SQL queries against Braintrust                                  |
 | `bt view`          | View logs, traces, and spans                                        |
@@ -664,5 +660,4 @@ Skill smoke-test harness:
 
 - Add richer channel controls for `bt update` (for example pinned/branch canary selection).
 - Expand release verification and smoke tests for installer flows across more architectures/environments.
-- Add `bt eval` support on Windows (today, `bt eval` is Unix-only due to Unix socket usage).
 - Add signed artifact verification guidance (signature flow) in install and upgrade docs.

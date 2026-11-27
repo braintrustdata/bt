@@ -1,20 +1,25 @@
 import os
+import threading
 import time
 
 from braintrust import Eval
 
 
 OUTPUT_PATH = os.environ.get("BT_MAX_CONCURRENCY_TEST_OUT")
+# Appends from concurrent tasks are not atomic on Windows.
+OUTPUT_LOCK = threading.Lock()
+
+
+def record(event):
+    if OUTPUT_PATH:
+        with OUTPUT_LOCK, open(OUTPUT_PATH, "a") as output:
+            output.write(f"{event}\n")
 
 
 def task(name, hooks=None):
-    if OUTPUT_PATH:
-        with open(OUTPUT_PATH, "a") as output:
-            output.write(f"start:{name}\n")
+    record(f"start:{name}")
     time.sleep(0.25)
-    if OUTPUT_PATH:
-        with open(OUTPUT_PATH, "a") as output:
-            output.write(f"end:{name}\n")
+    record(f"end:{name}")
     return name
 
 

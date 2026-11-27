@@ -1,5 +1,7 @@
 mod common;
-use common::{bt_binary_path, command_exists, ensure_python_env, python_can_import_braintrust};
+use common::{
+    bt_binary_path, command_exists, ensure_python_env, find_python, python_can_import_braintrust,
+};
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
@@ -378,10 +380,15 @@ fn eval_runner_list_mode_serializes_parameter_defaults() {
         .join("eval-ts-node-only");
     ensure_dependencies(&fixture_dir);
 
+    // Windows cannot spawn the extensionless shell shim next to `ts-node.cmd`.
     let runner = fixture_dir
         .join("node_modules")
         .join(".bin")
-        .join("ts-node");
+        .join(if cfg!(windows) {
+            "ts-node.cmd"
+        } else {
+            "ts-node"
+        });
     if !runner.is_file() || !js_module_resolves(&fixture_dir, "zod") {
         install_js_dependencies(&fixture_dir);
     }
@@ -519,15 +526,15 @@ fn eval_runner_list_mode_serializes_parameter_defaults() {
 #[test]
 fn eval_python_runner_list_mode_uses_sdk_parameter_serializer() {
     let _guard = test_lock();
-    if !command_exists("python3") {
+    let Some(python) = find_python() else {
         if required_runtimes().contains("python") {
             panic!("python runtime is required but unavailable for Python list-mode test");
         }
         eprintln!(
-            "Skipping eval_python_runner_list_mode_uses_sdk_parameter_serializer (python3 not installed)."
+            "Skipping eval_python_runner_list_mode_uses_sdk_parameter_serializer (python not installed)."
         );
         return;
-    }
+    };
 
     let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     let fixture_dir = root.join("target").join(format!(
@@ -696,7 +703,7 @@ Eval("python-remote", parameters=RemoteEvalParameters(), scores=[])
     )
     .expect("write eval file");
 
-    let output = Command::new("python3")
+    let output = Command::new(python)
         .arg(root.join("scripts").join("eval-runner.py"))
         .arg("evals.py")
         .current_dir(&fixture_dir)
@@ -1492,7 +1499,9 @@ fn resolve_runner(dir: &Path, runner: Option<&str>, python: Option<&PathBuf>) ->
 }
 
 fn local_tsx_path(dir: &Path) -> Option<PathBuf> {
-    let tsx_path = dir.join("node_modules").join(".bin").join("tsx");
+    // Windows cannot spawn the extensionless shell shim next to `tsx.cmd`.
+    let name = if cfg!(windows) { "tsx.cmd" } else { "tsx" };
+    let tsx_path = dir.join("node_modules").join(".bin").join(name);
     tsx_path.is_file().then_some(tsx_path)
 }
 

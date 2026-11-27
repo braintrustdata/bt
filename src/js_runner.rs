@@ -73,12 +73,18 @@ pub fn build_js_runner_command(
         return command;
     }
 
-    let mut command = Command::new("npx");
+    let mut command = Command::new(npx_program());
     command.arg("--yes").arg("tsx").arg(runner_script);
     for file in files {
         command.arg(file);
     }
     command
+}
+
+/// Windows installs `npx` as `npx.cmd`, which `Command::new("npx")` does not
+/// resolve, so look it up on PATH first.
+pub fn npx_program() -> PathBuf {
+    find_binary_in_path(&["npx"]).unwrap_or_else(|| PathBuf::from("npx"))
 }
 
 pub fn find_js_runner_binary(files: &[PathBuf]) -> Option<PathBuf> {
@@ -95,7 +101,10 @@ pub fn find_js_runner_binary(files: &[PathBuf]) -> Option<PathBuf> {
 
 pub fn resolve_js_runner_command(runner: &str, files: &[PathBuf]) -> PathBuf {
     if is_path_like_runner(runner) {
-        return PathBuf::from(runner);
+        let path = Path::new(runner);
+        return executable_candidates(path)
+            .find(|candidate| candidate.is_file())
+            .unwrap_or_else(|| path.to_path_buf());
     }
 
     find_node_module_bin_for_files(runner, files)
@@ -165,15 +174,8 @@ fn find_node_module_bin(binary: &str, start: &Path) -> Option<PathBuf> {
     let mut current = Some(start);
     while let Some(dir) = current {
         let base = dir.join("node_modules").join(".bin").join(binary);
-        if base.is_file() {
-            return Some(base);
-        }
-        if cfg!(windows) {
-            for candidate in with_windows_extensions(&base) {
-                if candidate.is_file() {
-                    return Some(candidate);
-                }
-            }
+        if let Some(found) = executable_candidates(&base).find(|path| path.is_file()) {
+            return Some(found);
         }
         current = dir.parent();
     }
@@ -185,40 +187,53 @@ pub fn find_binary_in_path(candidates: &[&str]) -> Option<PathBuf> {
     for dir in std::env::split_paths(&paths) {
         for candidate in candidates {
             let path = dir.join(candidate);
-            if path.is_file() {
-                return Some(path);
-            }
-            if cfg!(windows) {
-                for candidate_path in with_windows_extensions(&path) {
-                    if candidate_path.is_file() {
-                        return Some(candidate_path);
-                    }
-                }
+            if let Some(found) = executable_candidates(&path).find(|path| path.is_file()) {
+                return Some(found);
             }
         }
     }
     None
 }
 
-#[cfg(unix)]
 pub fn runner_bin_name(runner_command: &Path) -> Option<String> {
     let name = runner_command.file_name()?.to_str()?.to_ascii_lowercase();
-    Some(name.strip_suffix(".cmd").unwrap_or(&name).to_string())
+    let name = [".cmd", ".exe"]
+        .iter()
+        .find_map(|suffix| name.strip_suffix(suffix))
+        .unwrap_or(&name);
+    Some(name.to_string())
 }
 
-#[cfg(unix)]
 pub fn is_ts_node_runner_path(runner_command: &Path) -> bool {
     runner_bin_name(runner_command).is_some_and(|name| name == "ts-node" || name == "ts-node-esm")
 }
 
-#[cfg(windows)]
-fn with_windows_extensions(path: &Path) -> [PathBuf; 2] {
-    [path.with_extension("exe"), path.with_extension("cmd")]
-}
-
-#[cfg(not(windows))]
-fn with_windows_extensions(_path: &Path) -> [PathBuf; 0] {
-    []
+/// npm and pnpm install an extensionless POSIX shell shim next to `.cmd` on
+/// Windows, which `CreateProcess` cannot run, so Windows tries launchers first.
+pub(crate) fn executable_candidates(path: &Path) -> impl Iterator<Item = PathBuf> {
+    let has_launcher_extension = path
+        .extension()
+        .and_then(|extension| extension.to_str())
+        .is_some_and(|extension| {
+            ["exe", "cmd", "bat"]
+                .iter()
+                .any(|launcher| extension.eq_ignore_ascii_case(launcher))
+        });
+    let windows_launchers = if cfg!(windows) && !has_launcher_extension {
+        [".exe", ".cmd"]
+            .iter()
+            .map(|suffix| {
+                let mut candidate = path.as_os_str().to_os_string();
+                candidate.push(suffix);
+                PathBuf::from(candidate)
+            })
+            .collect()
+    } else {
+        Vec::new()
+    };
+    windows_launchers
+        .into_iter()
+        .chain(std::iter::once(path.to_path_buf()))
 }
 
 fn ensure_descendant_components_not_symlinks(base: &Path, descendant: &Path) -> Result<()> {
@@ -276,6 +291,48 @@ mod tests {
         assert!(is_path_like_runner("./tsx"));
         assert!(is_path_like_runner("bin/tsx"));
         assert!(!is_path_like_runner("tsx"));
+    }
+
+    #[test]
+    fn executable_candidates_prefer_windows_launchers() {
+        let base = Path::new("bin/python3.12");
+        let candidates: Vec<PathBuf> = executable_candidates(base).collect();
+        let expected: Vec<PathBuf> = if cfg!(windows) {
+            vec![
+                PathBuf::from("bin/python3.12.exe"),
+                PathBuf::from("bin/python3.12.cmd"),
+                base.into(),
+            ]
+        } else {
+            vec![base.into()]
+        };
+        assert_eq!(candidates, expected);
+    }
+
+    #[test]
+    fn explicit_launcher_extension_is_kept() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let cmd = dir.path().join("runner.cmd");
+        std::fs::write(&cmd, "").expect("write runner.cmd");
+        std::fs::write(dir.path().join("runner.exe"), "").expect("write runner.exe");
+
+        assert_eq!(
+            executable_candidates(&cmd).collect::<Vec<_>>(),
+            vec![cmd.clone()]
+        );
+        let resolved = resolve_js_runner_command(cmd.to_str().expect("utf-8 path"), &[]);
+        assert_eq!(resolved, cmd);
+    }
+
+    #[test]
+    fn runner_bin_name_strips_windows_extensions() {
+        for (path, expected) in [
+            ("bun.exe", "bun"),
+            ("TSX.CMD", "tsx"),
+            ("vite-node", "vite-node"),
+        ] {
+            assert_eq!(runner_bin_name(Path::new(path)).as_deref(), Some(expected));
+        }
     }
 
     #[cfg(unix)]

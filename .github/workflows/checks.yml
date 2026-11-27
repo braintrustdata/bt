@@ -190,6 +190,36 @@ jobs:
       - name: Run eval dev-server integration tests
         run: cargo test --locked --test eval_dev_server -- --test-threads=1
 
+  eval-tests-windows:
+    name: eval-tests-windows
+    runs-on: windows-latest
+    timeout-minutes: 60
+    permissions:
+      contents: read
+    env:
+      CARGO_NET_GIT_FETCH_WITH_CLI: true
+      # Deno evals are paused until its loader handles JSON with sync hooks:
+      # https://github.com/denoland/deno/issues/36841
+      BT_EVAL_REQUIRED_RUNTIMES: node,bun,python
+      BT_EVAL_FIXTURE_RUNTIMES: node,bun,python
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - uses: ./.github/actions/setup-rust-node
+        with:
+          mise-tools: rust node pnpm bun uv
+          rust-cache-key: tests
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5.6.0
+        with:
+          python-version: "3.13"
+      - name: Install JS dependencies
+        run: pnpm install --frozen-lockfile --ignore-scripts
+      - name: Run eval unit tests
+        run: "cargo test --locked --bin bt -- eval:: runner_sse:: js_runner:: python_runner::"
+      - name: Run eval fixtures
+        run: cargo test --locked --test eval_fixtures
+      - name: Run eval dev-server integration tests
+        run: cargo test --locked --test eval_dev_server -- --test-threads=1
+
   # Single aggregate status for branch protection: mark only `checks-passed` as
   # required. Every other job in this workflow must be listed in `needs`.
   checks-passed:
@@ -202,6 +232,7 @@ jobs:
       - eval-tests-go
       - eval-tests-node
       - eval-tests-python
+      - eval-tests-windows
     runs-on: ubuntu-latest
     timeout-minutes: 60
     if: always()

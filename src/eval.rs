@@ -2730,7 +2730,7 @@ fn build_js_plan(
         return Ok(JsRunnerPlan { cmd: command, kind });
     }
 
-    let mut command = Command::new("npx");
+    let mut command = Command::new(js_runner::npx_program());
     command.arg("--yes").arg("tsx").arg(runner).args(files);
     Ok(JsRunnerPlan {
         cmd: command,
@@ -2748,7 +2748,7 @@ fn build_vite_node_fallback_command(runner: &Path, files: &[String]) -> Result<C
         return Ok(command);
     }
 
-    let mut command = Command::new("npx");
+    let mut command = Command::new(js_runner::npx_program());
     command
         .arg("--yes")
         .arg("vite-node")
@@ -4195,27 +4195,18 @@ mod tests {
     }
 
     #[test]
-    fn materialize_runner_script_writes_file() {
-        let dir = make_temp_dir("write");
-
-        let path = materialize_runner_script(&dir, "runner.ts", "console.log('ok');")
-            .expect("runner script should be materialized");
-        let contents = fs::read_to_string(path).expect("runner script should be readable");
-        assert_eq!(contents, "console.log('ok');");
-
-        let _ = fs::remove_dir_all(&dir);
-    }
-
-    #[test]
-    fn materialize_runner_script_overwrites_stale_content() {
-        let dir = make_temp_dir("overwrite");
+    fn materialize_runner_script_writes_and_refreshes_content() {
+        let dir = make_temp_dir("materialize");
         let path = dir.join("runner.py");
         fs::write(&path, "stale").expect("stale file should be written");
 
-        materialize_runner_script(&dir, "runner.py", "fresh")
-            .expect("runner script should be updated");
-        let contents = fs::read_to_string(path).expect("runner script should be readable");
-        assert_eq!(contents, "fresh");
+        for source in ["fresh", "fresher"] {
+            let written = materialize_runner_script(&dir, "runner.py", source)
+                .expect("runner script should be materialized");
+            assert_eq!(written, path);
+            let contents = fs::read_to_string(&path).expect("runner script should be readable");
+            assert_eq!(contents, source);
+        }
 
         let _ = fs::remove_dir_all(&dir);
     }
@@ -5975,23 +5966,14 @@ mod tests {
     }
 
     #[test]
-    fn parse_eval_params_rejects_missing_equals() {
-        let params = vec!["modelonly".to_string()];
-        let err = parse_eval_params(&params).expect_err("should fail");
-        assert!(
-            err.to_string().contains("key=JSON_VALUE"),
-            "unexpected error: {err}"
-        );
-    }
-
-    #[test]
-    fn parse_eval_params_rejects_empty_key() {
-        let params = vec![r#"="value""#.to_string()];
-        let err = parse_eval_params(&params).expect_err("should fail");
-        assert!(
-            err.to_string().contains("key must not be empty"),
-            "unexpected error: {err}"
-        );
+    fn parse_eval_params_rejects_invalid_entries() {
+        for (raw, expected) in [
+            ("modelonly", "key=JSON_VALUE"),
+            (r#"="value""#, "key must not be empty"),
+        ] {
+            let err = parse_eval_params(&[raw.to_string()]).expect_err(raw);
+            assert!(err.to_string().contains(expected), "{raw}: {err}");
+        }
     }
 
     #[test]
@@ -6027,43 +6009,20 @@ mod tests {
     }
 
     #[test]
-    fn parse_matrix_params_rejects_duplicate_key() {
-        let raw = vec!["model=a,b".to_string(), "model=c,d".to_string()];
-        let err = parse_matrix_params(&raw).expect_err("should fail");
-        assert!(
-            err.to_string().contains("specified more than once"),
-            "unexpected error: {err}"
-        );
-    }
-
-    #[test]
-    fn parse_matrix_params_rejects_empty_key() {
-        let raw = vec!["=a,b".to_string()];
-        let err = parse_matrix_params(&raw).expect_err("should fail");
-        assert!(
-            err.to_string().contains("key must not be empty"),
-            "unexpected error: {err}"
-        );
-    }
-
-    #[test]
-    fn parse_matrix_params_rejects_missing_equals() {
-        let raw = vec!["modelonly".to_string()];
-        let err = parse_matrix_params(&raw).expect_err("should fail");
-        assert!(
-            err.to_string().contains("key=V1,V2"),
-            "unexpected error: {err}"
-        );
-    }
-
-    #[test]
-    fn parse_matrix_params_rejects_empty_values() {
-        let raw = vec!["model=".to_string()];
-        let err = parse_matrix_params(&raw).expect_err("should fail");
-        assert!(
-            err.to_string().contains("at least one value"),
-            "unexpected error: {err}"
-        );
+    fn parse_matrix_params_rejects_invalid_entries() {
+        let cases: [(&[&str], &str); 6] = [
+            (&["model=a,b", "model=c,d"], "specified more than once"),
+            (&["=a,b"], "key must not be empty"),
+            (&["modelonly"], "key=V1,V2"),
+            (&["model="], "at least one value"),
+            (&["model=[]"], "at least one value"),
+            (&["model=[\"a\""], "not a valid JSON array"),
+        ];
+        for (raw, expected) in cases {
+            let raw: Vec<String> = raw.iter().map(|value| value.to_string()).collect();
+            let err = parse_matrix_params(&raw).expect_err("should fail");
+            assert!(err.to_string().contains(expected), "{raw:?}: {err}");
+        }
     }
 
     #[test]
@@ -6090,26 +6049,6 @@ mod tests {
     }
 
     #[test]
-    fn parse_matrix_params_json_array_rejects_empty() {
-        let raw = vec!["model=[]".to_string()];
-        let err = parse_matrix_params(&raw).expect_err("should fail");
-        assert!(
-            err.to_string().contains("at least one value"),
-            "unexpected error: {err}"
-        );
-    }
-
-    #[test]
-    fn parse_matrix_params_json_array_rejects_malformed() {
-        let raw = vec!["model=[\"a\"".to_string()];
-        let err = parse_matrix_params(&raw).expect_err("should fail");
-        assert!(
-            err.to_string().contains("not a valid JSON array"),
-            "unexpected error: {err}"
-        );
-    }
-
-    #[test]
     fn parse_eval_filter_expression_splits_path_and_pattern() {
         let parsed =
             parse_eval_filter_expression("metadata.case=smoke.*").expect("parse should succeed");
@@ -6123,22 +6062,11 @@ mod tests {
     }
 
     #[test]
-    fn parse_eval_filter_expression_rejects_missing_equals() {
-        let err =
-            parse_eval_filter_expression("metadata.case").expect_err("missing equals should fail");
-        assert!(
-            err.to_string().contains("Invalid filter"),
-            "unexpected error: {err}"
-        );
-    }
-
-    #[test]
-    fn parse_eval_filter_expression_rejects_empty_path() {
-        let err = parse_eval_filter_expression("=foo").expect_err("empty path should fail");
-        assert!(
-            err.to_string().contains("Invalid filter"),
-            "unexpected error: {err}"
-        );
+    fn parse_eval_filter_expression_rejects_invalid_expressions() {
+        for raw in ["metadata.case", "=foo"] {
+            let err = parse_eval_filter_expression(raw).expect_err(raw);
+            assert!(err.to_string().contains("Invalid filter"), "{raw}: {err}");
+        }
     }
 
     #[test]
