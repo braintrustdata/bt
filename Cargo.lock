@@ -584,7 +584,7 @@ dependencies = [
 [[package]]
 name = "braintrust-api-client"
 version = "0.1.0-alpha.2"
-source = "git+https://github.com/braintrustdata/braintrust-sdk-rust?rev=3f34503e2be50270f92e96aa2d4b872ccd789936#3f34503e2be50270f92e96aa2d4b872ccd789936"
+source = "git+https://github.com/braintrustdata/braintrust-sdk-rust?rev=b29025a725125f56d97232464500f065d98dfe5d#b29025a725125f56d97232464500f065d98dfe5d"
 dependencies = [
  "anyhow",
  "backoff",
@@ -664,18 +664,16 @@ dependencies = [
 [[package]]
 name = "braintrust-sdk-rust"
 version = "0.1.0-alpha.2"
-source = "git+https://github.com/braintrustdata/braintrust-sdk-rust?rev=3f34503e2be50270f92e96aa2d4b872ccd789936#3f34503e2be50270f92e96aa2d4b872ccd789936"
+source = "git+https://github.com/braintrustdata/braintrust-sdk-rust?rev=b29025a725125f56d97232464500f065d98dfe5d#b29025a725125f56d97232464500f065d98dfe5d"
 dependencies = [
  "anyhow",
- "arc-swap",
  "async-trait",
  "backon",
  "base64 0.23.1",
  "bon",
- "braintrust-api-client 0.1.0-alpha.2 (git+https://github.com/braintrustdata/braintrust-sdk-rust?rev=3f34503e2be50270f92e96aa2d4b872ccd789936)",
+ "braintrust-api-client 0.1.0-alpha.2 (git+https://github.com/braintrustdata/braintrust-sdk-rust?rev=b29025a725125f56d97232464500f065d98dfe5d)",
  "bytes",
  "chrono",
- "crossbeam",
  "futures",
  "indexmap 2.14.0",
  "regex",
@@ -741,8 +739,8 @@ dependencies = [
  "assert_cmd",
  "async-trait",
  "base64 0.22.1",
- "braintrust-api-client 0.1.0-alpha.2 (git+https://github.com/braintrustdata/braintrust-sdk-rust?rev=3f34503e2be50270f92e96aa2d4b872ccd789936)",
- "braintrust-sdk-rust 0.1.0-alpha.2 (git+https://github.com/braintrustdata/braintrust-sdk-rust?rev=3f34503e2be50270f92e96aa2d4b872ccd789936)",
+ "braintrust-api-client 0.1.0-alpha.2 (git+https://github.com/braintrustdata/braintrust-sdk-rust?rev=b29025a725125f56d97232464500f065d98dfe5d)",
+ "braintrust-sdk-rust 0.1.0-alpha.2 (git+https://github.com/braintrustdata/braintrust-sdk-rust?rev=b29025a725125f56d97232464500f065d98dfe5d)",
  "bt-daemon",
  "chrono",
  "clap",
