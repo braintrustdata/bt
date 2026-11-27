@@ -275,6 +275,33 @@ mod tests {
         assert!(!is_path_like_runner("tsx"));
     }
 
+    #[test]
+    fn executable_candidates_prefer_windows_launchers() {
+        let base = Path::new("node_modules/.bin/tsx");
+        let candidates: Vec<PathBuf> = executable_candidates(base).collect();
+        let expected: Vec<PathBuf> = if cfg!(windows) {
+            vec![
+                base.with_extension("exe"),
+                base.with_extension("cmd"),
+                base.into(),
+            ]
+        } else {
+            vec![base.into()]
+        };
+        assert_eq!(candidates, expected);
+    }
+
+    #[test]
+    fn runner_bin_name_strips_windows_extensions() {
+        for (path, expected) in [
+            ("bun.exe", "bun"),
+            ("TSX.CMD", "tsx"),
+            ("vite-node", "vite-node"),
+        ] {
+            assert_eq!(runner_bin_name(Path::new(path)).as_deref(), Some(expected));
+        }
+    }
+
     #[cfg(unix)]
     #[test]
     fn descendant_symlink_check_rejects_symlinked_component() {

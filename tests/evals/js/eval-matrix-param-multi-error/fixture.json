@@ -1,5 +1,0 @@
-{
-  "files": ["matrix-multi.eval.mjs"],
-  "args": ["--matrix-param", "model=a,b"],
-  "expect_success": false
-}

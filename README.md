@@ -1,9 +1,5 @@
 # Braintrust CLI (`bt`)
 
-## Current Limitations
-
-- On Windows, `bt eval` supports JavaScript/TypeScript and Python evals. Go eval support on Windows is in progress.
-
 ## Install
 
 ### Unix (macOS / Linux)
