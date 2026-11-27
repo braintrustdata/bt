@@ -364,7 +364,7 @@ jobs:
               --apple-id "$APPLE_ID" --password "$APPLE_APP_SPECIFIC_PASSWORD" \
               --team-id "$APPLE_TEAM_ID" --wait --output-format json)
             echo "$result" | jq -e '.status == "Accepted"'
-            tar -czf "$archive" -C "$staging" .
+            tar -czf "$archive" -C "$staging" "$(basename "$archive" .tar.gz)"
             shasum -a 256 "$archive" | awk '{print $1 "  " name}' name="$(basename "$archive")" > "$archive.sha256"
             rm -rf "$staging" "$RUNNER_TEMP/bt-notarize.zip"
           done
