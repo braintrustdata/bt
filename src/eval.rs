@@ -4958,7 +4958,7 @@ mod tests {
 
             assert_eq!(
                 resolved,
-                fs::canonicalize(&dir).unwrap_or_else(|_| dir.clone())
+                dunce::canonicalize(&dir).unwrap_or_else(|_| dir.clone())
             );
 
             let _ = fs::remove_dir_all(&dir);
