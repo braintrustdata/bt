@@ -643,7 +643,7 @@ fn value_matches_schema_type(value: &Value, types: &BTreeSet<String>) -> bool {
     types.contains(json_value_type(value)) || (value.is_number() && types.contains("number"))
 }
 
-fn format_tool_result(result: &ToolResult, json_output: bool) -> Result<String> {
+pub(crate) fn format_tool_result(result: &ToolResult, json_output: bool) -> Result<String> {
     if json_output {
         return serde_json::to_string(result).context("failed to serialize MCP result");
     }
